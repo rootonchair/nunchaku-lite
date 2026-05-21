@@ -8,7 +8,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 from diffusers.models.activations import GELU
-from diffusers.models.attention import FeedForward
+from diffusers.models.attention import AttentionModuleMixin, FeedForward
 from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.transformers.transformer_qwenimage import (
@@ -210,7 +210,7 @@ class NunchakuQwenImageAttnProcessor:
         return img_attn_output, txt_attn_output
 
 
-class NunchakuQwenAttention(nn.Module):
+class NunchakuQwenAttention(nn.Module, AttentionModuleMixin):
     """Lite replacement for Qwen-Image joint attention."""
 
     def __init__(self, other: nn.Module, context: SVDQPatchContext | None = None, **kwargs):
@@ -600,8 +600,7 @@ class QwenImageAdapter:
 
         patch_modules_recursively(
             transformer,
-            context,
-            linear_filter=lambda _path, _linear: False,
+            skips=lambda _path, module: isinstance(module, nn.Linear),
             module_converters={
                 QwenImageTransformerBlock: lambda block: NunchakuQwenImageTransformerBlock(
                     block, scale_shift=0, context=context

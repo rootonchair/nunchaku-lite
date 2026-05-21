@@ -6,7 +6,7 @@ from collections.abc import Mapping, MutableMapping
 from typing import Any
 
 import torch
-from diffusers.models.attention import BasicTransformerBlock
+from diffusers.models.attention import AttentionModuleMixin, BasicTransformerBlock
 from diffusers.models.unets.unet_2d_blocks import (
     CrossAttnDownBlock2D,
     CrossAttnUpBlock2D,
@@ -20,7 +20,7 @@ from nunchaku_lite.adapters.common import (
     build_svdq_context,
     finalize_svdq_checkpoint,
     fuse_linears,
-    patch_svdq_linears,
+    patch_modules_recursively,
     prepare_transformer_dtype,
     svdq_from_linear,
 )
@@ -56,7 +56,7 @@ def _sdxl_state_dict_needs_conversion(state_dict: Mapping[str, torch.Tensor]) ->
     )
 
 
-class NunchakuSDXLAttention(nn.Module):
+class NunchakuSDXLAttention(nn.Module, AttentionModuleMixin):
     """Attention module compatible with Diffusers SDXL BasicTransformerBlock."""
 
     def __init__(self, attention: nn.Module, context: SVDQPatchContext) -> None:
@@ -217,7 +217,10 @@ class SDXLAdapter:
         if getattr(block, "attn2", None) is not None:
             block.attn2 = NunchakuSDXLAttention(block.attn2, context)
         if getattr(block, "ff", None) is not None:
-            patch_svdq_linears(block.ff, context)
+            patch_modules_recursively(
+                block.ff,
+                module_converters={nn.Linear: lambda linear: svdq_from_linear(linear, context)},
+            )
 
 
 register_adapter(SDXLAdapter())
