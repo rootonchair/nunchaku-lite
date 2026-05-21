@@ -10,7 +10,7 @@ import torch.nn as nn
 from ..core import PatchOptions, register_adapter
 from ..linear import AWQW4A16Linear, SVDQW4A4Linear
 from ..manifest import RuntimeManifest, RuntimeManifestTarget, parse_runtime_manifest
-from .common import SVDQPatchContext, finalize_svdq_checkpoint, prepare_transformer_dtype
+from .common import SVDQPatchContext, _mark_patched_module, finalize_svdq_checkpoint, prepare_transformer_dtype
 
 
 class ManifestAdapter:
@@ -187,7 +187,7 @@ def _apply_structural_patches(transformer: nn.Module, manifest: RuntimeManifest)
                 replacement = SplitLinearOutput.from_linear(module, splits)
             else:
                 raise ValueError(f"Unsupported runtime_manifest structural patch type {patch_type!r}.")
-            _set_submodule(transformer, module_name, replacement)
+            _set_submodule(transformer, module_name, _mark_manifest_replacement(replacement))
 
 
 def _replace_target(transformer: nn.Module, target: RuntimeManifestTarget, context: SVDQPatchContext) -> None:
@@ -245,7 +245,7 @@ def _replace_target(transformer: nn.Module, target: RuntimeManifestTarget, conte
     else:
         raise ValueError(f"Unsupported runtime_manifest nunchaku_op {target.nunchaku_op!r}.")
 
-    _set_submodule(transformer, target.checkpoint_prefix, replacement)
+    _set_submodule(transformer, target.checkpoint_prefix, _mark_manifest_replacement(replacement))
 
 
 def _replace_adanorm_awq_target(
@@ -266,8 +266,16 @@ def _replace_adanorm_awq_target(
         torch_dtype=context.torch_dtype,
         device=_module_device(module),
     )
-    wrapped = ManifestAdaNormAWQW4A16(parent, replacement, splits=target.op_options["adanorm_splits"])
-    _set_submodule(transformer, parent_path, wrapped)
+    wrapped = ManifestAdaNormAWQW4A16(
+        parent,
+        _mark_manifest_replacement(replacement),
+        splits=target.op_options["adanorm_splits"],
+    )
+    _set_submodule(transformer, parent_path, _mark_manifest_replacement(wrapped))
+
+
+def _mark_manifest_replacement(module: nn.Module) -> nn.Module:
+    return _mark_patched_module(module)
 
 
 def _validate_svdq_group_size(target: RuntimeManifestTarget) -> None:

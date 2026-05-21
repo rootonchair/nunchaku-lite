@@ -12,6 +12,7 @@ from nunchaku_lite.adapters.manifest import (
     SplitLinearInput,
     SplitLinearOutput,
 )
+from nunchaku_lite.adapters.common import PATCHED_MODULE_ATTR
 from nunchaku_lite.linear import AWQW4A16Linear, SVDQW4A4Linear
 from nunchaku_lite.manifest import parse_runtime_manifest
 
@@ -151,6 +152,7 @@ def test_patch_transformer_manifest_target_replaces_svdq_linear(tmp_path):
     assert isinstance(transformer.proj, SVDQW4A4Linear)
     assert transformer.proj.rank == 4
     assert transformer.proj.precision == "int4"
+    assert getattr(transformer.proj, PATCHED_MODULE_ATTR)
 
 
 def test_patch_transformer_auto_uses_manifest_before_matching_adapter(tmp_path, monkeypatch):
@@ -224,6 +226,7 @@ def test_manifest_adapter_applies_split_linear_output_before_replacement(tmp_pat
     )
 
     assert isinstance(transformer.proj, SVDQW4A4Linear)
+    assert getattr(transformer.proj, PATCHED_MODULE_ATTR)
     patch_transformer(
         TinyManifestModel(out_features=128),
         checkpoint,
@@ -260,6 +263,7 @@ def test_manifest_adapter_replaces_awq_target(tmp_path):
     )
 
     assert isinstance(transformer.proj, AWQW4A16Linear)
+    assert getattr(transformer.proj, PATCHED_MODULE_ATTR)
 
 
 @pytest.mark.parametrize("splits", [3, 6])
@@ -294,7 +298,9 @@ def test_manifest_adapter_wraps_adanorm_awq_target(splits):
 
     assert isinstance(transformer.norm, ManifestAdaNormAWQW4A16)
     assert transformer.norm.splits == splits
+    assert getattr(transformer.norm, PATCHED_MODULE_ATTR)
     assert isinstance(transformer.norm.linear, AWQW4A16Linear)
+    assert getattr(transformer.norm.linear, PATCHED_MODULE_ATTR)
 
 
 def test_manifest_adanorm_wrapper_decodes_six_way_interleaved_output():
