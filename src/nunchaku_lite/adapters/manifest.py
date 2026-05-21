@@ -119,6 +119,45 @@ class SplitLinearOutput(nn.Module):
         return torch.cat([linear(x) for linear in self.linears], dim=-1)
 
 
+class ManifestAdaNormAWQW4A16(nn.Module):
+    """Manifest-driven AdaNorm wrapper for interleaved AWQ W4A16 modulation."""
+
+    def __init__(self, parent: nn.Module, linear: nn.Module, *, splits: int) -> None:
+        super().__init__()
+        if splits not in {3, 6}:
+            raise ValueError(f"ManifestAdaNormAWQW4A16 requires splits to be 3 or 6, got {splits}.")
+        missing = [name for name in ("silu", "norm") if not hasattr(parent, name)]
+        if missing:
+            raise TypeError(f"adanorm_awq_w4a16 parent is missing required attributes: {', '.join(missing)}.")
+        self.splits = splits
+        self.emb = getattr(parent, "emb", None)
+        self.silu = parent.silu
+        self.linear = linear
+        self.norm = parent.norm
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor | None = None,
+        class_labels: torch.LongTensor | None = None,
+        hidden_dtype: torch.dtype | None = None,
+        emb: torch.Tensor | None = None,
+    ):
+        if self.emb is not None:
+            emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
+        if emb is None:
+            raise ValueError("adanorm_awq_w4a16 requires an embedding tensor.")
+        emb = self.linear(self.silu(emb))
+        emb = emb.view(emb.shape[0], -1, self.splits).permute(2, 0, 1)
+        if self.splits == 6:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb
+            norm_x = self.norm(x) * scale_msa[:, None] + shift_msa[:, None]
+            return norm_x, gate_msa, shift_mlp, scale_mlp - 1, gate_mlp
+        shift_msa, scale_msa, gate_msa = emb
+        norm_x = self.norm(x) * scale_msa[:, None] + shift_msa[:, None]
+        return norm_x, gate_msa
+
+
 def _manifest_context(transformer: nn.Module, manifest: RuntimeManifest, options: PatchOptions) -> SVDQPatchContext:
     parameter = next(transformer.parameters(), None)
     torch_dtype = options.torch_dtype or (parameter.dtype if parameter is not None else torch.bfloat16)
@@ -187,7 +226,7 @@ def _replace_target(transformer: nn.Module, target: RuntimeManifestTarget, conte
             torch_dtype=context.torch_dtype,
             device=_module_device(module),
         )
-    elif target.nunchaku_op in {"awq_w4a16", "adanorm_awq_w4a16"}:
+    elif target.nunchaku_op == "awq_w4a16":
         if target.precision != "int4":
             raise ValueError(f"{target.nunchaku_op} target {target.checkpoint_prefix!r} requires precision='int4'.")
         replacement = AWQW4A16Linear(
@@ -198,10 +237,37 @@ def _replace_target(transformer: nn.Module, target: RuntimeManifestTarget, conte
             torch_dtype=context.torch_dtype,
             device=_module_device(module),
         )
+    elif target.nunchaku_op == "adanorm_awq_w4a16":
+        if target.precision != "int4":
+            raise ValueError(f"{target.nunchaku_op} target {target.checkpoint_prefix!r} requires precision='int4'.")
+        _replace_adanorm_awq_target(transformer, target, module, context)
+        return
     else:
         raise ValueError(f"Unsupported runtime_manifest nunchaku_op {target.nunchaku_op!r}.")
 
     _set_submodule(transformer, target.checkpoint_prefix, replacement)
+
+
+def _replace_adanorm_awq_target(
+    transformer: nn.Module,
+    target: RuntimeManifestTarget,
+    module: nn.Module,
+    context: SVDQPatchContext,
+) -> None:
+    parent_path, separator, child_name = target.checkpoint_prefix.rpartition(".")
+    if separator == "" or child_name != "linear":
+        raise ValueError(f"adanorm_awq_w4a16 target {target.checkpoint_prefix!r} must reference a '.linear' child.")
+    parent = transformer.get_submodule(parent_path)
+    replacement = AWQW4A16Linear(
+        in_features=module.in_features,
+        out_features=module.out_features,
+        bias=target.has_bias,
+        group_size=target.group_size,
+        torch_dtype=context.torch_dtype,
+        device=_module_device(module),
+    )
+    wrapped = ManifestAdaNormAWQW4A16(parent, replacement, splits=target.op_options["adanorm_splits"])
+    _set_submodule(transformer, parent_path, wrapped)
 
 
 def _validate_svdq_group_size(target: RuntimeManifestTarget) -> None:

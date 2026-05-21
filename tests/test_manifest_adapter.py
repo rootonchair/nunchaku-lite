@@ -6,7 +6,12 @@ from safetensors.torch import save_file
 from torch import nn
 
 from nunchaku_lite import patch_transformer
-from nunchaku_lite.adapters.manifest import ManifestAdapter, SplitLinearInput, SplitLinearOutput
+from nunchaku_lite.adapters.manifest import (
+    ManifestAdapter,
+    ManifestAdaNormAWQW4A16,
+    SplitLinearInput,
+    SplitLinearOutput,
+)
 from nunchaku_lite.linear import AWQW4A16Linear, SVDQW4A4Linear
 from nunchaku_lite.manifest import parse_runtime_manifest
 
@@ -18,6 +23,30 @@ class TinyManifestModel(nn.Module):
 
     def forward(self, x):
         return self.proj(x)
+
+
+class TinyAdaNormParent(nn.Module):
+    def __init__(self, *, in_features: int = 128, out_features: int = 768, with_emb: bool = False):
+        super().__init__()
+        self.emb = nn.Linear(in_features, in_features) if with_emb else None
+        self.silu = nn.Identity()
+        self.linear = nn.Linear(in_features, out_features)
+        self.norm = nn.Identity()
+
+
+class TinyAdaNormModel(nn.Module):
+    def __init__(self, *, splits: int = 6):
+        super().__init__()
+        self.norm = TinyAdaNormParent(out_features=128 * splits)
+
+
+class FixedLinear(nn.Module):
+    def __init__(self, output: torch.Tensor):
+        super().__init__()
+        self.output = output
+
+    def forward(self, x):
+        return self.output.to(device=x.device, dtype=x.dtype).expand(x.shape[0], -1)
 
 
 class MatchingFakeAdapter:
@@ -231,3 +260,108 @@ def test_manifest_adapter_replaces_awq_target(tmp_path):
     )
 
     assert isinstance(transformer.proj, AWQW4A16Linear)
+
+
+@pytest.mark.parametrize("splits", [3, 6])
+def test_manifest_adapter_wraps_adanorm_awq_target(splits):
+    manifest = _manifest(op="adanorm_awq_w4a16", precision="int4", group_size=64, rank=0)
+    manifest["targets"][0].update(
+        {
+            "name": "norm.linear",
+            "checkpoint_prefix": "norm.linear",
+            "source_modules": ["norm.linear"],
+            "op_options": {"adanorm_splits": splits},
+        }
+    )
+    transformer = TinyAdaNormModel(splits=splits)
+
+    ManifestAdapter().patch(
+        transformer,
+        {},
+        _quantization_config(manifest),
+        type(
+            "Options",
+            (),
+            {
+                "precision": "int4",
+                "torch_dtype": torch.bfloat16,
+                "device": None,
+                "strict": True,
+                "adapter_options": {},
+            },
+        )(),
+    )
+
+    assert isinstance(transformer.norm, ManifestAdaNormAWQW4A16)
+    assert transformer.norm.splits == splits
+    assert isinstance(transformer.norm.linear, AWQW4A16Linear)
+
+
+def test_manifest_adanorm_wrapper_decodes_six_way_interleaved_output():
+    parent = TinyAdaNormParent(in_features=4, out_features=24)
+    output = torch.arange(24, dtype=torch.float32)
+    wrapper = ManifestAdaNormAWQW4A16(parent, FixedLinear(output), splits=6)
+    x = torch.ones(1, 2, 4)
+
+    norm_x, gate_msa, shift_mlp, scale_mlp, gate_mlp = wrapper(x, emb=torch.zeros(1, 4))
+    decoded = output.view(1, -1, 6).permute(2, 0, 1)
+
+    assert torch.equal(norm_x, x * decoded[1][:, None] + decoded[0][:, None])
+    assert torch.equal(gate_msa, decoded[2])
+    assert torch.equal(shift_mlp, decoded[3])
+    assert torch.equal(scale_mlp, decoded[4] - 1)
+    assert torch.equal(gate_mlp, decoded[5])
+
+
+def test_manifest_adanorm_wrapper_decodes_three_way_interleaved_output():
+    parent = TinyAdaNormParent(in_features=4, out_features=12)
+    output = torch.arange(12, dtype=torch.float32)
+    wrapper = ManifestAdaNormAWQW4A16(parent, FixedLinear(output), splits=3)
+    x = torch.ones(1, 2, 4)
+
+    norm_x, gate_msa = wrapper(x, emb=torch.zeros(1, 4))
+    decoded = output.view(1, -1, 3).permute(2, 0, 1)
+
+    assert torch.equal(norm_x, x * decoded[1][:, None] + decoded[0][:, None])
+    assert torch.equal(gate_msa, decoded[2])
+
+
+def test_parse_runtime_manifest_rejects_invalid_adanorm_splits():
+    manifest = _manifest(op="adanorm_awq_w4a16", precision="int4", group_size=64, rank=0)
+    manifest["targets"][0]["op_options"] = {"adanorm_splits": 4}
+
+    with pytest.raises(ValueError, match="adanorm_splits to be 3 or 6"):
+        parse_runtime_manifest(_quantization_config(manifest))
+
+
+def test_manifest_adapter_rejects_adanorm_target_without_linear_child():
+    manifest = _manifest(op="adanorm_awq_w4a16", precision="int4", group_size=64, rank=0)
+    manifest["targets"][0].update(
+        {
+            "name": "norm.proj",
+            "checkpoint_prefix": "norm.proj",
+            "source_modules": ["norm.proj"],
+            "op_options": {"adanorm_splits": 6},
+        }
+    )
+    transformer = nn.Module()
+    transformer.norm = nn.Module()
+    transformer.norm.proj = nn.Linear(128, 768)
+
+    with pytest.raises(ValueError, match="must reference a '.linear' child"):
+        ManifestAdapter().patch(
+            transformer,
+            {},
+            _quantization_config(manifest),
+            type(
+                "Options",
+                (),
+                {
+                    "precision": "int4",
+                    "torch_dtype": torch.bfloat16,
+                    "device": None,
+                    "strict": True,
+                    "adapter_options": {},
+                },
+            )(),
+        )

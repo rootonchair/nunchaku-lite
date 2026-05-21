@@ -174,9 +174,9 @@ def _parse_target(index: int, raw: Any) -> RuntimeManifestTarget:
 
     if nunchaku_op == "adanorm_awq_w4a16":
         splits = op_options.get("adanorm_splits")
-        if not isinstance(splits, int) or splits <= 0:
+        if splits not in {3, 6}:
             raise ValueError(
-                f"runtime_manifest target {checkpoint_prefix!r} requires positive op_options.adanorm_splits."
+                f"runtime_manifest target {checkpoint_prefix!r} requires op_options.adanorm_splits to be 3 or 6."
             )
 
     return RuntimeManifestTarget(
