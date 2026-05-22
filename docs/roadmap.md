@@ -66,6 +66,27 @@ current porting backlog for `nunchaku_lite`:
 - [ ] Remove monkey-patched transformer forward overrides in favor of module
   wrappers or inherited transformer implementations.
 
+## Runtime Manifest Adapter Backlog
+
+The generic `manifest` adapter currently covers checkpoint-driven linear
+replacement and simple structural rewrites. The remaining work is to let
+manifest-declared checkpoints opt into the same model-level fast paths that the
+handwritten adapters use:
+
+- [ ] Declare fused attention groups so separate `to_q`, `to_k`, and `to_v`
+  projections can be replaced by a model-specific attention wrapper.
+- [ ] Route manifest-created attention wrappers through
+  `fused_qkv_norm_rotary` when the model exposes compatible Q/K norms and
+  rotary embeddings.
+- [ ] Express two-layer MLP patterns that can use `fused_gelu_mlp` instead of
+  running the projections and activation as separate modules.
+- [ ] Expose manifest-driven attention backend selection, including
+  `nunchaku-fp16` where the underlying model and kernels support it.
+- [ ] Add manifest hooks for Flux-style cache integrations, including
+  TeaCache, first-block cache, and double-block cache behavior.
+- [x] Bind model-family runtime APIs, such as LoRA loading and adapter
+  management, when a manifest target corresponds to an existing family adapter.
+
 ## Notes
 
 - `nunchaku_lite` does not import or require the full `nunchaku` Python package.
