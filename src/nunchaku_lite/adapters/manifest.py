@@ -44,8 +44,27 @@ class ManifestAdapter:
             _replace_target(transformer, target, context)
 
         finalize_svdq_checkpoint(transformer, checkpoint_state, context)
+        transformer._nunchaku_lite_runtime_manifest = manifest
+        _bind_manifest_runtime_apis(transformer)
         transformer._nunchaku_lite_manifest_patched = True
         return checkpoint_state
+
+    def patch_pipeline(
+        self,
+        pipeline: Any,
+        *,
+        component_name: str = "transformer",
+        component: torch.nn.Module | None = None,
+    ) -> None:
+        """Attach generic manifest pipeline-level runtime LoRA APIs."""
+
+        component = component if component is not None else getattr(pipeline, component_name, None)
+        if not callable(getattr(component, "load_lora", None)):
+            return
+
+        from ..lora.core.runtime import NunchakuPipelineLoraMixin, bind_pipeline_lora_methods
+
+        bind_pipeline_lora_methods(pipeline, NunchakuPipelineLoraMixin, component_name=component_name)
 
 
 class SplitLinearInput(nn.Module):
@@ -350,6 +369,13 @@ def _module_device(module: nn.Module) -> torch.device:
     if parameter is not None:
         return parameter.device
     return torch.device("cpu")
+
+
+def _bind_manifest_runtime_apis(transformer: nn.Module) -> None:
+    from ..lora.core.runtime import bind_transformer_lora_methods
+    from ..lora.manifest import NunchakuManifestLoraMixin
+
+    bind_transformer_lora_methods(transformer, NunchakuManifestLoraMixin)
 
 
 register_adapter(ManifestAdapter())

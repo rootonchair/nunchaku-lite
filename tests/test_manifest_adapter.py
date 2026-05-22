@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,6 +15,8 @@ from nunchaku_lite.adapters.manifest import (
 )
 from nunchaku_lite.adapters.common import PATCHED_MODULE_ATTR
 from nunchaku_lite.linear import AWQW4A16Linear, SVDQW4A4Linear
+from nunchaku_lite.lora.core.layout import unpack_lowrank_weight
+from nunchaku_lite.lora.manifest import COMFYUI_FORMAT, KOHYA_FORMAT, PEFT_FORMAT, detect_manifest_lora_format
 from nunchaku_lite.manifest import parse_runtime_manifest
 
 
@@ -24,6 +27,15 @@ class TinyManifestModel(nn.Module):
 
     def forward(self, x):
         return self.proj(x)
+
+
+class TinyFusedManifestModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q = nn.Linear(128, 128)
+        self.k = nn.Linear(128, 128)
+        self.v = nn.Linear(128, 128)
+        self.qkv = nn.Linear(128, 384)
 
 
 class TinyAdaNormParent(nn.Module):
@@ -371,3 +383,148 @@ def test_manifest_adapter_rejects_adanorm_target_without_linear_child():
                 },
             )(),
         )
+
+
+def test_manifest_lora_format_detection_routes_external_formats():
+    assert (
+        detect_manifest_lora_format(
+            {
+                "transformer.proj.lora_A.weight": torch.ones(1, 128),
+                "transformer.proj.lora_B.weight": torch.ones(128, 1),
+            }
+        )
+        == PEFT_FORMAT
+    )
+    assert (
+        detect_manifest_lora_format(
+            {
+                "lora_transformer_proj.lora_down.weight": torch.ones(1, 128),
+                "lora_transformer_proj.lora_up.weight": torch.ones(128, 1),
+            }
+        )
+        == KOHYA_FORMAT
+    )
+    assert (
+        detect_manifest_lora_format(
+            {
+                "diffusion_model.proj.lora_A.weight": torch.ones(1, 128),
+                "diffusion_model.proj.lora_B.weight": torch.ones(128, 1),
+            }
+        )
+        == COMFYUI_FORMAT
+    )
+
+
+def test_manifest_adapter_binds_generic_lora_runtime(tmp_path):
+    manifest = _manifest()
+    checkpoint = _write_manifest_checkpoint(tmp_path, TinyManifestModel(), manifest)
+
+    transformer = TinyManifestModel()
+    patch_transformer(transformer, checkpoint, target="manifest", torch_dtype=torch.bfloat16, device="cpu")
+
+    assert transformer._nunchaku_lite_target == "manifest"
+    assert callable(transformer.load_lora)
+    assert callable(transformer.set_adapters)
+    assert transformer._nunchaku_lite_loras == {}
+
+    lora = {
+        "transformer.proj.lora_A.weight": torch.ones(2, 128, dtype=torch.bfloat16),
+        "transformer.proj.lora_B.weight": torch.ones(128, 2, dtype=torch.bfloat16),
+    }
+    transformer.load_lora(lora, name="style")
+
+    assert transformer.get_list_adapters() == ["style"]
+    assert transformer.get_active_adapters() == ["style"]
+
+
+def test_manifest_generic_lora_accepts_kohya_suffix_alias(tmp_path):
+    manifest = _manifest()
+    checkpoint = _write_manifest_checkpoint(tmp_path, TinyManifestModel(), manifest)
+    transformer = patch_transformer(
+        TinyManifestModel(),
+        checkpoint,
+        target="manifest",
+        torch_dtype=torch.bfloat16,
+        device="cpu",
+    )
+
+    converted = transformer._convert_lora_to_nunchaku(
+        {
+            "lora_transformer_proj.lora_down.weight": torch.ones(2, 128, dtype=torch.bfloat16),
+            "lora_transformer_proj.lora_up.weight": torch.ones(128, 2, dtype=torch.bfloat16),
+        }
+    )
+
+    assert set(converted) == {"proj.proj_down", "proj.proj_up"}
+
+
+def test_manifest_generic_lora_accepts_comfyui_component_prefix(tmp_path):
+    manifest = _manifest()
+    checkpoint = _write_manifest_checkpoint(tmp_path, TinyManifestModel(), manifest)
+    transformer = patch_transformer(
+        TinyManifestModel(),
+        checkpoint,
+        target="manifest",
+        torch_dtype=torch.bfloat16,
+        device="cpu",
+    )
+
+    converted = transformer._convert_lora_to_nunchaku(
+        {
+            "diffusion_model.proj.lora_A.weight": torch.ones(2, 128, dtype=torch.bfloat16),
+            "diffusion_model.proj.lora_B.weight": torch.ones(128, 2, dtype=torch.bfloat16),
+        }
+    )
+
+    assert set(converted) == {"proj.proj_down", "proj.proj_up"}
+
+
+def test_manifest_generic_lora_fuses_source_module_branches(tmp_path):
+    manifest = _manifest()
+    manifest["targets"][0].update(
+        {
+            "name": "qkv",
+            "checkpoint_prefix": "qkv",
+            "source_modules": ["q", "k", "v"],
+            "has_bias": True,
+        }
+    )
+    checkpoint = _write_manifest_checkpoint(tmp_path, TinyFusedManifestModel(), manifest)
+    transformer = patch_transformer(
+        TinyFusedManifestModel(),
+        checkpoint,
+        target="manifest",
+        torch_dtype=torch.bfloat16,
+        device="cpu",
+    )
+
+    lora = {}
+    for value, branch in enumerate(("q", "k", "v"), start=1):
+        lora[f"transformer.{branch}.lora_A.weight"] = torch.ones(2, 128, dtype=torch.bfloat16)
+        lora[f"transformer.{branch}.lora_B.weight"] = torch.full((128, 2), value, dtype=torch.bfloat16)
+
+    converted = transformer._convert_lora_to_nunchaku(lora)
+    logical_up = unpack_lowrank_weight(converted["qkv.proj_up"], down=False)[:384, :2]
+
+    assert set(converted) == {"qkv.proj_down", "qkv.proj_up"}
+    assert torch.equal(logical_up[:128], torch.ones_like(logical_up[:128]))
+    assert torch.equal(logical_up[128:256], torch.full_like(logical_up[128:256], 2))
+    assert torch.equal(logical_up[256:384], torch.full_like(logical_up[256:384], 3))
+
+
+def test_manifest_pipeline_lora_methods_bind_when_component_runtime_is_bound(tmp_path):
+    manifest = _manifest()
+    checkpoint = _write_manifest_checkpoint(tmp_path, TinyManifestModel(), manifest)
+    transformer = patch_transformer(
+        TinyManifestModel(),
+        checkpoint,
+        target="manifest",
+        torch_dtype=torch.bfloat16,
+        device="cpu",
+    )
+    pipeline = SimpleNamespace(transformer=transformer)
+
+    ManifestAdapter().patch_pipeline(pipeline, component_name="transformer", component=transformer)
+
+    assert callable(pipeline.load_lora_weights)
+    assert pipeline._nunchaku_lite_lora_component_name == "transformer"

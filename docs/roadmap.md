@@ -84,7 +84,7 @@ handwritten adapters use:
   `nunchaku-fp16` where the underlying model and kernels support it.
 - [ ] Add manifest hooks for Flux-style cache integrations, including
   TeaCache, first-block cache, and double-block cache behavior.
-- [ ] Bind model-family runtime APIs, such as LoRA loading and adapter
+- [x] Bind model-family runtime APIs, such as LoRA loading and adapter
   management, when a manifest target corresponds to an existing family adapter.
 
 ## Notes
