@@ -64,6 +64,20 @@ class FakeUnetPipeline(FakePipeline):
         return cls(kwargs["unet"])
 
 
+class FakePipelineWithEncoder(FakePipeline):
+    @classmethod
+    def _get_signature_keys(cls, obj):
+        return ["transformer", "text_encoder_2"], []
+
+    @classmethod
+    def load_config(cls, model_id, **kwargs):
+        cls.load_config_kwargs = kwargs
+        return {
+            "transformer": [__name__, "FakePipelineComponent"],
+            "text_encoder_2": [__name__, "FakePipelineComponent"],
+        }
+
+
 class FakeAdapter:
     target = "fake_meta"
 
@@ -176,6 +190,50 @@ def test_load_nunchaku_pipeline_injects_meta_loaded_transformer(tmp_path, monkey
     assert pipe.patch_pipeline_context.component_name == "transformer"
     assert pipe.patch_pipeline_context.component is transformer
     assert pipe.patch_pipeline_context.adapter_target == FakeAdapter.target
+
+
+def test_load_nunchaku_pipeline_injects_quantized_encoder_component(tmp_path, monkeypatch):
+    import nunchaku_lite.core as core
+    from nunchaku_lite import load_nunchaku_pipeline
+
+    encoder = torch.nn.Linear(2, 2)
+
+    def fake_load_encoder(checkpoint, *, torch_dtype, device):
+        assert checkpoint == "encoder.safetensors"
+        assert torch_dtype is torch.float16
+        assert device == "cuda"
+        return encoder
+
+    _install_fake_adapter(monkeypatch)
+    monkeypatch.setattr(core, "_load_quantized_encoder_component", fake_load_encoder)
+
+    pipe = load_nunchaku_pipeline(
+        tmp_path,
+        pipeline_cls=FakePipelineWithEncoder,
+        checkpoint=_fake_checkpoint(tmp_path),
+        target=FakeAdapter.target,
+        torch_dtype={"default": torch.bfloat16, "text_encoder_2": torch.float16},
+        device="cuda",
+        quantized_encoder_checkpoints={"text_encoder_2": "encoder.safetensors"},
+    )
+
+    assert FakePipelineWithEncoder.from_pretrained_kwargs["text_encoder_2"] is encoder
+    assert FakePipelineWithEncoder.from_pretrained_kwargs["transformer"] is pipe.transformer
+
+
+def test_load_nunchaku_pipeline_rejects_quantized_encoder_collision(tmp_path, monkeypatch):
+    from nunchaku_lite import load_nunchaku_pipeline
+
+    _install_fake_adapter(monkeypatch)
+    with pytest.raises(ValueError, match="already contains 'text_encoder_2'"):
+        load_nunchaku_pipeline(
+            tmp_path,
+            pipeline_cls=FakePipelineWithEncoder,
+            checkpoint=_fake_checkpoint(tmp_path),
+            target=FakeAdapter.target,
+            text_encoder_2=torch.nn.Linear(2, 2),
+            quantized_encoder_checkpoints={"text_encoder_2": "encoder.safetensors"},
+        )
 
 
 def test_load_nunchaku_pipeline_allows_adapter_without_pipeline_patch(tmp_path, monkeypatch):

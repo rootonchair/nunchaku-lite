@@ -226,13 +226,13 @@ class ZImageAdapter:
             transformer,
             skips=lambda path, module: self._should_skip(path, module, skip_refiners),
             module_converters={
-                Attention: lambda attention: patch_attention_module(
+                Attention: lambda _path, attention: patch_attention_module(
                     attention,
                     ZImageSingleStreamAttnProcessor(),
                     context=context,
                 ),
-                DiffusersZImageFeedForward: _convert_z_image_ff,
-                nn.Linear: lambda linear: svdq_from_linear(linear, context),
+                DiffusersZImageFeedForward: lambda _path, ff: _convert_z_image_ff(ff),
+                nn.Linear: lambda _path, linear: svdq_from_linear(linear, context),
             },
         )
 

@@ -94,12 +94,17 @@ only model topology and forward-pass differences in the model-specific file.
 Recommended structure:
 
 ```python
+import torch.nn as nn
+from diffusers.models.attention_processor import Attention
+
 from nunchaku_lite import register_adapter
 from nunchaku_lite.adapters.common import (
     build_svdq_context,
     finalize_svdq_checkpoint,
     patch_modules_recursively,
+    patch_attention_module,
     prepare_transformer_dtype,
+    svdq_from_linear,
 )
 
 
@@ -117,12 +122,16 @@ class MyModelAdapter:
         # checkpoint-backed dense linear children.
         patch_modules_recursively(
             transformer,
-            context,
-            attention_processor_factory=lambda path, attention: MyAttentionProcessor(),
-            linear_filter=lambda path, linear: path.startswith("blocks."),
+            skips=lambda path, module: isinstance(module, nn.Linear) and not path.startswith("blocks."),
             module_converters={
-                MyFeedForwardBlock: convert_my_feed_forward_block,
-                MyAttentionSubclass: lambda attention: MyLiteAttention(attention, context=context),
+                nn.Linear: lambda path, linear: svdq_from_linear(linear, context),
+                Attention: lambda path, attention: patch_attention_module(
+                    attention,
+                    MyAttentionProcessor(),
+                    context=context,
+                ),
+                MyFeedForwardBlock: lambda path, block: convert_my_feed_forward_block(block),
+                MyAttentionSubclass: lambda path, attention: MyLiteAttention(attention, context=context),
             },
         )
 
@@ -137,9 +146,9 @@ register_adapter(MyModelAdapter())
 Adapter responsibilities:
 
 - Use `build_svdq_context`, `patch_modules_recursively`, `svdq_from_linear`,
-  `patch_svdq_linears`, and `finalize_svdq_checkpoint` for rank, precision,
-  dtype, recursive module replacement, scale-key patching, and fp16 checkpoint
-  conversion.
+  `patch_attention_module`, and `finalize_svdq_checkpoint` for rank,
+  precision, dtype, recursive module replacement, scale-key patching, and fp16
+  checkpoint conversion.
 - Keep graph-specific rewrites in the adapter, including QKV fusion, MLP fusion,
   module renaming, and any synthetic projection modules required to match
   checkpoint keys.
@@ -153,13 +162,12 @@ Adapter responsibilities:
 
 `patch_modules_recursively` mutates the selected module tree in place and
 returns a `ModulePatchReport` with replacement and skip counts. Use
-`linear_filter` or narrow roots so only checkpoint-backed dense projections are
-replaced. Use `skip_subtree` for branches that must remain completely untouched.
-Use `attention_processor_factory` for exact Diffusers `Attention` children that
-can use the shared `NunchakuAttention` wrapper. Use `module_converters` for
-exact-class model blocks or Diffusers `Attention` subclasses that require a
-model-specific replacement; unsupported attention subclasses raise `TypeError`
-instead of being silently skipped.
+`skips` or narrow roots so only checkpoint-backed dense projections are
+replaced. A skipped child and all of its descendants are left untouched. Use
+`module_converters` for exact-class model blocks, `nn.Linear` projections, or
+Diffusers `Attention` modules that require replacement. Converters receive
+`(path, module)`, which allows checkpoint-key-based decisions and path-specific
+rewrites.
 
 Avoid adding a pipeline subclass for a new model unless the upstream Diffusers
 pipeline itself requires one. The preferred integration is

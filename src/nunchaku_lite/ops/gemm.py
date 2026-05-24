@@ -122,3 +122,26 @@ def svdq_gemm_w4a4_cuda(
         out_v,
         attn_tokens,
     )
+
+
+def awq_gemm_w4a16_cuda(
+    in_feats: torch.Tensor,
+    kernel: torch.Tensor,
+    scaling_factors: torch.Tensor,
+    zeros: torch.Tensor,
+) -> torch.Tensor:
+    """Run the native TinyChat-style AWQ W4A16 GEMM kernel.
+
+    Args:
+        in_feats: Input activations with last dimension equal to input
+            features.
+        kernel: Packed int16 AWQ weights.
+        scaling_factors: Per-group scaling factors.
+        zeros: Per-group zero offsets.
+
+    Returns:
+        Projected activation tensor with the same leading dimensions as
+        ``in_feats``.
+    """
+
+    return _ops().gemm_awq(in_feats, kernel, scaling_factors, zeros)

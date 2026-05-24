@@ -49,6 +49,37 @@ image.save(output_path)
 print(f"saved {output_path}")
 ```
 
+## Quantized T5 Encoder
+
+FLUX.1 can also replace the large T5 `text_encoder_2` with a quantized
+Nunchaku checkpoint:
+
+```python
+pipe = load_nunchaku_pipeline(
+    "black-forest-labs/FLUX.1-dev",
+    pipeline_cls=FluxPipeline,
+    checkpoint="nunchaku-tech/nunchaku-flux.1-dev/svdq-int4_r32-flux.1-dev.safetensors",
+    target="flux",
+    quantized_encoder_checkpoints={
+        "text_encoder_2": "mit-han-lab/nunchaku-t5/awq-int4-flux.1-t5xxl.safetensors",
+    },
+    torch_dtype=torch.bfloat16,
+    device="cuda",
+)
+```
+
+Advanced callers can construct the encoder directly:
+
+```python
+from nunchaku_lite import NunchakuT5EncoderModel
+
+text_encoder_2 = NunchakuT5EncoderModel.from_pretrained(
+    "mit-han-lab/nunchaku-t5/awq-int4-flux.1-t5xxl.safetensors",
+    torch_dtype=torch.bfloat16,
+    device="cuda",
+)
+```
+
 ## FLUX.1-dev Runtime LoRA
 
 Patched FLUX transformers expose `load_lora`, `set_lora_strength`, and

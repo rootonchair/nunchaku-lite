@@ -219,7 +219,7 @@ class SDXLAdapter:
         if getattr(block, "ff", None) is not None:
             patch_modules_recursively(
                 block.ff,
-                module_converters={nn.Linear: lambda linear: svdq_from_linear(linear, context)},
+                module_converters={nn.Linear: lambda _path, linear: svdq_from_linear(linear, context)},
             )
 
 

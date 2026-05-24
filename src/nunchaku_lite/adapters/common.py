@@ -348,7 +348,7 @@ def patch_modules_recursively(
     *,
     path: str = "",
     skips: Callable[[str, nn.Module], bool] | None = None,
-    module_converters: dict[type[nn.Module], Callable[[nn.Module], nn.Module]] | None = None,
+    module_converters: dict[type[nn.Module], Callable[[str, nn.Module], nn.Module]] | None = None,
 ) -> ModulePatchReport:
     """Recursively patch modules through explicit converters.
 
@@ -368,10 +368,10 @@ def patch_modules_recursively(
             for both whole subtrees and leaf linears.
         module_converters: Optional dictionary keyed by exact module class.
             When a child has a matching ``child.__class__`` entry, the
-            converter is called with the child and its return value replaces
-            the child before recursive handling continues. Converters are
-            intended for all replacement decisions, including dense
-            ``nn.Linear`` replacement through :func:`svdq_from_linear`.
+            converter is called with ``(child_path, child)`` and its return
+            value replaces the child before recursive handling continues.
+            Converters are intended for all replacement decisions, including
+            dense ``nn.Linear`` replacement through :func:`svdq_from_linear`.
 
     Returns:
         :class:`ModulePatchReport` containing replacement and skip counts for
@@ -394,7 +394,7 @@ def patch_modules_recursively(
 
         module_converter = module_converters.get(child.__class__)
         if module_converter is not None:
-            child = _mark_patched_module(module_converter(child))
+            child = _mark_patched_module(module_converter(child_path, child))
             setattr(module, name, child)
             report.converted_modules += 1
 
@@ -408,6 +408,7 @@ def patch_modules_recursively(
         )
 
     return report
+
 
 def fuse_linears(linears: list[nn.Linear]) -> nn.Linear:
     """Create a placeholder linear for concatenated output projections.

@@ -43,7 +43,12 @@ current porting backlog for `nunchaku_lite`:
   covering Sana 1.6B and Sana PAG examples.
 - [x] SDXL UNet adapter based on `NunchakuSDXLUNet2DConditionModel`, covering
   SDXL and SDXL-Turbo examples.
-- [ ] Quantized T5 text encoder support based on `NunchakuT5EncoderModel`.
+- [x] Quantized T5 text encoder support based on `NunchakuT5EncoderModel`.
+- [ ] Benchmark quantized text encoder memory and latency impact in end-to-end
+  pipelines.
+- [ ] Quantized Qwen3 text encoder support, covering FLUX.2 Klein and Z-Image.
+- [ ] Quantized Qwen2.5-VL text encoder support, covering Qwen-Image and
+  Qwen-Image-Edit.
 - [x] FLUX runtime LoRA support, including Diffusers-format conversion,
   Nunchaku-format loading, strength control, reset, and multi-LoRA composition.
 - [x] Qwen-Image runtime LoRA support, covering Qwen-Image and Qwen-Image-Edit

@@ -5,6 +5,7 @@ components into Diffusers pipelines and for registering model-specific adapters.
 
 ```python
 from nunchaku_lite import (
+    NunchakuT5EncoderModel,
     TransformerAdapter,
     list_adapters,
     load_nunchaku_pipeline,
@@ -46,7 +47,40 @@ Arguments:
   prefers `transformer`, then `unet`.
 - `precision`, `torch_dtype`, `device`, `strict`, and `adapter_options`: same
   patching controls as `patch_transformer`.
+- `quantized_encoder_checkpoints`: optional mapping from Diffusers component
+  name to a quantized encoder checkpoint. Currently supports T5 checkpoints.
 - Additional keyword arguments are forwarded to `pipeline_cls.from_pretrained(...)`.
+
+Quantized text encoders can be injected up front so Diffusers skips loading the
+dense encoder:
+
+```python
+pipe = load_nunchaku_pipeline(
+    "black-forest-labs/FLUX.1-dev",
+    pipeline_cls=FluxPipeline,
+    checkpoint="nunchaku-tech/nunchaku-flux.1-dev/svdq-int4_r32-flux.1-dev.safetensors",
+    target="flux",
+    quantized_encoder_checkpoints={
+        "text_encoder_2": "mit-han-lab/nunchaku-t5/awq-int4-flux.1-t5xxl.safetensors",
+    },
+    torch_dtype=torch.bfloat16,
+    device="cuda",
+)
+```
+
+## `NunchakuT5EncoderModel`
+
+```python
+text_encoder_2 = NunchakuT5EncoderModel.from_pretrained(
+    "mit-han-lab/nunchaku-t5/awq-int4-flux.1-t5xxl.safetensors",
+    torch_dtype=torch.bfloat16,
+    device="cuda",
+)
+```
+
+`NunchakuT5EncoderModel` loads original Nunchaku AWQ INT4 T5 encoder
+checkpoints and can be passed manually as a Diffusers pipeline component, such
+as FLUX.1 `text_encoder_2`. The quantized forward path uses CUDA native kernels.
 
 ## `patch_transformer`
 

@@ -181,6 +181,7 @@ def load_nunchaku_pipeline(
     device: str | torch.device | None = None,
     strict: bool = True,
     adapter_options: dict[str, Any] | None = None,
+    quantized_encoder_checkpoints: dict[str, str | Path] | None = None,
     **pipeline_kwargs,
 ):
     """Load a Diffusers pipeline with its Nunchaku component installed up front.
@@ -205,6 +206,9 @@ def load_nunchaku_pipeline(
         device: Optional device to move the patched component to after loading.
         strict: Whether checkpoint loading should require exact key matching.
         adapter_options: Optional adapter-specific patch settings.
+        quantized_encoder_checkpoints: Optional mapping from Diffusers pipeline
+            component name to quantized encoder checkpoint. This currently
+            supports T5-compatible Nunchaku checkpoints.
         **pipeline_kwargs: Additional keyword arguments forwarded to
             ``pipeline_cls.from_pretrained``.
 
@@ -224,6 +228,15 @@ def load_nunchaku_pipeline(
             f"pipeline_kwargs already contains {component_name!r}; "
             "load_nunchaku_pipeline creates and injects that component itself."
         )
+    quantized_encoders = _load_quantized_encoder_components(
+        quantized_encoder_checkpoints,
+        pipeline_cls=pipeline_cls,
+        pipeline_config=pipeline_config,
+        pipeline_kwargs=pipeline_kwargs,
+        component_name=component_name,
+        torch_dtype=torch_dtype,
+        device=device,
+    )
 
     component_cls = _resolve_pipeline_component_class(pipeline_config, component_name)
     component_dtype = _resolve_component_torch_dtype(torch_dtype, component_name)
@@ -245,6 +258,7 @@ def load_nunchaku_pipeline(
         pretrained_model_name_or_path,
         torch_dtype=torch_dtype,
         **pipeline_kwargs,
+        **quantized_encoders,
         **{component_name: loaded_component},
     )
     adapter = getattr(loaded_component, "_nunchaku_lite_adapter", None)
@@ -252,6 +266,63 @@ def load_nunchaku_pipeline(
     if patch_pipeline is not None:
         patch_pipeline(pipe, component_name=component_name, component=loaded_component)
     return pipe
+
+
+def _load_quantized_encoder_components(
+    quantized_encoder_checkpoints: dict[str, str | Path] | None,
+    *,
+    pipeline_cls: type,
+    pipeline_config: dict[str, Any],
+    pipeline_kwargs: dict[str, Any],
+    component_name: str,
+    torch_dtype: torch.dtype | dict[str, torch.dtype] | None,
+    device: str | torch.device | None,
+) -> dict[str, torch.nn.Module]:
+    if not quantized_encoder_checkpoints:
+        return {}
+
+    expected_modules = _pipeline_expected_modules(pipeline_cls)
+    components: dict[str, torch.nn.Module] = {}
+    for encoder_component, encoder_checkpoint in quantized_encoder_checkpoints.items():
+        if encoder_component in pipeline_kwargs:
+            raise ValueError(
+                f"pipeline_kwargs already contains {encoder_component!r}; "
+                "remove it or omit quantized_encoder_checkpoints for that component."
+            )
+        if encoder_component == component_name:
+            raise ValueError(
+                f"quantized_encoder_checkpoints cannot replace the main Nunchaku component {component_name!r}."
+            )
+        if encoder_component not in expected_modules and encoder_component not in pipeline_config:
+            raise ValueError(f"Pipeline does not define an encoder component named {encoder_component!r}.")
+        components[encoder_component] = _load_quantized_encoder_component(
+            encoder_checkpoint,
+            torch_dtype=_resolve_component_torch_dtype(torch_dtype, encoder_component),
+            device=device,
+        )
+    return components
+
+
+def _load_quantized_encoder_component(
+    checkpoint: str | Path,
+    *,
+    torch_dtype: torch.dtype | None,
+    device: str | torch.device | None,
+) -> torch.nn.Module:
+    from .text_encoders import NunchakuT5EncoderModel
+
+    try:
+        return NunchakuT5EncoderModel.from_pretrained(
+            checkpoint,
+            torch_dtype=torch_dtype or torch.bfloat16,
+            device=device or "cuda",
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"Unsupported quantized encoder checkpoint {checkpoint!s}. "
+            "Nunchaku Lite currently supports T5 encoder checkpoints only; "
+            "Qwen3 and Qwen2.5-VL encoder support is tracked on the roadmap."
+        ) from exc
 
 
 def _patch_component(
@@ -352,8 +423,7 @@ def _select_pipeline_component(
             return candidate
 
     raise ValueError(
-        "Could not auto-select a Nunchaku pipeline component. "
-        "Pass component='transformer' or component='unet'."
+        "Could not auto-select a Nunchaku pipeline component. Pass component='transformer' or component='unet'."
     )
 
 
@@ -369,9 +439,7 @@ def _pipeline_expected_modules(pipeline_cls: type) -> set[str]:
 def _resolve_pipeline_component_class(pipeline_config: dict[str, Any], component_name: str) -> type[torch.nn.Module]:
     component_spec = pipeline_config.get(component_name)
     if not isinstance(component_spec, (list, tuple)) or len(component_spec) < 2:
-        raise ValueError(
-            f"Pipeline config does not contain a loadable class entry for component {component_name!r}."
-        )
+        raise ValueError(f"Pipeline config does not contain a loadable class entry for component {component_name!r}.")
 
     library_name, class_name = component_spec[:2]
     if library_name is None or class_name is None:

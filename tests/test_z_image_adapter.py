@@ -152,16 +152,24 @@ def test_patch_modules_recursively_replaces_exact_attention_and_filtered_linears
             self.modulation = nn.Linear(8, 8)
 
     module = Wrapper()
+    converted_paths = []
     report = patch_modules_recursively(
         module,
         module_converters={
-            Attention: lambda attention: patch_attention_module(attention, object()),
-            nn.Linear: lambda linear: SVDQW4A4Linear.from_linear(linear, precision="int4", rank=4),
+            Attention: lambda path, attention: (
+                converted_paths.append(path),
+                patch_attention_module(attention, object()),
+            )[1],
+            nn.Linear: lambda path, linear: (
+                converted_paths.append(path),
+                SVDQW4A4Linear.from_linear(linear, precision="int4", rank=4),
+            )[1],
         },
         skips=lambda path, child: isinstance(child, nn.Linear) and not path.startswith("feed_forward."),
     )
 
     assert report.converted_modules == 3
+    assert converted_paths == ["attention", "feed_forward.0", "feed_forward.2"]
     assert isinstance(module.attention, NunchakuAttention)
     assert isinstance(module.feed_forward[0], SVDQW4A4Linear)
     assert isinstance(module.feed_forward[2], SVDQW4A4Linear)
@@ -185,16 +193,27 @@ def test_patch_modules_recursively_applies_module_converters_before_descending()
             self.feed_forward = DiffusersZImageFeedForward(dim=8, hidden_dim=16)
 
     module = Wrapper()
+
+    converted_paths = []
+
+    def convert_linear(path, linear):
+        converted_paths.append(path)
+        return SVDQW4A4Linear.from_linear(linear, precision="int4", rank=4)
+
     report = patch_modules_recursively(
         module,
         module_converters={
-            DiffusersZImageFeedForward: convert_z_image_ff,
-            nn.Linear: lambda linear: SVDQW4A4Linear.from_linear(linear, precision="int4", rank=4),
+            DiffusersZImageFeedForward: lambda path, module: (
+                converted_paths.append(path),
+                convert_z_image_ff(module),
+            )[1],
+            nn.Linear: convert_linear,
         },
         skips=lambda path, child: isinstance(child, nn.Linear) and not path.startswith("feed_forward."),
     )
 
     assert report.converted_modules == 3
+    assert converted_paths == ["feed_forward", "feed_forward.net.0.proj", "feed_forward.net.2"]
     assert isinstance(module.feed_forward, FeedForward)
     assert isinstance(module.feed_forward.net[0].proj, SVDQW4A4Linear)
     assert isinstance(module.feed_forward.net[2], SVDQW4A4Linear)
@@ -212,9 +231,12 @@ def test_patch_modules_recursively_descends_into_unconverted_attention_subclasse
     module = Wrapper()
     report = patch_modules_recursively(
         module,
-        module_converters={nn.Linear: lambda linear: SVDQW4A4Linear.from_linear(linear, precision="int4", rank=4)},
-        skips=lambda path, child: isinstance(child, nn.Linear)
-        and not (path.endswith(".to_q") or path.endswith(".to_k")),
+        module_converters={
+            nn.Linear: lambda _path, linear: SVDQW4A4Linear.from_linear(linear, precision="int4", rank=4)
+        },
+        skips=lambda path, child: (
+            isinstance(child, nn.Linear) and not (path.endswith(".to_q") or path.endswith(".to_k"))
+        ),
     )
 
     assert report.converted_modules == 2
@@ -237,10 +259,14 @@ def test_patch_modules_recursively_replaces_attention_subclasses_with_converter(
             self.attention = CustomAttention(query_dim=8, heads=2, dim_head=4, bias=False)
 
     module = Wrapper()
+    converted_paths = []
     report = patch_modules_recursively(
         module,
-        module_converters={CustomAttention: lambda _attention: NunchakuCustomAttention()},
+        module_converters={
+            CustomAttention: lambda path, _attention: (converted_paths.append(path), NunchakuCustomAttention())[1]
+        },
     )
 
     assert report.converted_modules == 1
+    assert converted_paths == ["attention"]
     assert isinstance(module.attention, NunchakuCustomAttention)

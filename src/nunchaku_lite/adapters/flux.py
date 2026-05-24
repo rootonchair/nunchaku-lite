@@ -394,12 +394,8 @@ class NunchakuFluxAttnProcessor(nn.Module):
         for current_ip_hidden_states, scale, to_k_ip, to_v_ip in zip(
             ip_hidden_states, self.scale, self.to_k_ip, self.to_v_ip
         ):
-            ip_key = to_k_ip(current_ip_hidden_states).view(
-                hidden_states.shape[0], -1, attn.heads, attn.head_dim
-            )
-            ip_value = to_v_ip(current_ip_hidden_states).view(
-                hidden_states.shape[0], -1, attn.heads, attn.head_dim
-            )
+            ip_key = to_k_ip(current_ip_hidden_states).view(hidden_states.shape[0], -1, attn.heads, attn.head_dim)
+            ip_value = to_v_ip(current_ip_hidden_states).view(hidden_states.shape[0], -1, attn.heads, attn.head_dim)
             ip_key = ip_key.transpose(1, 2)
             ip_value = ip_value.transpose(1, 2)
             current_ip_output = F.scaled_dot_product_attention(
@@ -552,7 +548,7 @@ def _patch_flux_feed_forward(ff: nn.Module, context: SVDQPatchContext, **kwargs)
 
     patch_modules_recursively(
         ff.net,
-        module_converters={nn.Linear: lambda linear: svdq_from_linear(linear, context, **kwargs)},
+        module_converters={nn.Linear: lambda _path, linear: svdq_from_linear(linear, context, **kwargs)},
     )
     if len(ff.net) > 2 and isinstance(ff.net[2], SVDQW4A4Linear):
         ff.net[2].act_unsigned = ff.net[2].precision != "nvfp4"
@@ -611,7 +607,6 @@ class NunchakuFluxSingleTransformerBlock(nn.Module):
             hidden_states = hidden_states.clip(-65504, 65504)
         encoder_hidden_states, hidden_states = hidden_states[:, :text_seq_len], hidden_states[:, text_seq_len:]
         return encoder_hidden_states, hidden_states
-
 
 
 class FluxAdapter:
@@ -700,15 +695,15 @@ class FluxAdapter:
             transformer,
             skips=lambda _path, module: isinstance(module, nn.Linear),
             module_converters={
-                AdaLayerNormZero: lambda norm: NunchakuAdaLayerNormZero(
+                AdaLayerNormZero: lambda _path, norm: NunchakuAdaLayerNormZero(
                     norm,
                     scale_shift=0.0,
                     torch_dtype=torch_dtype,
                     return_scale_shift=-1.0,
                 ),
-                FluxAttention: lambda attn: NunchakuFluxAttention(attn, context=context),
-                FeedForward: lambda ff: _patch_flux_feed_forward(ff, context),
-                FluxSingleTransformerBlock: lambda block: NunchakuFluxSingleTransformerBlock(
+                FluxAttention: lambda _path, attn: NunchakuFluxAttention(attn, context=context),
+                FeedForward: lambda _path, ff: _patch_flux_feed_forward(ff, context),
+                FluxSingleTransformerBlock: lambda _path, block: NunchakuFluxSingleTransformerBlock(
                     block,
                     context=context,
                     scale_shift=0.0,

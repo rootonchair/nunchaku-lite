@@ -602,7 +602,7 @@ class QwenImageAdapter:
             transformer,
             skips=lambda _path, module: isinstance(module, nn.Linear),
             module_converters={
-                QwenImageTransformerBlock: lambda block: NunchakuQwenImageTransformerBlock(
+                QwenImageTransformerBlock: lambda _path, block: NunchakuQwenImageTransformerBlock(
                     block, scale_shift=0, context=context
                 )
             },

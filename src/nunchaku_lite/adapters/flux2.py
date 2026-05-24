@@ -346,7 +346,7 @@ def _patch_flux2_feed_forward(ff: Flux2FeedForward, context: SVDQPatchContext | 
 
     patch_modules_recursively(
         ff,
-        module_converters={nn.Linear: lambda linear: svdq_from_linear(linear, context, **kwargs)},
+        module_converters={nn.Linear: lambda _path, linear: svdq_from_linear(linear, context, **kwargs)},
     )
     ff.linear_out.act_unsigned = False
     return ff
@@ -702,9 +702,11 @@ class Flux2Adapter:
             transformer,
             skips=lambda _path, module: isinstance(module, nn.Linear),
             module_converters={
-                Flux2Attention: lambda attn: NunchakuFlux2Attention(attn, context=context),
-                Flux2FeedForward: lambda ff: _patch_flux2_feed_forward(ff, context=context),
-                Flux2ParallelSelfAttention: lambda attn: NunchakuFlux2ParallelSelfAttention(attn, context=context),
+                Flux2Attention: lambda _path, attn: NunchakuFlux2Attention(attn, context=context),
+                Flux2FeedForward: lambda _path, ff: _patch_flux2_feed_forward(ff, context=context),
+                Flux2ParallelSelfAttention: lambda _path, attn: NunchakuFlux2ParallelSelfAttention(
+                    attn, context=context
+                ),
             },
         )
 

@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .ops.gemm import svdq_gemm_w4a4_cuda
+from .ops.gemm import awq_gemm_w4a16_cuda, svdq_gemm_w4a4_cuda
 from .ops.gemv import awq_gemv_w4a16_cuda
 from .ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
 
@@ -408,3 +408,108 @@ class AWQW4A16Linear(nn.Module):
             f"AWQW4A16Linear(in_features={self.in_features}, out_features={self.out_features}, "
             f"group_size={self.group_size})"
         )
+
+
+class TinyChatAWQW4A16Linear(nn.Module):
+    """TinyChat-layout AWQ W4A16 linear projection.
+
+    This module matches original Nunchaku text encoder checkpoints that store
+    packed TinyChat AWQ tensors as ``qweight``, ``scales``, and
+    ``scaled_zeros``.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        group_size: int = 128,
+        torch_dtype: torch.dtype = torch.bfloat16,
+        device: str | torch.device | None = None,
+    ):
+        super().__init__()
+        if group_size != 128:
+            raise ValueError("TinyChatAWQW4A16Linear currently supports group_size=128 only.")
+        if in_features % group_size != 0:
+            raise ValueError("in_features must be divisible by group_size.")
+        if out_features % 4 != 0:
+            raise ValueError("out_features must be divisible by 4.")
+        if torch_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("torch_dtype must be torch.float16 or torch.bfloat16.")
+        if device is None:
+            device = torch.device("cpu")
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+
+        self.register_buffer(
+            "qweight",
+            torch.empty(out_features // 4, in_features, dtype=torch.int16, device=device),
+        )
+        self.register_buffer(
+            "scales",
+            torch.empty(
+                _tinychat_ceil_num_groups(in_features, group_size), out_features, dtype=torch_dtype, device=device
+            ),
+        )
+        self.register_buffer(
+            "scaled_zeros",
+            torch.empty(
+                _tinychat_ceil_num_groups(in_features, group_size), out_features, dtype=torch_dtype, device=device
+            ),
+        )
+        if bias:
+            self.register_buffer("bias", torch.empty(out_features, dtype=torch_dtype, device=device))
+        else:
+            self.bias = None
+
+    @classmethod
+    def from_linear(
+        cls,
+        linear: nn.Linear,
+        *,
+        group_size: int = 128,
+        torch_dtype: torch.dtype | None = None,
+        device: str | torch.device | None = None,
+    ) -> "TinyChatAWQW4A16Linear":
+        """Allocate an empty quantized module with metadata copied from ``linear``."""
+
+        if torch_dtype is None:
+            torch_dtype = linear.weight.dtype
+        if device is None:
+            device = linear.weight.device
+        return cls(
+            in_features=linear.in_features,
+            out_features=linear.out_features,
+            bias=linear.bias is not None,
+            group_size=group_size,
+            torch_dtype=torch_dtype,
+            device=device,
+        )
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the packed AWQ projection using the TinyChat GEMM path."""
+
+        output = awq_gemm_w4a16_cuda(x, self.qweight, self.scales, self.scaled_zeros)
+        if self.bias is not None:
+            output = output + self.bias.view([1] * (output.ndim - 1) + [-1])
+        return output
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"bias={self.bias is not None}, weight_bits=4, group_size={self.group_size}"
+        )
+
+
+def _tinychat_ceil_num_groups(in_features: int, group_size: int, weight_bits: int = 4) -> int:
+    if in_features % group_size != 0:
+        raise ValueError("in_features must be divisible by group_size.")
+    if weight_bits != 4:
+        raise ValueError("Only 4-bit weights are supported.")
+    num_groups = in_features // group_size
+    pack_size = 32 // weight_bits
+    num_packs = (num_groups + pack_size - 1) // pack_size
+    return num_packs * pack_size

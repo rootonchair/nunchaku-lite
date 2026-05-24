@@ -144,6 +144,7 @@ if __name__ == "__main__":
             native_source("src/kernels/zgemm/gemm_w4a4_launch_bf16_int4.cu"),
             native_source("src/kernels/zgemm/gemm_w4a4_launch_bf16_fp4.cu"),
             native_source("src/kernels/zgemm/attention.cu"),
+            native_source("src/kernels/awq/gemm_awq.cu"),
             native_source("src/kernels/awq/gemv_awq.cu"),
         ],
         extra_compile_args={
