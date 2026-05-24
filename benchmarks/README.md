@@ -2,9 +2,15 @@
 
 The benchmark scripts compare unmodified Diffusers pipelines against
 `nunchaku_lite` pipelines loaded with quantized transformer weights.
+FLUX.1, Z-Image, and Qwen-Image can also benchmark the original Nunchaku
+checkout at `/mnt/disks/workspace/research/nunchaku` with
+`--run-original-nunchaku`.
 
 Outputs are written under `outputs/benchmark_*/` and include generated images
-plus a `summary.json` file with timing and CUDA memory statistics.
+plus a `summary.json` file with timing and CUDA memory statistics. Benchmarks
+that run both original Diffusers and `nunchaku_lite` also write
+`comparison.png` with latency and peak CUDA memory charts. When original
+Nunchaku is enabled, it is included as a third comparison series.
 
 ## Z-Image
 
