@@ -3,8 +3,8 @@
 The benchmark scripts compare unmodified Diffusers pipelines against
 `nunchaku_lite` pipelines loaded with quantized transformer weights.
 FLUX.1, Z-Image, and Qwen-Image can also benchmark the original Nunchaku
-checkout with `--run-original-nunchaku`. By default, the scripts look for a
-sibling `../nunchaku` checkout; set `NUNCHAKU_ORIGINAL_SRC` to override it.
+package with `--run-original-nunchaku`. The scripts import `nunchaku` lazily
+only when that optional run is requested.
 
 Outputs are written under `outputs/benchmark_*/` and include generated images
 plus a `summary.json` file with timing and CUDA memory statistics. Benchmarks

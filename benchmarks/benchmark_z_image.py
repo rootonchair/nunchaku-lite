@@ -12,7 +12,6 @@ from utils import (
     dtype_from_arg,
     import_diffusers_pipeline,
     import_original_nunchaku_class,
-    original_nunchaku_source,
     pipeline_transformer_size_gb,
     print_benchmark_speedups,
     run_generation_loop,
@@ -162,7 +161,6 @@ def main() -> None:
         "warmup_runs": args.warmup_runs,
         "dtype": args.dtype,
         "precision": args.precision,
-        "original_nunchaku_src": original_nunchaku_source() if args.run_original_nunchaku else None,
         "device": torch.cuda.get_device_name(0),
     }
     results = {"metadata": metadata}

@@ -1,6 +1,5 @@
 import gc
 import importlib
-import os
 import sys
 import time
 from collections.abc import Callable
@@ -9,11 +8,6 @@ from statistics import mean, stdev
 from typing import Any
 
 import torch
-
-
-ORIGINAL_NUNCHAKU_SRC = Path(
-    os.environ.get("NUNCHAKU_ORIGINAL_SRC", Path(__file__).resolve().parents[2] / "nunchaku")
-)
 
 
 def benchmark_device_label(device: str) -> str:
@@ -30,29 +24,9 @@ def import_diffusers_pipeline(local_diffusers_src: str | None, pipeline_name: st
 
 
 def import_original_nunchaku_class(class_name: str):
-    if not ORIGINAL_NUNCHAKU_SRC.exists():
-        raise FileNotFoundError(f"original Nunchaku checkout not found: {ORIGINAL_NUNCHAKU_SRC}")
-
-    original_path = str(ORIGINAL_NUNCHAKU_SRC)
-    if sys.path[0:1] != [original_path]:
-        sys.path = [path for path in sys.path if path != original_path]
-        sys.path.insert(0, original_path)
-
-    loaded = sys.modules.get("nunchaku")
-    if loaded is not None:
-        loaded_file = Path(getattr(loaded, "__file__", "") or "").resolve()
-        if ORIGINAL_NUNCHAKU_SRC.resolve() not in loaded_file.parents:
-            for module_name in list(sys.modules):
-                if module_name == "nunchaku" or module_name.startswith("nunchaku."):
-                    del sys.modules[module_name]
-
     importlib.invalidate_caches()
     nunchaku = importlib.import_module("nunchaku")
     return getattr(nunchaku, class_name)
-
-
-def original_nunchaku_source() -> str:
-    return str(ORIGINAL_NUNCHAKU_SRC)
 
 
 def dtype_from_arg(name: str) -> torch.dtype:
