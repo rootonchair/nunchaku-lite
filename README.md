@@ -42,6 +42,20 @@ Its core features include:
   small adapters without requiring pipeline subclasses or a dependency on the
   full `nunchaku` Python package.
 
+## Benchmarks
+
+<p align="center">
+  <img src="docs/assets/benchmarks/readme-benchmark-summary.png" alt="nunchaku_lite benchmark gains versus original Diffusers" width="900">
+</p>
+
+On an NVIDIA RTX PRO 6000, `nunchaku_lite` delivers up
+to `1.79x` lower latency, up to `46%` lower peak CUDA memory, and up to `71%`
+smaller transformer storage versus unmodified Diffusers pipelines in the current
+benchmark set.
+
+See [docs/benchmarks.md](docs/benchmarks.md) for charts, generated samples,
+run settings, and reproduction commands.
+
 ## Supported Models
 
 `nunchaku_lite` currently supports Diffusers pipelines whose transformer or UNet
@@ -216,6 +230,7 @@ org-or-user/repo-name/path/to/checkpoint.safetensors
 | Topic | Link |
 | --- | --- |
 | Hosted documentation | [nunchaku-lite.readthedocs.io](https://nunchaku-lite.readthedocs.io/en/latest/) |
+| Benchmark charts and samples | [docs/benchmarks.md](docs/benchmarks.md) |
 | Public API and runtime LoRA usage | [docs/api.md](docs/api.md) |
 | Development, testing, and adapter authoring | [docs/development.md](docs/development.md) |
 | Documentation deployment flow | [docs/deployment.md](docs/deployment.md) |

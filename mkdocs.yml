@@ -71,10 +71,12 @@ markdown_extensions:
 nav:
   - Home:
       - Overview: index.md
+      - Benchmarks: benchmarks.md
       - Installation: installation.md
       - Quick Start: quick_start.md
   - Documentation:
       - Overview: overview.md
+      - Benchmarks: benchmarks.md
       - Supported models:
           - FLUX.1: models/flux.md
           - FLUX.2 Klein: models/flux2.md

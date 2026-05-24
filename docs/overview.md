@@ -10,6 +10,8 @@ adapters. The usual workflow is:
 
 The documentation in this section covers:
 
+- [Benchmarks](benchmarks.md): measured latency, peak CUDA memory, transformer
+  storage, charts, and generated samples.
 - [Supported models](models/flux.md): runnable model-specific loading guides.
 - [API Reference](api.md): public loading, patching, and adapter registry APIs.
 - [Roadmap](roadmap.md): supported model coverage and remaining feature work.

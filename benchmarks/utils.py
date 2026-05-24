@@ -1,5 +1,6 @@
 import gc
 import importlib
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -10,7 +11,13 @@ from typing import Any
 import torch
 
 
-ORIGINAL_NUNCHAKU_SRC = Path("/mnt/disks/workspace/research/nunchaku")
+ORIGINAL_NUNCHAKU_SRC = Path(
+    os.environ.get("NUNCHAKU_ORIGINAL_SRC", Path(__file__).resolve().parents[2] / "nunchaku")
+)
+
+
+def benchmark_device_label(device: str) -> str:
+    return device.replace(" Blackwell Server Edition", "")
 
 
 def import_diffusers_pipeline(local_diffusers_src: str | None, pipeline_name: str):
@@ -245,7 +252,7 @@ def write_comparison_plot(results: dict, output_dir: Path, title: str) -> Path |
     fig.text(
         0.5,
         0.02,
-        f"{metadata['device']} | {metadata['width']}x{metadata['height']} | "
+        f"{benchmark_device_label(metadata['device'])} | {metadata['width']}x{metadata['height']} | "
         f"{metadata['steps']} steps | {metadata['runs']} measured runs",
         ha="center",
         fontsize=9,
