@@ -5,8 +5,7 @@ the normal Diffusers pipeline workflow. The measurements below compare
 unmodified Diffusers pipelines against `nunchaku_lite` pipelines loaded with
 FP4 SVDQ checkpoints.
 
-All runs used `1024x1024` generation on an NVIDIA RTX PRO 6000 Blackwell Server
-Edition, BF16 runtime dtype, 5 measured runs, and 2 warmup runs. Source data is
+All runs used `1024x1024` generation on an NVIDIA RTX PRO 6000, BF16 runtime dtype, 5 measured runs, and 2 warmup runs. Source data is
 stored under `outputs/benchmark_*/summary.json`.
 
 ## Results
