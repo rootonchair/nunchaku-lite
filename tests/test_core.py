@@ -201,7 +201,7 @@ def test_load_nunchaku_pipeline_injects_quantized_encoder_component(tmp_path, mo
     def fake_load_encoder(checkpoint, *, torch_dtype, device):
         assert checkpoint == "encoder.safetensors"
         assert torch_dtype is torch.float16
-        assert device == "cuda"
+        assert device == "cpu"
         return encoder
 
     _install_fake_adapter(monkeypatch)
@@ -213,7 +213,7 @@ def test_load_nunchaku_pipeline_injects_quantized_encoder_component(tmp_path, mo
         checkpoint=_fake_checkpoint(tmp_path),
         target=FakeAdapter.target,
         torch_dtype={"default": torch.bfloat16, "text_encoder_2": torch.float16},
-        device="cuda",
+        device="cpu",
         quantized_encoder_checkpoints={"text_encoder_2": "encoder.safetensors"},
     )
 
