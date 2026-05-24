@@ -12,6 +12,23 @@ that run both original Diffusers and `nunchaku_lite` also write
 `comparison.png` with latency and peak CUDA memory charts. When original
 Nunchaku is enabled, it is included as a third comparison series.
 
+## README Figure
+
+Regenerate the README benchmark summary figure from existing benchmark summaries:
+
+```bash
+python benchmarks/generate_readme_benchmark_figure.py
+```
+
+When adding a new benchmark result, either update the default entries in the
+script or pass explicit entries in display order:
+
+```bash
+python benchmarks/generate_readme_benchmark_figure.py \
+  --entry 'FLUX.2\nKlein 4B=outputs/benchmark_flux2_klein_4b/summary.json' \
+  --entry 'New\nModel=outputs/benchmark_new_model/summary.json'
+```
+
 ## Z-Image
 
 ```bash
