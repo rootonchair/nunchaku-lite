@@ -124,7 +124,7 @@ def svdq_gemm_w4a4_cuda(
     )
 
 
-def awq_gemm_w4a16_cuda(
+def awq_gemm_w4a16_g128_int16(
     in_feats: torch.Tensor,
     kernel: torch.Tensor,
     scaling_factors: torch.Tensor,
@@ -144,4 +144,29 @@ def awq_gemm_w4a16_cuda(
         ``in_feats``.
     """
 
-    return _ops().gemm_awq(in_feats, kernel, scaling_factors, zeros)
+    return _ops().awq_gemm_w4a16_g128_int16(in_feats, kernel, scaling_factors, zeros)
+
+
+def awq_gemm_w4a16_g64_int32(
+    in_feats: torch.Tensor,
+    kernel: torch.Tensor,
+    scaling_factors: torch.Tensor,
+    zeros: torch.Tensor,
+) -> torch.Tensor:
+    """Run the native AWQ W4A16 GEMM kernel for g64/int32-packed weights.
+
+    Args:
+        in_feats: Input activations with last dimension equal to input
+            features.
+        kernel: Packed int32 AWQ weights.
+        scaling_factors: Per-group scaling factors with shape
+            ``[in_features // 64, out_features]``.
+        zeros: Per-group additive zero offsets with the same shape as
+            ``scaling_factors``.
+
+    Returns:
+        Projected activation tensor with the same leading dimensions as
+        ``in_feats``.
+    """
+
+    return _ops().awq_gemm_w4a16_g64_int32(in_feats, kernel, scaling_factors, zeros)

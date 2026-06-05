@@ -45,10 +45,31 @@
     int j_factors1 = num_out_channels / CTA_N / 1;                                                                     \
     dim3 num_blocks((num_out_feats + CTA_M - 1) / CTA_M * j_factors1 * SPLITK);                                        \
     dim3 threads_per_block(WARP_SIZE, NUM_WARPS);                                                                      \
-    auto kernel_func = gemm_w4a16_T1<f16_t, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G, SPLITK>;           \
+    auto kernel_func = awq_gemm_w4a16_kernel<f16_t, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G, SPLITK>;   \
     cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemByteSize);                     \
     kernel_func<<<num_blocks, threads_per_block, kSmemByteSize>>>(                                                     \
         in_feats, kernel, scales, zeros, out_feats, semaphores, num_in_feats, num_out_channels, num_in_channels);
+
+#define LARGE_M_KERNEL_LAUNCH_CODE                                                                                     \
+    constexpr int NUM_WARPS = (CTA_M / WARP_M) * (CTA_N / WARP_N);                                                     \
+    constexpr int SCALES_LOAD_INTERVAL = G >= CTA_K ? G / CTA_K : 1;                                                   \
+    constexpr int SCALES_PER_LOAD      = G < CTA_K ? CTA_K / G : 1;                                                    \
+    constexpr int SCALES_ZEROS_SMEM_SIZE = 2 * CTA_N * STAGES / SCALES_LOAD_INTERVAL * SCALES_PER_LOAD;                \
+    constexpr int kSmemByteSize =                                                                                      \
+        ((CTA_M * (CTA_K + SMEM_PAD_A) + CTA_N * (CTA_K + SMEM_PAD_B) / kInterleave) * STAGES +                        \
+         SCALES_ZEROS_SMEM_SIZE) *                                                                                     \
+        sizeof(f16_t);                                                                                                 \
+    if (kSmemByteSize >= 99 * 1024) {                                                                                  \
+        printf("This kernel requires %d Bytes of shared memory, which exceeds device limit.\n", kSmemByteSize);        \
+        return _out_feats;                                                                                             \
+    }                                                                                                                  \
+    int j_factors1 = num_out_channels / CTA_N / 1;                                                                     \
+    dim3 num_blocks((num_out_feats + CTA_M - 1) / CTA_M * j_factors1);                                                 \
+    dim3 threads_per_block(WARP_SIZE, NUM_WARPS);                                                                      \
+    auto kernel_func = awq_gemm_w4a16_large_m_kernel<f16_t, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G>;   \
+    cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemByteSize);                     \
+    kernel_func<<<num_blocks, threads_per_block, kSmemByteSize>>>(                                                     \
+        in_feats, kernel, scales, zeros, out_feats, num_in_feats, num_out_channels, num_in_channels);
 
 template<int N>
 __inline__ __host__ __device__ int get_log_tile(int n) {
@@ -369,15 +390,15 @@ template<typename f16_t,
          int STAGES,
          int G,
          int SPLITK>
-__global__ void gemm_w4a16_T1(f16_t *__restrict__ A,
-                              f16_t *__restrict__ B,
-                              f16_t *__restrict__ scales,
-                              f16_t *__restrict__ zeros,
-                              f16_t *__restrict__ C,
-                              int *__restrict__ semaphores,
-                              int M,
-                              int N,
-                              int K) {
+__global__ void awq_gemm_w4a16_kernel(f16_t *__restrict__ A,
+                                       f16_t *__restrict__ B,
+                                       f16_t *__restrict__ scales,
+                                       f16_t *__restrict__ zeros,
+                                       f16_t *__restrict__ C,
+                                       int *__restrict__ semaphores,
+                                       int M,
+                                       int N,
+                                       int K) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
     trap_unsupported_arch();
     return;
@@ -757,7 +778,7 @@ __global__ void gemm_w4a16_T1(f16_t *__restrict__ A,
 }
 
 template<typename f16_t, int CTA_M, int CTA_N, int CTA_K, int CTA_SIZE, int SHARED_K_ITERS, int STAGES>
-__device__ __inline__ void global_to_share_one_stage_A_T2(f16_t *src,
+__device__ __inline__ void global_to_share_one_stage_A_large_m(f16_t *src,
                                                           f16_t *dst,
                                                           int global_nrows,
                                                           int global_ncols,
@@ -799,7 +820,7 @@ __device__ __inline__ void global_to_share_one_stage_A_T2(f16_t *src,
 }
 
 template<typename f16_t, int CTA_M, int CTA_N, int CTA_K, int CTA_SIZE, int SHARED_K_ITERS, int STAGES>
-__device__ __inline__ void global_to_share_one_stage_B_T2(f16_t *src,
+__device__ __inline__ void global_to_share_one_stage_B_large_m(f16_t *src,
                                                           f16_t *dst,
                                                           int global_ncols,
                                                           int cta_offset_m,
@@ -837,7 +858,7 @@ __device__ __inline__ void global_to_share_one_stage_B_T2(f16_t *src,
 }
 
 template<typename f16_t, int CTA_M, int CTA_N, int CTA_K, int CTA_SIZE, int STAGES, int G>
-__device__ __inline__ void global_to_share_one_stage_scales_T2(f16_t *src,
+__device__ __inline__ void global_to_share_one_stage_scales_large_m(f16_t *src,
                                                                f16_t *dst,
                                                                f16_t *src_z,
                                                                f16_t *dst_z,
@@ -875,7 +896,7 @@ __device__ __inline__ void global_to_share_one_stage_scales_T2(f16_t *src,
 
 template<typename f16_t, int CTA_M, int CTA_N, int CTA_K, int STAGES, int shared_iters>
 __device__ __inline__ void
-share_to_reg_one_stage_A_T2(f16_t *src, f16_t *dst, int warp_offset_m, int warp_offset_n, int k_0_1) {
+share_to_reg_one_stage_A_large_m(f16_t *src, f16_t *dst, int warp_offset_m, int warp_offset_n, int k_0_1) {
     constexpr int kSmemCol = CTA_K + SMEM_PAD_A;
 
     for (int shared_iter = 0; shared_iter < shared_iters; ++shared_iter) {
@@ -891,7 +912,7 @@ share_to_reg_one_stage_A_T2(f16_t *src, f16_t *dst, int warp_offset_m, int warp_
 }
 
 template<typename f16_t, int CTA_M, int CTA_N, int CTA_K, int STAGES, bool ldmatrix, int shared_iters, int G>
-__device__ __inline__ void share_to_reg_one_stage_B_T2(f16_t *src,
+__device__ __inline__ void share_to_reg_one_stage_B_large_m(f16_t *src,
                                                        f16_t *src_scales,
                                                        f16_t *src_zeros,
                                                        f16_t *dst,
@@ -936,14 +957,14 @@ __device__ __inline__ void share_to_reg_one_stage_B_T2(f16_t *src,
 }
 
 template<typename f16_t, int CTA_M, int CTA_N, int CTA_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, int G>
-__global__ void gemm_w4a16_T2(f16_t *__restrict__ A,
-                              f16_t *__restrict__ B,
-                              f16_t *__restrict__ scales,
-                              f16_t *__restrict__ zeros,
-                              f16_t *__restrict__ C,
-                              int M,
-                              int N,
-                              int K) {
+__global__ void awq_gemm_w4a16_large_m_kernel(f16_t *__restrict__ A,
+                                               f16_t *__restrict__ B,
+                                               f16_t *__restrict__ scales,
+                                               f16_t *__restrict__ zeros,
+                                               f16_t *__restrict__ C,
+                                               int M,
+                                               int N,
+                                               int K) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
     trap_unsupported_arch();
     return;
@@ -970,9 +991,10 @@ __global__ void gemm_w4a16_T2(f16_t *__restrict__ A,
     constexpr int kSmemSizeBPerStage   = CTA_N / kInterleave * kSmemPadKB;
     constexpr int kSmemSizeA           = kSmemSizeAPerStage * STAGES;
     constexpr int kSmemSizeB           = kSmemSizeBPerStage * STAGES;
-    constexpr int kSmemSizeScales      = CTA_N * STAGES / 2;
-    constexpr int kSmemSizeZeros       = CTA_N * STAGES / 2;
-    constexpr int scales_load_interval = G / CTA_K;
+    constexpr int scales_load_interval = G >= CTA_K ? G / CTA_K : 1;
+    constexpr int scales_per_load      = G < CTA_K ? CTA_K / G : 1;
+    constexpr int kSmemSizeScales      = CTA_N * STAGES / scales_load_interval * scales_per_load;
+    constexpr int kSmemSizeZeros       = CTA_N * STAGES / scales_load_interval * scales_per_load;
     extern __shared__ half mem_shared[];
     f16_t *A_shared      = reinterpret_cast<f16_t *>(mem_shared);
     f16_t *B_shared      = reinterpret_cast<f16_t *>(mem_shared + kSmemSizeA);
@@ -995,15 +1017,15 @@ __global__ void gemm_w4a16_T2(f16_t *__restrict__ A,
     constexpr int prologue_stages = STAGES == 1 ? 1 : STAGES - 1;
 #pragma unroll
     for (k_0_0_ld = 0; k_0_0_ld < prologue_stages; ++k_0_0_ld) {
-        global_to_share_one_stage_A_T2<f16_t, CTA_M, CTA_N, CTA_K, CTA_SIZE, 1, STAGES>(
+        global_to_share_one_stage_A_large_m<f16_t, CTA_M, CTA_N, CTA_K, CTA_SIZE, 1, STAGES>(
             A, A_shared + k_0_0_ld * kSmemSizeAPerStage, M, K, cta_offset_m, cta_offset_n, k_0_0_ld, 0, true);
-        global_to_share_one_stage_B_T2<f16_t, CTA_M, CTA_N, CTA_K, CTA_SIZE, 1, STAGES>(
+        global_to_share_one_stage_B_large_m<f16_t, CTA_M, CTA_N, CTA_K, CTA_SIZE, 1, STAGES>(
             B, B_shared + k_0_0_ld * kSmemSizeBPerStage, K, cta_offset_m, cta_offset_n, k_0_0_ld, 0, true);
-        global_to_share_one_stage_scales_T2<f16_t, CTA_M, CTA_N, CTA_K, CTA_SIZE, STAGES, G>(
+        global_to_share_one_stage_scales_large_m<f16_t, CTA_M, CTA_N, CTA_K, CTA_SIZE, STAGES, G>(
             scales,
-            scales_shared + (k_0_0_ld / scales_load_interval) * CTA_N,
+            scales_shared + (k_0_0_ld / scales_load_interval * scales_per_load) * CTA_N,
             zeros,
-            zeros_shared + (k_0_0_ld / scales_load_interval) * CTA_N,
+            zeros_shared + (k_0_0_ld / scales_load_interval * scales_per_load) * CTA_N,
             N,
             cta_offset_m,
             cta_offset_n,
@@ -1017,9 +1039,9 @@ __global__ void gemm_w4a16_T2(f16_t *__restrict__ A,
         __pipeline_wait_prior(STAGES - 2);
     __syncthreads();
 
-    share_to_reg_one_stage_A_T2<f16_t, CTA_M, CTA_N, CTA_K, STAGES, WARP_M / INTRIN_M>(
+    share_to_reg_one_stage_A_large_m<f16_t, CTA_M, CTA_N, CTA_K, STAGES, WARP_M / INTRIN_M>(
         A_shared, A_shared_warp_[0], warp_offset_m, warp_offset_n, 0);
-    share_to_reg_one_stage_B_T2<f16_t, CTA_M, CTA_N, CTA_K, STAGES, true, WARP_N / INTRIN_N, G>(B_shared,
+    share_to_reg_one_stage_B_large_m<f16_t, CTA_M, CTA_N, CTA_K, STAGES, true, WARP_N / INTRIN_N, G>(B_shared,
                                                                                                 scales_shared,
                                                                                                 zeros_shared,
                                                                                                 B_shared_warp_tmp_[0],
@@ -1040,9 +1062,11 @@ __global__ void gemm_w4a16_T2(f16_t *__restrict__ A,
         for (int iter_k = 0; iter_k < SHARED_K_ITERS; ++iter_k) {
             A_shared_this_compute_stage      = A_shared + compute_stage * kSmemSizeAPerStage;
             B_shared_this_compute_stage      = B_shared + compute_stage * kSmemSizeBPerStage;
-            scales_shared_this_compute_stage = scales_shared + (compute_stage / scales_load_interval) * CTA_N;
-            zeros_shared_this_compute_stage  = zeros_shared + (compute_stage / scales_load_interval) * CTA_N;
-            share_to_reg_one_stage_A_T2<f16_t, CTA_M, CTA_N, CTA_K, STAGES, WARP_M / INTRIN_M>(
+            scales_shared_this_compute_stage =
+                scales_shared + (compute_stage / scales_load_interval * scales_per_load) * CTA_N;
+            zeros_shared_this_compute_stage =
+                zeros_shared + (compute_stage / scales_load_interval * scales_per_load) * CTA_N;
+            share_to_reg_one_stage_A_large_m<f16_t, CTA_M, CTA_N, CTA_K, STAGES, WARP_M / INTRIN_M>(
                 A_shared_this_compute_stage,
                 A_shared_warp_[(iter_k + 1) % 2],
                 warp_offset_m,
@@ -1050,7 +1074,7 @@ __global__ void gemm_w4a16_T2(f16_t *__restrict__ A,
                 (iter_k + 1) % SHARED_K_ITERS);
             if ((iter_k + 1) % kInterleave == 0) {
                 if (compute_stage % 2 == 1) {
-                    share_to_reg_one_stage_B_T2<f16_t, CTA_M, CTA_N, CTA_K, STAGES, true, WARP_N / INTRIN_N, G>(
+                    share_to_reg_one_stage_B_large_m<f16_t, CTA_M, CTA_N, CTA_K, STAGES, true, WARP_N / INTRIN_N, G>(
                         B_shared_this_compute_stage,
                         scales_shared_this_compute_stage,
                         zeros_shared_this_compute_stage,
@@ -1060,7 +1084,7 @@ __global__ void gemm_w4a16_T2(f16_t *__restrict__ A,
                         warp_offset_n,
                         (iter_k + 1) % SHARED_K_ITERS);
                 } else {
-                    share_to_reg_one_stage_B_T2<f16_t, CTA_M, CTA_N, CTA_K, STAGES, true, WARP_N / INTRIN_N, G>(
+                    share_to_reg_one_stage_B_large_m<f16_t, CTA_M, CTA_N, CTA_K, STAGES, true, WARP_N / INTRIN_N, G>(
                         B_shared_this_compute_stage,
                         scales_shared_this_compute_stage,
                         zeros_shared_this_compute_stage,
@@ -1072,7 +1096,7 @@ __global__ void gemm_w4a16_T2(f16_t *__restrict__ A,
                 }
             } else {
                 if (compute_stage % 2 == 1) {
-                    share_to_reg_one_stage_B_T2<f16_t, CTA_M, CTA_N, CTA_K, STAGES, false, WARP_N / INTRIN_N, G>(
+                    share_to_reg_one_stage_B_large_m<f16_t, CTA_M, CTA_N, CTA_K, STAGES, false, WARP_N / INTRIN_N, G>(
                         B_shared_this_compute_stage,
                         scales_shared_this_compute_stage,
                         zeros_shared_this_compute_stage,
@@ -1082,7 +1106,7 @@ __global__ void gemm_w4a16_T2(f16_t *__restrict__ A,
                         warp_offset_n,
                         (iter_k + 1) % SHARED_K_ITERS);
                 } else {
-                    share_to_reg_one_stage_B_T2<f16_t, CTA_M, CTA_N, CTA_K, STAGES, false, WARP_N / INTRIN_N, G>(
+                    share_to_reg_one_stage_B_large_m<f16_t, CTA_M, CTA_N, CTA_K, STAGES, false, WARP_N / INTRIN_N, G>(
                         B_shared_this_compute_stage,
                         scales_shared_this_compute_stage,
                         zeros_shared_this_compute_stage,
@@ -1110,7 +1134,7 @@ __global__ void gemm_w4a16_T2(f16_t *__restrict__ A,
             if (iter_k < WARP_K / INTRIN_K - 1) {
                 if constexpr (STAGES == 1)
                     __syncthreads();
-                global_to_share_one_stage_A_T2<f16_t, CTA_M, CTA_N, CTA_K, CTA_SIZE, WARP_K / INTRIN_K, STAGES>(
+                global_to_share_one_stage_A_large_m<f16_t, CTA_M, CTA_N, CTA_K, CTA_SIZE, WARP_K / INTRIN_K, STAGES>(
                     A,
                     A_shared + ld_stage * kSmemSizeAPerStage,
                     M,
@@ -1120,7 +1144,7 @@ __global__ void gemm_w4a16_T2(f16_t *__restrict__ A,
                     k_0_0_ld,
                     iter_k,
                     k_0_0_ld < gemm_iters);
-                global_to_share_one_stage_B_T2<f16_t, CTA_M, CTA_N, CTA_K, CTA_SIZE, WARP_K / INTRIN_K, STAGES>(
+                global_to_share_one_stage_B_large_m<f16_t, CTA_M, CTA_N, CTA_K, CTA_SIZE, WARP_K / INTRIN_K, STAGES>(
                     B,
                     B_shared + ld_stage * kSmemSizeBPerStage,
                     K,
@@ -1135,7 +1159,7 @@ __global__ void gemm_w4a16_T2(f16_t *__restrict__ A,
                 if constexpr (STAGES == 1 && WARP_K / INTRIN_K > 2) {
                     __syncthreads();
                 }
-                global_to_share_one_stage_A_T2<f16_t, CTA_M, CTA_N, CTA_K, CTA_SIZE, WARP_K / INTRIN_K, STAGES>(
+                global_to_share_one_stage_A_large_m<f16_t, CTA_M, CTA_N, CTA_K, CTA_SIZE, WARP_K / INTRIN_K, STAGES>(
                     A,
                     A_shared + ld_stage * kSmemSizeAPerStage,
                     M,
@@ -1145,7 +1169,7 @@ __global__ void gemm_w4a16_T2(f16_t *__restrict__ A,
                     k_0_0_ld,
                     iter_k + 1,
                     k_0_0_ld < gemm_iters);
-                global_to_share_one_stage_B_T2<f16_t, CTA_M, CTA_N, CTA_K, CTA_SIZE, WARP_K / INTRIN_K, STAGES>(
+                global_to_share_one_stage_B_large_m<f16_t, CTA_M, CTA_N, CTA_K, CTA_SIZE, WARP_K / INTRIN_K, STAGES>(
                     B,
                     B_shared + ld_stage * kSmemSizeBPerStage,
                     K,
@@ -1154,11 +1178,11 @@ __global__ void gemm_w4a16_T2(f16_t *__restrict__ A,
                     k_0_0_ld,
                     iter_k + 1,
                     k_0_0_ld < gemm_iters);
-                global_to_share_one_stage_scales_T2<f16_t, CTA_M, CTA_N, CTA_K, CTA_SIZE, STAGES, G>(
+                global_to_share_one_stage_scales_large_m<f16_t, CTA_M, CTA_N, CTA_K, CTA_SIZE, STAGES, G>(
                     scales,
-                    scales_shared + (ld_stage / scales_load_interval) * CTA_N,
+                    scales_shared + (ld_stage / scales_load_interval * scales_per_load) * CTA_N,
                     zeros,
-                    zeros_shared + (ld_stage / scales_load_interval) * CTA_N,
+                    zeros_shared + (ld_stage / scales_load_interval * scales_per_load) * CTA_N,
                     N,
                     cta_offset_m,
                     cta_offset_n,
@@ -1190,7 +1214,7 @@ __global__ void gemm_w4a16_T2(f16_t *__restrict__ A,
     }
 }
 
-Tensor awq_gemm_forward_cuda(Tensor _in_feats, Tensor _kernel, Tensor _scales, Tensor _zeros) {
+Tensor awq_gemm_w4a16_g128_int16(Tensor _in_feats, Tensor _kernel, Tensor _scales, Tensor _zeros) {
     auto output_shape    = _in_feats.shape.dataExtent;
     output_shape.back()  = _kernel.size(0) * kInterleave;
     int num_in_feats     = _in_feats.numel() / _in_feats.size(-1);
@@ -1265,21 +1289,7 @@ Tensor awq_gemm_forward_cuda(Tensor _in_feats, Tensor _kernel, Tensor _scales, T
             constexpr int WARP_K = 64;
             constexpr int STAGES = 4;
 
-            constexpr int NUM_WARPS = (CTA_M / WARP_M) * (CTA_N / WARP_N);
-            constexpr int kSmemByteSize =
-                (CTA_M * (CTA_K + SMEM_PAD_A) + CTA_N * (CTA_K + SMEM_PAD_B) / kInterleave + CTA_N) * STAGES *
-                sizeof(f16_t);
-            if (kSmemByteSize >= 99 * 1024) {
-                printf("This kernel requires %d Bytes of shared memory, which exceeds device limit.\n", kSmemByteSize);
-                return _out_feats;
-            }
-            int j_factors1 = num_out_channels / CTA_N / 1;
-            dim3 num_blocks((num_out_feats + CTA_M - 1) / CTA_M * j_factors1);
-            dim3 threads_per_block(WARP_SIZE, NUM_WARPS);
-            auto kernel_func = gemm_w4a16_T2<f16_t, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G>;
-            cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemByteSize);
-            kernel_func<<<num_blocks, threads_per_block, kSmemByteSize>>>(
-                in_feats, kernel, scales, zeros, out_feats, num_in_feats, num_out_channels, num_in_channels);
+            LARGE_M_KERNEL_LAUNCH_CODE
         }
     } else if (_in_feats.scalar_type() == Tensor::BF16) {
         using f16_t = __nv_bfloat16;
@@ -1345,21 +1355,116 @@ Tensor awq_gemm_forward_cuda(Tensor _in_feats, Tensor _kernel, Tensor _scales, T
             constexpr int WARP_K = 64;
             constexpr int STAGES = 4;
 
-            constexpr int NUM_WARPS = (CTA_M / WARP_M) * (CTA_N / WARP_N);
-            constexpr int kSmemByteSize =
-                (CTA_M * (CTA_K + SMEM_PAD_A) + CTA_N * (CTA_K + SMEM_PAD_B) / kInterleave + CTA_N) * STAGES *
-                sizeof(f16_t);
-            if (kSmemByteSize >= 99 * 1024) {
-                printf("This kernel requires %d Bytes of shared memory, which exceeds device limit.\n", kSmemByteSize);
-                return _out_feats;
-            }
-            int j_factors1 = num_out_channels / CTA_N / 1;
-            dim3 num_blocks((num_out_feats + CTA_M - 1) / CTA_M * j_factors1);
-            dim3 threads_per_block(WARP_SIZE, NUM_WARPS);
-            auto kernel_func = gemm_w4a16_T2<f16_t, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G>;
-            cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemByteSize);
-            kernel_func<<<num_blocks, threads_per_block, kSmemByteSize>>>(
-                in_feats, kernel, scales, zeros, out_feats, num_in_feats, num_out_channels, num_in_channels);
+            LARGE_M_KERNEL_LAUNCH_CODE
+        }
+    } else {
+        throw std::runtime_error("Unsupported input type");
+    }
+
+    return _out_feats;
+}
+
+Tensor awq_gemm_w4a16_g64_int32(Tensor _in_feats, Tensor _kernel, Tensor _scales, Tensor _zeros) {
+    auto output_shape    = _in_feats.shape.dataExtent;
+    output_shape.back()  = _kernel.size(0) * kInterleave;
+    int num_in_feats     = _in_feats.numel() / _in_feats.size(-1);
+    int num_in_channels  = _in_feats.size(-1);
+    Tensor _out_feats    = Tensor::allocate(output_shape, _in_feats.dtype(), _in_feats.device());
+    int num_out_feats    = _out_feats.numel() / _out_feats.size(-1);
+    int num_out_channels = _out_feats.size(-1);
+
+    if (num_out_channels % 128 != 0) {
+        throw std::runtime_error("awq_gemm_w4a16_g64_int32 requires output features to be divisible by 128");
+    }
+    if (num_in_channels % 64 != 0) {
+        throw std::runtime_error("awq_gemm_w4a16_g64_int32 requires input features to be divisible by 64");
+    }
+
+    if (_in_feats.scalar_type() == Tensor::FP16) {
+        using f16_t = half;
+
+        auto in_feats  = reinterpret_cast<f16_t *>(_in_feats.data_ptr());
+        auto kernel    = reinterpret_cast<f16_t *>(_kernel.data_ptr<int32_t>());
+        auto scales    = reinterpret_cast<f16_t *>(_scales.data_ptr());
+        auto zeros     = reinterpret_cast<f16_t *>(_zeros.data_ptr());
+        auto out_feats = reinterpret_cast<f16_t *>(_out_feats.data_ptr());
+
+        if (num_out_feats <= 32) {
+            constexpr int G      = 64;
+            constexpr int CTA_M  = 16;
+            constexpr int CTA_N  = 128;
+            constexpr int CTA_K  = 64;
+            constexpr int WARP_M = 16;
+            constexpr int WARP_N = 32;
+            constexpr int WARP_K = 64;
+            constexpr int SPLITK = 1;
+            constexpr int STAGES = 4;
+            KERNEL_LAUNCH_CODE
+        } else if (num_out_feats <= 128) {
+            constexpr int G      = 64;
+            constexpr int CTA_M  = 32;
+            constexpr int CTA_N  = 128;
+            constexpr int CTA_K  = 64;
+            constexpr int WARP_M = 32;
+            constexpr int WARP_N = 32;
+            constexpr int WARP_K = 64;
+            constexpr int SPLITK = 1;
+            constexpr int STAGES = 4;
+            KERNEL_LAUNCH_CODE
+        } else {
+            constexpr int G      = 64;
+            constexpr int CTA_M  = 64;
+            constexpr int CTA_N  = 128;
+            constexpr int CTA_K  = 64;
+            constexpr int WARP_M = 64;
+            constexpr int WARP_N = 32;
+            constexpr int WARP_K = 64;
+            constexpr int SPLITK = 1;
+            constexpr int STAGES = 4;
+            KERNEL_LAUNCH_CODE
+        }
+    } else if (_in_feats.scalar_type() == Tensor::BF16) {
+        using f16_t = __nv_bfloat16;
+
+        auto in_feats  = reinterpret_cast<f16_t *>(_in_feats.data_ptr());
+        auto kernel    = reinterpret_cast<f16_t *>(_kernel.data_ptr<int32_t>());
+        auto scales    = reinterpret_cast<f16_t *>(_scales.data_ptr());
+        auto zeros     = reinterpret_cast<f16_t *>(_zeros.data_ptr());
+        auto out_feats = reinterpret_cast<f16_t *>(_out_feats.data_ptr());
+
+        if (num_out_feats <= 32) {
+            constexpr int G      = 64;
+            constexpr int CTA_M  = 16;
+            constexpr int CTA_N  = 128;
+            constexpr int CTA_K  = 64;
+            constexpr int WARP_M = 16;
+            constexpr int WARP_N = 32;
+            constexpr int WARP_K = 64;
+            constexpr int SPLITK = 1;
+            constexpr int STAGES = 4;
+            KERNEL_LAUNCH_CODE
+        } else if (num_out_feats <= 128) {
+            constexpr int G      = 64;
+            constexpr int CTA_M  = 32;
+            constexpr int CTA_N  = 128;
+            constexpr int CTA_K  = 64;
+            constexpr int WARP_M = 32;
+            constexpr int WARP_N = 32;
+            constexpr int WARP_K = 64;
+            constexpr int SPLITK = 1;
+            constexpr int STAGES = 4;
+            KERNEL_LAUNCH_CODE
+        } else {
+            constexpr int G      = 64;
+            constexpr int CTA_M  = 64;
+            constexpr int CTA_N  = 128;
+            constexpr int CTA_K  = 64;
+            constexpr int WARP_M = 64;
+            constexpr int WARP_N = 32;
+            constexpr int WARP_K = 64;
+            constexpr int SPLITK = 1;
+            constexpr int STAGES = 4;
+            KERNEL_LAUNCH_CODE
         }
     } else {
         throw std::runtime_error("Unsupported input type");

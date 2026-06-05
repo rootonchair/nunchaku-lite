@@ -33,6 +33,9 @@ Its core features include:
   that are immediately replaced.
 - Native quantized kernels: packages the CUDA kernels and Python wrappers needed
   for INT4 and FP4 Nunchaku checkpoints.
+- AWQ GEMM acceleration: unlike original Nunchaku, `nunchaku_lite` ships a
+  native W4A16 group-size-64/int32 GEMM path for large AWQ projections, turning
+  chunked GEMV bottlenecks into high-throughput CUDA matmuls.
 - Broad image-model coverage: includes built-in adapters for FLUX.1, FLUX.2
   Klein, Qwen-Image, Qwen-Image-Edit, SDXL, SDXL-Turbo, and Z-Image Turbo.
 - Runtime LoRA support: exposes Diffusers-style LoRA loading, adapter strength

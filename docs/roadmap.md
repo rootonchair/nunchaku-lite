@@ -89,6 +89,10 @@ handwritten adapters use:
   `nunchaku-fp16` where the underlying model and kernels support it.
 - [ ] Add manifest hooks for Flux-style cache integrations, including
   TeaCache, first-block cache, and double-block cache behavior.
+- [x] Add a general AWQ GEMM path for large W4A16 group-size-64/int32
+  projections. The TinyChat AWQ GEMM path remains separate for
+  group-size-128/int16 weights, while compatible group-size-64/int32 weights now
+  dispatch to GEMM instead of chunked GEMV for larger batches.
 - [x] Bind model-family runtime APIs, such as LoRA loading and adapter
   management, when a manifest target corresponds to an existing family adapter.
 

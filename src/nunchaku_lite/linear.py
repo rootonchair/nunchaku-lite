@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .ops.gemm import awq_gemm_w4a16_cuda, svdq_gemm_w4a4_cuda
+from .ops.gemm import awq_gemm_w4a16_g128_int16, awq_gemm_w4a16_g64_int32, svdq_gemm_w4a4_cuda
 from .ops.gemv import awq_gemv_w4a16_cuda
 from .ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
 
@@ -272,8 +272,8 @@ class SVDQW4A4Linear(nn.Module):
 class AWQW4A16Linear(nn.Module):
     """AWQ W4A16 linear projection used by selected Flux adapter paths.
 
-    This module stores packed AWQ checkpoint buffers and dispatches to the
-    native GEMV kernel at runtime.
+    This module stores packed AWQ checkpoint buffers and dispatches to native
+    GEMM or chunked GEMV kernels at runtime.
     """
 
     def __init__(
@@ -358,7 +358,7 @@ class AWQW4A16Linear(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the AWQ projection using the native GEMV kernel.
+        """Apply the AWQ projection using native AWQ kernels.
 
         Args:
             x: Input activation tensor whose last dimension is
@@ -368,16 +368,24 @@ class AWQW4A16Linear(nn.Module):
             Output tensor with last dimension ``out_features``.
         """
 
-        output = awq_gemv_w4a16_cuda(
-            in_feats=x,
-            kernel=self.qweight,
-            scaling_factors=self.wscales,
-            zeros=self.wzeros,
-            m=x.shape[0],
-            n=self.out_features,
-            k=self.in_features,
-            group_size=self.group_size,
-        )
+        if x.ndim == 0 or x.shape[-1] != self.in_features:
+            raise ValueError(
+                f"AWQW4A16Linear expected input last dimension {self.in_features}, got shape {tuple(x.shape)}."
+            )
+        output_shape = (*x.shape[:-1], self.out_features)
+        x_flat = x.reshape(-1, self.in_features).contiguous()
+        if x_flat.shape[0] == 0:
+            output = x.new_empty(output_shape)
+        else:
+            if self._use_gemm(x_flat.shape[0]):
+                output = awq_gemm_w4a16_g64_int32(
+                    in_feats=x_flat,
+                    kernel=self.qweight,
+                    scaling_factors=self.wscales,
+                    zeros=self.wzeros,
+                ).reshape(output_shape)
+            else:
+                output = self._forward_gemv_chunks(x_flat).reshape(output_shape)
         if self.bias is not None:
             output.add_(self.bias.view([1] * (output.ndim - 1) + [-1]))
         lora_down = getattr(self, "_nunchaku_lite_lora_down", None)
@@ -393,6 +401,32 @@ class AWQW4A16Linear(nn.Module):
             lora = torch.matmul(lora, lora_up.transpose(0, 1))
             output.add_(lora.to(output.dtype))
         return output
+
+    def _use_gemm(self, rows: int) -> bool:
+        return (
+            rows >= 16
+            and self.group_size == 64
+            and self.in_features % 64 == 0
+            and self.out_features % 128 == 0
+        )
+
+    def _forward_gemv_chunks(self, x_flat: torch.Tensor) -> torch.Tensor:
+        outputs = []
+        for start in range(0, x_flat.shape[0], 8):
+            chunk = x_flat[start : start + 8]
+            outputs.append(
+                awq_gemv_w4a16_cuda(
+                    in_feats=chunk,
+                    kernel=self.qweight,
+                    scaling_factors=self.wscales,
+                    zeros=self.wzeros,
+                    m=chunk.shape[0],
+                    n=self.out_features,
+                    k=self.in_features,
+                    group_size=self.group_size,
+                )
+            )
+        return torch.cat(outputs, dim=0)
 
     def __repr__(self):
         """Return a compact representation with AWQ metadata.
@@ -492,7 +526,7 @@ class TinyChatAWQW4A16Linear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the packed AWQ projection using the TinyChat GEMM path."""
 
-        output = awq_gemm_w4a16_cuda(x, self.qweight, self.scales, self.scaled_zeros)
+        output = awq_gemm_w4a16_g128_int16(x, self.qweight, self.scales, self.scaled_zeros)
         if self.bias is not None:
             output = output + self.bias.view([1] * (output.ndim - 1) + [-1])
         return output

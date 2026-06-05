@@ -278,6 +278,144 @@ def test_manifest_adapter_replaces_awq_target(tmp_path):
     assert getattr(transformer.proj, PATCHED_MODULE_ATTR)
 
 
+@pytest.mark.parametrize(
+    ("input_shape", "chunk_sizes"),
+    [
+        ((8, 128), [8]),
+        ((9, 128), [8, 1]),
+        ((2, 9, 128), [8, 8, 2]),
+        ((17, 1, 128), [8, 8, 1]),
+    ],
+)
+def test_awq_w4a16_linear_chunks_manifest_gemv_inputs(monkeypatch, input_shape, chunk_sizes):
+    import nunchaku_lite.linear as linear_module
+
+    calls = []
+
+    def fake_gemv(in_feats, kernel, scaling_factors, zeros, m, n, k, group_size):
+        calls.append(
+            {
+                "input_shape": tuple(in_feats.shape),
+                "m": m,
+                "n": n,
+                "k": k,
+                "group_size": group_size,
+            }
+        )
+        return torch.zeros(in_feats.shape[0], n, dtype=in_feats.dtype, device=in_feats.device)
+
+    def fail_gemm(*args, **kwargs):
+        raise AssertionError("Small manifest AWQ inputs should stay on GEMV")
+
+    monkeypatch.setattr(linear_module, "awq_gemv_w4a16_cuda", fake_gemv)
+    monkeypatch.setattr(linear_module, "awq_gemm_w4a16_g64_int32", fail_gemm)
+    layer = AWQW4A16Linear(128, 16, bias=False, group_size=64, torch_dtype=torch.bfloat16)
+
+    output = layer(torch.zeros(input_shape, dtype=torch.bfloat16))
+
+    assert tuple(output.shape) == (*input_shape[:-1], 16)
+    assert [call["m"] for call in calls] == chunk_sizes
+    assert [call["input_shape"] for call in calls] == [(chunk_size, 128) for chunk_size in chunk_sizes]
+    assert all(call["n"] == 16 and call["k"] == 128 and call["group_size"] == 64 for call in calls)
+
+
+def test_awq_w4a16_linear_empty_input_skips_native_gemv(monkeypatch):
+    import nunchaku_lite.linear as linear_module
+
+    def fail_gemv(*args, **kwargs):
+        raise AssertionError("Empty AWQ input should not call native GEMV")
+
+    monkeypatch.setattr(linear_module, "awq_gemv_w4a16_cuda", fail_gemv)
+    layer = AWQW4A16Linear(128, 16, bias=False, group_size=64, torch_dtype=torch.bfloat16)
+
+    output = layer(torch.zeros(0, 2, 128, dtype=torch.bfloat16))
+
+    assert tuple(output.shape) == (0, 2, 16)
+    assert output.numel() == 0
+
+
+def test_awq_w4a16_linear_dispatches_large_compatible_inputs_to_gemm(monkeypatch):
+    import nunchaku_lite.linear as linear_module
+
+    gemm_calls = []
+
+    def fake_gemm(in_feats, kernel, scaling_factors, zeros):
+        gemm_calls.append(
+            {
+                "input_shape": tuple(in_feats.shape),
+                "kernel_dtype": kernel.dtype,
+                "scales_shape": tuple(scaling_factors.shape),
+                "zeros_shape": tuple(zeros.shape),
+            }
+        )
+        return torch.zeros(in_feats.shape[0], 128, dtype=in_feats.dtype, device=in_feats.device)
+
+    def fail_gemv(*args, **kwargs):
+        raise AssertionError("Large compatible manifest AWQ inputs should use GEMM")
+
+    monkeypatch.setattr(linear_module, "awq_gemm_w4a16_g64_int32", fake_gemm)
+    monkeypatch.setattr(linear_module, "awq_gemv_w4a16_cuda", fail_gemv)
+    layer = AWQW4A16Linear(128, 128, bias=False, group_size=64, torch_dtype=torch.bfloat16)
+
+    output = layer(torch.zeros(2, 9, 128, dtype=torch.bfloat16))
+
+    assert tuple(output.shape) == (2, 9, 128)
+    assert gemm_calls == [
+        {
+            "input_shape": (18, 128),
+            "kernel_dtype": torch.int32,
+            "scales_shape": (2, 128),
+            "zeros_shape": (2, 128),
+        }
+    ]
+
+
+def test_awq_w4a16_linear_keeps_incompatible_large_inputs_on_gemv(monkeypatch):
+    import nunchaku_lite.linear as linear_module
+
+    calls = []
+
+    def fake_gemv(in_feats, kernel, scaling_factors, zeros, m, n, k, group_size):
+        calls.append(m)
+        return torch.zeros(in_feats.shape[0], n, dtype=in_feats.dtype, device=in_feats.device)
+
+    def fail_gemm(*args, **kwargs):
+        raise AssertionError("Incompatible output features should not use GEMM")
+
+    monkeypatch.setattr(linear_module, "awq_gemv_w4a16_cuda", fake_gemv)
+    monkeypatch.setattr(linear_module, "awq_gemm_w4a16_g64_int32", fail_gemm)
+    layer = AWQW4A16Linear(128, 16, bias=False, group_size=64, torch_dtype=torch.bfloat16)
+
+    output = layer(torch.zeros(18, 128, dtype=torch.bfloat16))
+
+    assert tuple(output.shape) == (18, 16)
+    assert calls == [8, 8, 2]
+
+
+def test_awq_w4a16_linear_bias_broadcasts_after_chunking(monkeypatch):
+    import nunchaku_lite.linear as linear_module
+
+    def fake_gemv(in_feats, kernel, scaling_factors, zeros, m, n, k, group_size):
+        return torch.zeros(in_feats.shape[0], n, dtype=in_feats.dtype, device=in_feats.device)
+
+    monkeypatch.setattr(linear_module, "awq_gemv_w4a16_cuda", fake_gemv)
+    layer = AWQW4A16Linear(128, 16, bias=True, group_size=64, torch_dtype=torch.bfloat16)
+    with torch.no_grad():
+        layer.bias.copy_(torch.arange(16, dtype=torch.bfloat16))
+
+    output = layer(torch.zeros(2, 9, 128, dtype=torch.bfloat16))
+
+    expected = layer.bias.view(1, 1, -1).expand_as(output)
+    assert torch.equal(output, expected)
+
+
+def test_awq_w4a16_linear_rejects_wrong_input_features():
+    layer = AWQW4A16Linear(128, 16, bias=False, group_size=64, torch_dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="expected input last dimension 128"):
+        layer(torch.zeros(2, 127, dtype=torch.bfloat16))
+
+
 @pytest.mark.parametrize("splits", [3, 6])
 def test_manifest_adapter_wraps_adanorm_awq_target(splits):
     manifest = _manifest(op="adanorm_awq_w4a16", precision="int4", group_size=64, rank=0)

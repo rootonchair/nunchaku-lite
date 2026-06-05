@@ -111,13 +111,27 @@ inline torch::Tensor gemv_awq(torch::Tensor in_feats,
     return to_torch(result);
 }
 
-inline torch::Tensor
-gemm_awq(torch::Tensor in_feats, torch::Tensor kernel, torch::Tensor scaling_factors, torch::Tensor zeros) {
+inline torch::Tensor awq_gemm_w4a16_g128_int16(torch::Tensor in_feats,
+                                               torch::Tensor kernel,
+                                               torch::Tensor scaling_factors,
+                                               torch::Tensor zeros) {
     TorchOpContext ctx;
-    Tensor result = ::awq_gemm_forward_cuda(from_torch(in_feats.contiguous()),
-                                            from_torch(kernel.contiguous()),
-                                            from_torch(scaling_factors.contiguous()),
-                                            from_torch(zeros.contiguous()));
+    Tensor result = ::awq_gemm_w4a16_g128_int16(from_torch(in_feats.contiguous()),
+                                                from_torch(kernel.contiguous()),
+                                                from_torch(scaling_factors.contiguous()),
+                                                from_torch(zeros.contiguous()));
+    return to_torch(result);
+}
+
+inline torch::Tensor awq_gemm_w4a16_g64_int32(torch::Tensor in_feats,
+                                              torch::Tensor kernel,
+                                              torch::Tensor scaling_factors,
+                                              torch::Tensor zeros) {
+    TorchOpContext ctx;
+    Tensor result = ::awq_gemm_w4a16_g64_int32(from_torch(in_feats.contiguous()),
+                                               from_torch(kernel.contiguous()),
+                                               from_torch(scaling_factors.contiguous()),
+                                               from_torch(zeros.contiguous()));
     return to_torch(result);
 }
 
