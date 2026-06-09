@@ -2,8 +2,6 @@
 
 #include <ATen/cuda/CUDAContext.h>
 
-using spdlog::fmt_lib::format;
-
 template<typename To, typename Ti>
 static To int_cast(Ti x) {
     if (x < std::numeric_limits<To>::min() || x > std::numeric_limits<To>::max()) {
@@ -66,7 +64,7 @@ at::Tensor to_torch(Tensor input, bool inplace) {
     if (input.device().type == Device::CPU) {
         opts = opts.device("cpu");
     } else {
-        opts = opts.device(format("cuda:{}", input.device().idx));
+        opts = opts.device("cuda:" + std::to_string(input.device().idx));
     }
 
     at::Tensor result;

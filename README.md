@@ -285,6 +285,5 @@ authoring guidance, runtime LoRA implementation notes, and repository layout.
 ## Acknowledgements
 
 `nunchaku_lite` builds on the Nunchaku project and uses selected native kernel
-code for the lite runtime. The vendored native support code includes spdlog and
-its bundled fmt headers. We are grateful to the maintainers and contributors of
-these projects.
+code for the lite runtime. We are grateful to the maintainers and contributors
+of these projects.

@@ -98,7 +98,6 @@ if __name__ == "__main__":
     include_dirs = [
         here("src/nunchaku_lite/csrc"),
         native("src"),
-        native("third_party/spdlog/include"),
     ]
 
     sm_targets = get_sm_targets()

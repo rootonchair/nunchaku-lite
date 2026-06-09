@@ -58,15 +58,6 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
         assert(actualN <= N && N - actualN < GEMM::BLOCK_N);
     }
 
-    spdlog::trace("gemm_w4a4: M={} N={} K={}", M, N, K);
-    spdlog::trace("act at {}", act.data_ptr());
-    spdlog::trace("wgt at {}", wgt.data_ptr());
-    spdlog::trace("ascales at {}", ascales.data_ptr());
-    spdlog::trace("wscales at {}", wscales.data_ptr());
-    if (bias.valid()) {
-        spdlog::trace("bias at {}", bias.data_ptr());
-    }
-
     int shmem = 0;
 
     auto launch = [&]<typename Epilogue>(Epilogue::Arguments args) {

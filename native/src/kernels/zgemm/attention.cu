@@ -23,13 +23,6 @@ void attention_fp16(Tensor q, // packed [Batch, Head, TokensQ, HEAD_DIM]
     assert(o.shape[1] == numTokensQ);
     assert(o.shape[2] == numHeads * headDim);
 
-    spdlog::trace("attention_fp16: B={} H={} NQ={} NK={}", sizeBatch, numHeads, numTokensQ, numTokensKV);
-    spdlog::trace("q at {}", q.data_ptr());
-    spdlog::trace("k at {}", k.data_ptr());
-    spdlog::trace("v at {}", v.data_ptr());
-    spdlog::trace("o at {}", o.data_ptr());
-    spdlog::trace("scale={}", scale);
-
     dispatchBool(o.scalar_type() == Tensor::BF16, [&]<bool bf16out>() {
 #ifndef __INTELLISENSE__
         using Attention = typename nunchaku::kernels::Attention<AttentionFP16Config<bf16out>>;

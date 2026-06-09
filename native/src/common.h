@@ -21,7 +21,6 @@
 #include <functional>
 #include <cuda_runtime_api.h>
 #include <cublas_v2.h>
-#include <spdlog/spdlog.h>
 
 class CUDAError : public std::runtime_error {
 public:
@@ -34,8 +33,10 @@ public:
 
 private:
     static std::string format(cudaError_t errorCode, std::source_location location) {
-        return spdlog::fmt_lib::format(
-            "CUDA error: {} (at {}:{})", cudaGetErrorString(errorCode), location.file_name(), location.line());
+        std::ostringstream oss;
+        oss << "CUDA error: " << cudaGetErrorString(errorCode) << " (at " << location.file_name() << ":"
+            << location.line() << ")";
+        return oss.str();
     }
 };
 
@@ -51,8 +52,10 @@ inline cudaError_t checkCUDA(cudaError_t retValue,
 inline cublasStatus_t checkCUBLAS(cublasStatus_t retValue,
                                   const std::source_location location = std::source_location::current()) {
     if (retValue != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error(spdlog::fmt_lib::format(
-            "CUBLAS error: {} (at {}:{})", cublasGetStatusString(retValue), location.file_name(), location.line()));
+        std::ostringstream oss;
+        oss << "CUBLAS error: " << cublasGetStatusString(retValue) << " (at " << location.file_name() << ":"
+            << location.line() << ")";
+        throw std::runtime_error(oss.str());
     }
     return retValue;
 }
