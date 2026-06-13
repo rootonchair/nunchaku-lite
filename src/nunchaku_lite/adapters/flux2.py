@@ -1,7 +1,6 @@
 """Flux2 adapter for patching Diffusers Flux2 transformers with Nunchaku Lite modules."""
 
 import inspect
-import math
 import types
 from typing import Any
 
@@ -18,11 +17,9 @@ from diffusers.models.transformers.transformer_flux2 import (
 )
 
 from ..core import PatchOptions, register_adapter
-from ..ops.attention import attention_fp16_cuda
 from ..ops.fused import fused_qkv_norm_rotary
 from .common import (
     SVDQPatchContext,
-    alloc_packed_qkv as _alloc_packed_qkv,
     build_svdq_context,
     finalize_svdq_checkpoint,
     fuse_linears,
@@ -129,18 +126,6 @@ class NunchakuFlux2AttnProcessor:
         kv_cache_mode: str | None = None,
         num_ref_tokens: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        use_packed_fp16 = (
-            kv_cache_mode is None
-            and encoder_hidden_states is not None
-            and isinstance(image_rotary_emb, tuple)
-            and len(image_rotary_emb) == 2
-            and torch.is_tensor(image_rotary_emb[0])
-            and image_rotary_emb[0].ndim == 3
-            and hidden_states.is_cuda
-        )
-        if use_packed_fp16:
-            return self._forward_packed(attn, hidden_states, encoder_hidden_states, image_rotary_emb)
-
         query, key, value, encoder_seq_len = self._project_qkv(
             attn, hidden_states, encoder_hidden_states, image_rotary_emb
         )
@@ -179,57 +164,6 @@ class NunchakuFlux2AttnProcessor:
         if encoder_seq_len:
             return hidden_states, encoder_hidden_states
         return hidden_states
-
-    def _forward_packed(
-        self,
-        attn: Flux2Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size = hidden_states.shape[0]
-        num_txt_tokens = encoder_hidden_states.shape[1]
-        num_img_tokens = hidden_states.shape[1]
-        num_txt_tokens_pad = math.ceil(num_txt_tokens / 256) * 256
-        num_img_tokens_pad = math.ceil(num_img_tokens / 256) * 256
-        num_tokens_pad = num_txt_tokens_pad + num_img_tokens_pad
-        query = torch.empty(
-            batch_size, attn.heads, num_tokens_pad, attn.head_dim, dtype=torch.float16, device=hidden_states.device
-        )
-        key = torch.empty_like(query)
-        value = torch.empty_like(query)
-        fused_qkv_norm_rotary(
-            hidden_states,
-            attn.to_qkv,
-            attn.norm_q,
-            attn.norm_k,
-            image_rotary_emb[0],
-            output=(query[:, :, num_txt_tokens_pad:], key[:, :, num_txt_tokens_pad:], value[:, :, num_txt_tokens_pad:]),
-            attn_tokens=num_img_tokens,
-        )
-        fused_qkv_norm_rotary(
-            encoder_hidden_states,
-            attn.to_added_qkv,
-            attn.norm_added_q,
-            attn.norm_added_k,
-            image_rotary_emb[1],
-            output=(query[:, :, :num_txt_tokens_pad], key[:, :, :num_txt_tokens_pad], value[:, :, :num_txt_tokens_pad]),
-            attn_tokens=num_txt_tokens,
-        )
-        attention_output = torch.empty(
-            batch_size,
-            num_tokens_pad,
-            attn.heads * attn.head_dim,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        attention_fp16_cuda(query, key, value, attention_output, attn.head_dim ** (-0.5))
-        encoder_hidden_states = attention_output[:, :num_txt_tokens]
-        hidden_states = attention_output[:, num_txt_tokens_pad : num_txt_tokens_pad + num_img_tokens]
-        encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
-        hidden_states = attn.to_out[0](hidden_states)
-        hidden_states = attn.to_out[1](hidden_states)
-        return hidden_states, encoder_hidden_states
 
     def _project_qkv(
         self,
@@ -370,15 +304,6 @@ class NunchakuFlux2ParallelSelfAttnProcessor:
         num_txt_tokens: int = 0,
         num_ref_tokens: int = 0,
     ) -> torch.Tensor:
-        use_packed_fp16 = (
-            kv_cache_mode is None
-            and torch.is_tensor(image_rotary_emb)
-            and image_rotary_emb.ndim == 3
-            and hidden_states.is_cuda
-        )
-        if use_packed_fp16:
-            return self._forward_packed(attn, hidden_states, image_rotary_emb)
-
         if torch.is_tensor(image_rotary_emb) and image_rotary_emb.ndim == 3:
             batch_size = hidden_states.shape[0]
             qkv = fused_qkv_norm_rotary(hidden_states, attn.qkv_proj, attn.norm_q, attn.norm_k, image_rotary_emb)
@@ -421,38 +346,6 @@ class NunchakuFlux2ParallelSelfAttnProcessor:
                 parallel_config=self._parallel_config,
             )
         attn_output = attn_output.flatten(2, 3).to(query.dtype)
-        mlp_hidden_states = attn.mlp_act_fn(attn.mlp_fc1(hidden_states))
-        return attn.out_proj(attn_output) + attn.mlp_fc2(mlp_hidden_states)
-
-    def _forward_packed(
-        self,
-        attn: Flux2ParallelSelfAttention,
-        hidden_states: torch.Tensor,
-        image_rotary_emb: torch.Tensor,
-    ) -> torch.Tensor:
-        batch_size = hidden_states.shape[0]
-        num_tokens = hidden_states.shape[1]
-        query, key, value, num_tokens_pad = _alloc_packed_qkv(
-            batch_size, attn.heads, num_tokens, attn.head_dim, hidden_states.device
-        )
-        fused_qkv_norm_rotary(
-            hidden_states,
-            attn.qkv_proj,
-            attn.norm_q,
-            attn.norm_k,
-            image_rotary_emb,
-            output=(query, key, value),
-            attn_tokens=num_tokens,
-        )
-        attn_output = torch.empty(
-            batch_size,
-            num_tokens_pad,
-            attn.heads * attn.head_dim,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        attention_fp16_cuda(query, key, value, attn_output, attn.head_dim ** (-0.5))
-        attn_output = attn_output[:, :num_tokens]
         mlp_hidden_states = attn.mlp_act_fn(attn.mlp_fc1(hidden_states))
         return attn.out_proj(attn_output) + attn.mlp_fc2(mlp_hidden_states)
 
