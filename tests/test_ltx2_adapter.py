@@ -174,7 +174,7 @@ def test_ltx2_processor_applies_fused_qk_norm_rope_when_rotary_present(monkeypat
         return torch.zeros_like(value)
 
     monkeypatch.setattr(ltx2_adapter, "_apply_fused_cross_head_qk_norm_rope", fake_apply_fused)
-    monkeypatch.setattr(ltx2_adapter, "dispatch_attention_fn", fake_dispatch_attention_fn)
+    monkeypatch.setattr(ltx2_adapter, "dispatch_lite_attention_fn", fake_dispatch_attention_fn)
 
     processor = NunchakuLTX2AudioVideoAttnProcessor()
     hidden_states = torch.randn(1, 3, 8)
@@ -202,7 +202,7 @@ def test_ltx2_perturbed_attention_all_perturbed_skips_attention(monkeypatch):
     def fail_dispatch(*args, **kwargs):
         raise AssertionError("attention should be skipped when all samples are perturbed")
 
-    monkeypatch.setattr(ltx2_adapter, "dispatch_attention_fn", fail_dispatch)
+    monkeypatch.setattr(ltx2_adapter, "dispatch_lite_attention_fn", fail_dispatch)
     processor = NunchakuLTX2PerturbedAttnProcessor()
     hidden_states = torch.randn(1, 3, 8)
 
@@ -231,7 +231,7 @@ def test_ltx2_perturbed_attention_mask_lerps_value_and_attention(monkeypatch):
     def fake_dispatch_attention_fn(*args, **kwargs):
         return attended.unflatten(2, (2, 4))
 
-    monkeypatch.setattr(ltx2_adapter, "dispatch_attention_fn", fake_dispatch_attention_fn)
+    monkeypatch.setattr(ltx2_adapter, "dispatch_lite_attention_fn", fake_dispatch_attention_fn)
     processor = NunchakuLTX2PerturbedAttnProcessor()
 
     output = processor(FakeAttention(), hidden_states, perturbation_mask=perturbation_mask)

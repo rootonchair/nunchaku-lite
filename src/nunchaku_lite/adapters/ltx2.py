@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 from diffusers.models.activations import GELU
 from diffusers.models.attention import FeedForward
-from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.transformers.transformer_ltx2 import (
     LTX2AdaLayerNormSingle,
     LTX2Attention,
@@ -17,6 +16,7 @@ from diffusers.models.transformers.transformer_ltx2 import (
     LTX2VideoTransformerBlock,
 )
 
+from .attention_dispatch import dispatch_lite_attention_fn
 from ..core import PatchOptions, register_adapter
 from ..linear import AWQW4A16Linear, SVDQW4A4Linear
 from ..ops.fused import (
@@ -215,7 +215,7 @@ class NunchakuLTX2AudioVideoAttnProcessor:
         key = key.unflatten(2, (attn.heads, -1))
         value = value.unflatten(2, (attn.heads, -1))
 
-        hidden_states = dispatch_attention_fn(
+        hidden_states = dispatch_lite_attention_fn(
             query,
             key,
             value,
@@ -292,7 +292,7 @@ class NunchakuLTX2PerturbedAttnProcessor(NunchakuLTX2AudioVideoAttnProcessor):
             key = key.unflatten(2, (attn.heads, -1))
             value_heads = value.unflatten(2, (attn.heads, -1))
 
-            hidden_states = dispatch_attention_fn(
+            hidden_states = dispatch_lite_attention_fn(
                 query,
                 key,
                 value_heads,
