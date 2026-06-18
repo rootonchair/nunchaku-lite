@@ -726,6 +726,7 @@ def _ensure_builtin_adapters() -> None:
         return
     importlib.import_module("nunchaku_lite.adapters.flux")
     importlib.import_module("nunchaku_lite.adapters.flux2")
+    importlib.import_module("nunchaku_lite.adapters.ltx2")
     importlib.import_module("nunchaku_lite.adapters.manifest")
     importlib.import_module("nunchaku_lite.adapters.qwen_image")
     importlib.import_module("nunchaku_lite.adapters.sdxl")
