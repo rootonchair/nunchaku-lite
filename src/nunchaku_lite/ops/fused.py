@@ -151,6 +151,89 @@ def _rms_norm_weight(norm: RMSNorm | DiffusersRMSNorm | None) -> torch.Tensor | 
     return getattr(norm, "weight", None)
 
 
+def _broadcast_shape_supported_for_modulation(x: torch.Tensor, value: torch.Tensor) -> bool:
+    if value.ndim == 3 and value.shape[1] == 1:
+        value = value.squeeze(1)
+    return value.numel() in (x.shape[-1], x.shape[0] * x.shape[-1], x.numel())
+
+
+def _torch_broadcast_modulation_param(x: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    if x.ndim == 3 and value.ndim == 2 and value.shape == (x.shape[0], x.shape[-1]):
+        return value.unsqueeze(1)
+    return value
+
+
+def fused_rms_norm_modulate(
+    x: torch.Tensor,
+    norm: RMSNorm | DiffusersRMSNorm | None,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> torch.Tensor:
+    """Apply ``norm(x) * (1 + scale) + shift`` with a guarded CUDA fast path."""
+
+    weight = _rms_norm_weight(norm)
+    eps = _rms_norm_eps(norm)
+    native_scale = scale.squeeze(1) if scale.ndim == 3 and scale.shape[1] == 1 else scale
+    native_shift = shift.squeeze(1) if shift.ndim == 3 and shift.shape[1] == 1 else shift
+    if (
+        x.device.type == "cuda"
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and x.ndim == 3
+        and native_scale.dtype == x.dtype
+        and native_shift.dtype == x.dtype
+        and native_scale.device == x.device
+        and native_shift.device == x.device
+        and native_scale.numel() in (x.shape[-1], x.shape[0] * x.shape[-1])
+        and native_shift.numel() in (x.shape[-1], x.shape[0] * x.shape[-1])
+        and not torch.is_grad_enabled()
+    ):
+        try:
+            return _ops().fused_rms_norm_modulate(
+                x.contiguous(),
+                weight,
+                native_scale.contiguous(),
+                native_shift.contiguous(),
+                eps,
+            )
+        except (ImportError, ModuleNotFoundError, AttributeError, RuntimeError):
+            pass
+    if norm is None:
+        normalized = torch.nn.functional.rms_norm(x, (x.shape[-1],), weight=None, eps=eps)
+    else:
+        normalized = norm(x)
+    scale = _torch_broadcast_modulation_param(x, scale)
+    shift = _torch_broadcast_modulation_param(x, shift)
+    return normalized * (1 + scale) + shift
+
+
+def fused_affine_modulate(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor) -> torch.Tensor:
+    """Apply ``x * (1 + scale) + shift`` with a guarded CUDA fast path."""
+
+    native_scale = scale.squeeze(1) if scale.ndim == 3 and scale.shape[1] == 1 else scale
+    native_shift = shift.squeeze(1) if shift.ndim == 3 and shift.shape[1] == 1 else shift
+    if (
+        x.device.type == "cuda"
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and x.ndim == 3
+        and native_scale.dtype == x.dtype
+        and native_shift.dtype == x.dtype
+        and native_scale.device == x.device
+        and native_shift.device == x.device
+        and _broadcast_shape_supported_for_modulation(x, native_scale)
+        and _broadcast_shape_supported_for_modulation(x, native_shift)
+        and not torch.is_grad_enabled()
+    ):
+        try:
+            return _ops().fused_affine_modulate(
+                x.contiguous(), native_scale.contiguous(), native_shift.contiguous()
+            )
+        except (ImportError, ModuleNotFoundError, AttributeError, RuntimeError):
+            pass
+    scale = _torch_broadcast_modulation_param(x, scale)
+    shift = _torch_broadcast_modulation_param(x, shift)
+    return x * (1 + scale) + shift
+
+
 def _cross_head_weight(
     norm: RMSNorm | DiffusersRMSNorm | None,
     channels: int,

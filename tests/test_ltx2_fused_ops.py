@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from diffusers.models.transformers.transformer_ltx2 import apply_interleaved_rotary_emb, apply_split_rotary_emb
 
-from nunchaku_lite.ops.fused import fused_cross_head_qk_norm_rope
+from nunchaku_lite.ops.fused import fused_affine_modulate, fused_cross_head_qk_norm_rope, fused_rms_norm_modulate
 
 
 def _has_native_cross_head_qk_op() -> bool:
@@ -11,6 +11,15 @@ def _has_native_cross_head_qk_op() -> bool:
         from nunchaku_lite._C import ops
 
         return hasattr(ops, "fused_cross_head_qk_norm_rope")
+    except Exception:
+        return False
+
+
+def _has_native_modulation_ops() -> bool:
+    try:
+        from nunchaku_lite._C import ops
+
+        return hasattr(ops, "fused_rms_norm_modulate") and hasattr(ops, "fused_affine_modulate")
     except Exception:
         return False
 
@@ -136,3 +145,66 @@ def test_cross_head_qk_norm_rope_rejects_non_cuda_direct_call():
             head_dim=4,
             rope_type="split",
         )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _has_native_modulation_ops(),
+    reason="modulation fusion requires the CUDA extension",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize("shape", ["channels", "batch_channels"])
+@torch.inference_mode()
+def test_native_rms_norm_modulate_matches_reference(dtype, weighted, shape):
+    torch.manual_seed(51 + int(weighted))
+    device = torch.device("cuda")
+    batch_size, seq_len, channels = 2, 5, 64
+    x = torch.randn(batch_size, seq_len, channels, dtype=dtype, device=device)
+    norm = torch.nn.RMSNorm(channels, eps=1e-6, elementwise_affine=weighted).to(device=device, dtype=dtype)
+    if shape == "channels":
+        scale = torch.randn(channels, dtype=dtype, device=device)
+        shift = torch.randn(channels, dtype=dtype, device=device)
+    else:
+        scale = torch.randn(batch_size, channels, dtype=dtype, device=device)
+        shift = torch.randn(batch_size, channels, dtype=dtype, device=device)
+
+    output = fused_rms_norm_modulate(x, norm, scale, shift)
+    ref_scale = scale.unsqueeze(1) if scale.ndim == 2 else scale
+    ref_shift = shift.unsqueeze(1) if shift.ndim == 2 else shift
+    reference = norm(x) * (1 + ref_scale) + ref_shift
+
+    torch.testing.assert_close(output, reference, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _has_native_modulation_ops(),
+    reason="modulation fusion requires the CUDA extension",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", ["channels", "batch_channels", "full"])
+@torch.inference_mode()
+def test_native_affine_modulate_matches_reference(dtype, shape):
+    torch.manual_seed(61)
+    device = torch.device("cuda")
+    batch_size, seq_len, channels = 2, 5, 64
+    x = torch.randn(batch_size, seq_len, channels, dtype=dtype, device=device)
+    if shape == "channels":
+        scale = torch.randn(channels, dtype=dtype, device=device)
+        shift = torch.randn(channels, dtype=dtype, device=device)
+        ref_scale = scale
+        ref_shift = shift
+    elif shape == "batch_channels":
+        scale = torch.randn(batch_size, channels, dtype=dtype, device=device)
+        shift = torch.randn(batch_size, channels, dtype=dtype, device=device)
+        ref_scale = scale.unsqueeze(1)
+        ref_shift = shift.unsqueeze(1)
+    else:
+        scale = torch.randn(batch_size, seq_len, channels, dtype=dtype, device=device)
+        shift = torch.randn(batch_size, seq_len, channels, dtype=dtype, device=device)
+        ref_scale = scale
+        ref_shift = shift
+
+    output = fused_affine_modulate(x, scale, shift)
+    reference = x * (1 + ref_scale) + ref_shift
+
+    torch.testing.assert_close(output, reference, atol=3e-2, rtol=3e-2)

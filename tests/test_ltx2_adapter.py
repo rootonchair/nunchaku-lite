@@ -12,6 +12,7 @@ from nunchaku_lite.adapters.ltx2 import (
     LTX2Adapter,
     NunchakuLTX2AudioVideoAttnProcessor,
     NunchakuLTX2PerturbedAttnProcessor,
+    _ltx2_block_forward,
 )
 from nunchaku_lite.linear import AWQW4A16Linear, SVDQW4A4Linear
 
@@ -70,7 +71,8 @@ def test_ltx2_patch_keeps_separate_qkv_and_dense_gate_logits():
     assert isinstance(attn.processor, NunchakuLTX2AudioVideoAttnProcessor)
     assert isinstance(transformer.transformer_blocks[0].ff.net[0].proj, SVDQW4A4Linear)
     assert isinstance(transformer.transformer_blocks[0].audio_ff.net[0].proj, SVDQW4A4Linear)
-    assert not hasattr(transformer.transformer_blocks[0], "_nunchaku_lite_ltx2_original_forward")
+    assert hasattr(transformer.transformer_blocks[0], "_nunchaku_lite_ltx2_original_forward")
+    assert transformer.transformer_blocks[0].forward.__func__ is _ltx2_block_forward
 
 
 def test_ltx2_perturbed_attention_processor_is_preserved():
@@ -235,3 +237,13 @@ def test_ltx2_perturbed_attention_mask_lerps_value_and_attention(monkeypatch):
     output = processor(FakeAttention(), hidden_states, perturbation_mask=perturbation_mask)
 
     torch.testing.assert_close(output, torch.lerp(hidden_states, attended, perturbation_mask))
+
+
+def test_ltx2_residual_gate_torch_path_broadcasts_batch_channel_gate():
+    residual = torch.randn(2, 3, 4)
+    branch = torch.randn(2, 3, 4)
+    gate = torch.randn(2, 4)
+
+    output = ltx2_adapter._residual_gate(residual, gate, branch)
+
+    torch.testing.assert_close(output, residual + gate.unsqueeze(1) * branch)

@@ -23,6 +23,14 @@ std::vector<torch::Tensor> fused_cross_head_qk_norm_rope(torch::Tensor q,
                                                          double eps,
                                                          bool interleaved);
 
+torch::Tensor fused_rms_norm_modulate(torch::Tensor x,
+                                      std::optional<torch::Tensor> norm_weight,
+                                      torch::Tensor scale,
+                                      torch::Tensor shift,
+                                      double eps);
+
+torch::Tensor fused_affine_modulate(torch::Tensor x, torch::Tensor scale, torch::Tensor shift);
+
 inline Tensor as_tensor(std::optional<torch::Tensor> &tensor) {
     return tensor.has_value() ? from_torch(tensor.value()) : Tensor{};
 }

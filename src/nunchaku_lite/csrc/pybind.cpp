@@ -8,5 +8,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("awq_gemm_w4a16_g64_int32", nunchaku_lite::ops::awq_gemm_w4a16_g64_int32)
         .def("gemv_awq", nunchaku_lite::ops::gemv_awq)
         .def("fused_cross_head_qk_norm_rope", nunchaku_lite::ops::fused_cross_head_qk_norm_rope)
+        .def("fused_rms_norm_modulate", nunchaku_lite::ops::fused_rms_norm_modulate)
+        .def("fused_affine_modulate", nunchaku_lite::ops::fused_affine_modulate)
         .def("attention_fp16", nunchaku_lite::ops::attention_fp16);
 }
