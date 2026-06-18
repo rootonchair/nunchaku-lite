@@ -10,7 +10,6 @@ from diffusers.models.attention import FeedForward
 from diffusers.models.transformers.transformer_ltx2 import (
     LTX2AdaLayerNormSingle,
     LTX2Attention,
-    LTX2AudioVideoAttnProcessor,
     LTX2PerturbedAttnProcessor,
     LTX2VideoTransformer3DModel,
     LTX2VideoTransformerBlock,
