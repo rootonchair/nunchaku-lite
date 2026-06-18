@@ -14,13 +14,11 @@ from diffusers.models.transformers.transformer_ltx2 import (
     LTX2AudioVideoAttnProcessor,
     LTX2PerturbedAttnProcessor,
     LTX2VideoTransformer3DModel,
-    apply_interleaved_rotary_emb,
-    apply_split_rotary_emb,
 )
 
 from ..core import PatchOptions, register_adapter
 from ..linear import AWQW4A16Linear, SVDQW4A4Linear
-from ..ops.fused import fused_gelu_mlp
+from ..ops.fused import fused_gelu_mlp, fused_cross_head_qk_norm_rope
 from .common import (
     SVDQPatchContext,
     build_svdq_context,
@@ -124,6 +122,41 @@ def _patch_ltx2_adaln_single(
     return module
 
 
+def _apply_fused_cross_head_qk_norm_rope(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    norm_q: nn.Module,
+    norm_k: nn.Module,
+    query_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
+    key_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
+    rope_type: str,
+    heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if query_rotary_emb is None:
+        raise ValueError("fused cross-head Q/K norm+RoPE requires query rotary embeddings")
+    if rope_type not in {"split", "interleaved"}:
+        raise ValueError("fused cross-head Q/K norm+RoPE supports only split and interleaved RoPE")
+
+    q_heads = int(heads)
+    head_dim = int(head_dim)
+    if head_dim <= 0:
+        raise ValueError("head_dim must be positive")
+    k_heads = int(key.shape[-1] // head_dim)
+    return fused_cross_head_qk_norm_rope(
+        query,
+        key,
+        norm_q,
+        norm_k,
+        query_rotary_emb,
+        key_rotary_emb if key_rotary_emb is not None else query_rotary_emb,
+        q_heads=q_heads,
+        k_heads=k_heads,
+        head_dim=head_dim,
+        rope_type=rope_type,
+    )
+
+
 class NunchakuLTX2AudioVideoAttnProcessor:
     """LTX2 attention processor that keeps separate Q/K/V SVDQ projections."""
 
@@ -156,9 +189,21 @@ class NunchakuLTX2AudioVideoAttnProcessor:
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
 
-        query = attn.norm_q(query)
-        key = attn.norm_k(key)
-        query, key = _apply_ltx2_rotary(attn, query, key, query_rotary_emb, key_rotary_emb)
+        if query_rotary_emb is None:
+            query = attn.norm_q(query)
+            key = attn.norm_k(key)
+        else:
+            query, key = _apply_fused_cross_head_qk_norm_rope(
+                query,
+                key,
+                attn.norm_q,
+                attn.norm_k,
+                query_rotary_emb,
+                key_rotary_emb,
+                attn.rope_type,
+                attn.heads,
+                attn.head_dim,
+            )
 
         query = query.unflatten(2, (attn.heads, -1))
         key = key.unflatten(2, (attn.heads, -1))
@@ -221,9 +266,21 @@ class NunchakuLTX2PerturbedAttnProcessor(NunchakuLTX2AudioVideoAttnProcessor):
             query = attn.to_q(hidden_states)
             key = attn.to_k(encoder_hidden_states)
 
-            query = attn.norm_q(query)
-            key = attn.norm_k(key)
-            query, key = _apply_ltx2_rotary(attn, query, key, query_rotary_emb, key_rotary_emb)
+            if query_rotary_emb is None:
+                query = attn.norm_q(query)
+                key = attn.norm_k(key)
+            else:
+                query, key = _apply_fused_cross_head_qk_norm_rope(
+                    query,
+                    key,
+                    attn.norm_q,
+                    attn.norm_k,
+                    query_rotary_emb,
+                    key_rotary_emb,
+                    attn.rope_type,
+                    attn.heads,
+                    attn.head_dim,
+                )
 
             query = query.unflatten(2, (attn.heads, -1))
             key = key.unflatten(2, (attn.heads, -1))
@@ -251,23 +308,6 @@ class NunchakuLTX2PerturbedAttnProcessor(NunchakuLTX2AudioVideoAttnProcessor):
 
         hidden_states = attn.to_out[0](hidden_states)
         return attn.to_out[1](hidden_states)
-
-
-def _apply_ltx2_rotary(
-    attn: LTX2Attention,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    query_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
-    key_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if query_rotary_emb is None:
-        return query, key
-    key_rotary_emb = key_rotary_emb if key_rotary_emb is not None else query_rotary_emb
-    if attn.rope_type == "interleaved":
-        return apply_interleaved_rotary_emb(query, query_rotary_emb), apply_interleaved_rotary_emb(key, key_rotary_emb)
-    if attn.rope_type == "split":
-        return apply_split_rotary_emb(query, query_rotary_emb), apply_split_rotary_emb(key, key_rotary_emb)
-    return query, key
 
 
 class LTX2Adapter:

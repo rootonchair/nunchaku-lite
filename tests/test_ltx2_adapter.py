@@ -7,6 +7,7 @@ from diffusers import LTX2VideoTransformer3DModel
 from safetensors.torch import save_file
 
 from nunchaku_lite import list_adapters, patch_transformer
+import nunchaku_lite.adapters.ltx2 as ltx2_adapter
 from nunchaku_lite.adapters.ltx2 import (
     LTX2Adapter,
     NunchakuLTX2AudioVideoAttnProcessor,
@@ -144,3 +145,93 @@ def test_patch_transformer_loads_synthetic_ltx2_checkpoint_with_separate_keys(tm
     assert "transformer_blocks.0.attn1.to_v.qweight" in keys
     assert "transformer_blocks.0.attn1.to_gate_logits.weight" in keys
     assert "transformer_blocks.0.attn1.to_qkv.qweight" not in keys
+
+
+def test_ltx2_processor_applies_fused_qk_norm_rope_when_rotary_present(monkeypatch):
+    class FakeAttention:
+        heads = 2
+        head_dim = 4
+        rope_type = "split"
+        to_gate_logits = None
+        to_q = nn.Identity()
+        to_k = nn.Identity()
+        to_v = nn.Identity()
+        norm_q = nn.Identity()
+        norm_k = nn.Identity()
+        to_out = [nn.Identity(), nn.Identity()]
+
+    calls = []
+
+    def fake_apply_fused(query, key, *args):
+        calls.append((query, key, args))
+        return query + 1, key + 2
+
+    def fake_dispatch_attention_fn(query, key, value, **kwargs):
+        assert torch.equal(query.flatten(2, 3), calls[0][0] + 1)
+        assert torch.equal(key.flatten(2, 3), calls[0][1] + 2)
+        return torch.zeros_like(value)
+
+    monkeypatch.setattr(ltx2_adapter, "_apply_fused_cross_head_qk_norm_rope", fake_apply_fused)
+    monkeypatch.setattr(ltx2_adapter, "dispatch_attention_fn", fake_dispatch_attention_fn)
+
+    processor = NunchakuLTX2AudioVideoAttnProcessor()
+    hidden_states = torch.randn(1, 3, 8)
+    rope = (torch.randn(1, 2, 3, 2), torch.randn(1, 2, 3, 2))
+
+    output = processor(FakeAttention(), hidden_states, query_rotary_emb=rope)
+
+    assert output.shape == hidden_states.shape
+    assert len(calls) == 1
+
+
+def test_ltx2_perturbed_attention_all_perturbed_skips_attention(monkeypatch):
+    class FakeAttention:
+        heads = 2
+        head_dim = 4
+        rope_type = "split"
+        to_gate_logits = None
+        to_q = nn.Identity()
+        to_k = nn.Identity()
+        to_v = nn.Identity()
+        norm_q = nn.Identity()
+        norm_k = nn.Identity()
+        to_out = [nn.Identity(), nn.Identity()]
+
+    def fail_dispatch(*args, **kwargs):
+        raise AssertionError("attention should be skipped when all samples are perturbed")
+
+    monkeypatch.setattr(ltx2_adapter, "dispatch_attention_fn", fail_dispatch)
+    processor = NunchakuLTX2PerturbedAttnProcessor()
+    hidden_states = torch.randn(1, 3, 8)
+
+    output = processor(FakeAttention(), hidden_states, all_perturbed=True)
+
+    torch.testing.assert_close(output, hidden_states)
+
+
+def test_ltx2_perturbed_attention_mask_lerps_value_and_attention(monkeypatch):
+    class FakeAttention:
+        heads = 2
+        head_dim = 4
+        rope_type = "split"
+        to_gate_logits = None
+        to_q = nn.Identity()
+        to_k = nn.Identity()
+        to_v = nn.Identity()
+        norm_q = nn.Identity()
+        norm_k = nn.Identity()
+        to_out = [nn.Identity(), nn.Identity()]
+
+    hidden_states = torch.randn(1, 3, 8)
+    attended = torch.randn(1, 3, 8)
+    perturbation_mask = torch.full((1, 3, 1), 0.25)
+
+    def fake_dispatch_attention_fn(*args, **kwargs):
+        return attended.unflatten(2, (2, 4))
+
+    monkeypatch.setattr(ltx2_adapter, "dispatch_attention_fn", fake_dispatch_attention_fn)
+    processor = NunchakuLTX2PerturbedAttnProcessor()
+
+    output = processor(FakeAttention(), hidden_states, perturbation_mask=perturbation_mask)
+
+    torch.testing.assert_close(output, torch.lerp(hidden_states, attended, perturbation_mask))

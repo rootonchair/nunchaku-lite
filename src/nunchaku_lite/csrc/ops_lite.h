@@ -1,11 +1,27 @@
 #pragma once
 
+#include <vector>
+
 #include "interop/torch.h"
 #include "kernels/awq/gemm_awq.h"
 #include "kernels/awq/gemv_awq.h"
 #include "kernels/zgemm/zgemm.h"
 
 namespace nunchaku_lite::ops {
+
+std::vector<torch::Tensor> fused_cross_head_qk_norm_rope(torch::Tensor q,
+                                                         torch::Tensor k,
+                                                         std::optional<torch::Tensor> q_weight,
+                                                         std::optional<torch::Tensor> k_weight,
+                                                         std::optional<torch::Tensor> q_cos,
+                                                         std::optional<torch::Tensor> q_sin,
+                                                         std::optional<torch::Tensor> k_cos,
+                                                         std::optional<torch::Tensor> k_sin,
+                                                         int64_t q_heads,
+                                                         int64_t k_heads,
+                                                         int64_t head_dim,
+                                                         double eps,
+                                                         bool interleaved);
 
 inline Tensor as_tensor(std::optional<torch::Tensor> &tensor) {
     return tensor.has_value() ? from_torch(tensor.value()) : Tensor{};

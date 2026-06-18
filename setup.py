@@ -145,6 +145,7 @@ if __name__ == "__main__":
             native_source("src/kernels/zgemm/attention.cu"),
             native_source("src/kernels/awq/gemm_awq.cu"),
             native_source("src/kernels/awq/gemv_awq.cu"),
+            native_source("src/kernels/cross_head_qk_norm_rope.cu"),
         ],
         extra_compile_args={
             "gcc": gcc_flags,
