@@ -1,0 +1,8 @@
+recursive-include nunchaku_lite_kernels_cuda *.cpp *.h *.hpp *.ipp *.cu *.cuh
+recursive-include torch-ext *.py *.cpp *.h *.hpp *.ipp
+
+include build.toml
+include flake.nix
+include flake.lock
+include CARD.md
+include setup.py
