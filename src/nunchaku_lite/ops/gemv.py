@@ -1,18 +1,8 @@
-"""GEMV kernel wrappers exposed by the native extension."""
+"""GEMV kernel wrappers exposed by the active backend."""
 
 import torch
 
-
-def _ops():
-    """Import native ops lazily.
-
-    Returns:
-        Native extension ``ops`` namespace.
-    """
-
-    from nunchaku_lite._C import ops
-
-    return ops
+from .backend import get_ops
 
 
 def awq_gemv_w4a16_cuda(
@@ -41,4 +31,4 @@ def awq_gemv_w4a16_cuda(
         Projected activation tensor.
     """
 
-    return _ops().gemv_awq(in_feats, kernel, scaling_factors, zeros, m, n, k, group_size)
+    return get_ops().gemv_awq(in_feats, kernel, scaling_factors, zeros, m, n, k, group_size)

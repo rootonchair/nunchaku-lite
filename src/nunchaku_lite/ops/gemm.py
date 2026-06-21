@@ -1,20 +1,10 @@
-"""GEMM kernel wrappers exposed by the native extension."""
+"""GEMM kernel wrappers exposed by the active backend."""
 
 import math
 
 import torch
 
-
-def _ops():
-    """Import native ops lazily.
-
-    Returns:
-        Native extension ``ops`` namespace.
-    """
-
-    from nunchaku_lite._C import ops
-
-    return ops
+from .backend import get_ops
 
 
 def svdq_gemm_w4a4_cuda(
@@ -91,7 +81,7 @@ def svdq_gemm_w4a4_cuda(
         lora_scales = [1.0] * math.ceil(rank / 16)
     if alpha is None:
         alpha = 1.0
-    _ops().gemm_w4a4(
+    get_ops().gemm_w4a4(
         act,
         wgt,
         out,
@@ -144,7 +134,7 @@ def awq_gemm_w4a16_g128_int16(
         ``in_feats``.
     """
 
-    return _ops().awq_gemm_w4a16_g128_int16(in_feats, kernel, scaling_factors, zeros)
+    return get_ops().awq_gemm_w4a16_g128_int16(in_feats, kernel, scaling_factors, zeros)
 
 
 def awq_gemm_w4a16_g64_int32(
@@ -169,4 +159,4 @@ def awq_gemm_w4a16_g64_int32(
         ``in_feats``.
     """
 
-    return _ops().awq_gemm_w4a16_g64_int32(in_feats, kernel, scaling_factors, zeros)
+    return get_ops().awq_gemm_w4a16_g64_int32(in_feats, kernel, scaling_factors, zeros)
