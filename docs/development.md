@@ -52,17 +52,17 @@ The Z-Image full inference test defaults to the INT4
 `NUNCHAKU_LITE_Z_IMAGE_FULL_INFERENCE_*` environment variables to use another
 compatible checkpoint or LoRA.
 
-Build the extension in place:
+Install the local kernels package during native-kernel development:
 
 ```bash
-python setup.py build_ext --inplace
+pip install ./nunchaku-lite-kernels
 ```
 
 Useful validation checks:
 
 ```bash
 python -c "import nunchaku_lite; print(nunchaku_lite.list_adapters())"
-python -c "import nunchaku_lite._C as ext; print(hasattr(ext.ops, 'gemm_w4a4'))"
+python -c "from nunchaku_lite.ops.backend import get_ops; print(hasattr(get_ops(), 'gemm_w4a4'))"
 ```
 
 ## Repository Layout
@@ -72,12 +72,12 @@ nunchaku_lite/
   src/
     nunchaku_lite/
       adapters/    Model-specific patch adapters
-      csrc/        Python extension bindings
       lora/        Runtime LoRA conversion and binding
-      ops/         Python wrappers for native ops
+      ops/         Python wrappers for kernel backends
       core.py      Public loading and patching API
       linear.py    Quantized linear modules
-native/            Vendored native kernel sources and headers
+nunchaku-lite-kernels/
+                   Vendored local/HF kernel package sources
 benchmarks/        End-to-end benchmark scripts
 docs/              Project documentation
 docs/models/       Model-specific quick-start guides
