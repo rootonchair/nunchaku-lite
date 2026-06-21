@@ -60,8 +60,8 @@ non-Blackwell targets, CUDA 12.8 or newer is required for `sm120a`, and CUDA
 
 ## Nix Kernel Builds
 
-The vendored `nunchaku-lite-kernels` package keeps its Hugging Face
-kernel-builder flake:
+`nunchaku-lite-kernels` includes Nix build support through Hugging Face
+kernel-builder:
 
 ```bash
 nix flake show path:./nunchaku-lite-kernels
