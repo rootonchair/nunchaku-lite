@@ -1,0 +1,98 @@
+[general]
+name = "nunchaku-lite-kernels"
+license = "Apache-2.0"
+backends = [
+  "cuda",
+]
+version = 1
+
+[general.hub]
+repo-id = "rootonchair/nunchaku-lite-kernels"
+
+[torch]
+include = [
+  "nunchaku_lite_kernels_cuda",
+  "torch-ext",
+]
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+
+[kernel.nunchaku_lite_kernels]
+backend = "cuda"
+depends = ["torch"]
+include = [
+  "nunchaku_lite_kernels_cuda",
+  "torch-ext",
+]
+cxx-flags = [
+  "-DENABLE_BF16=1",
+  "-DBUILD_NUNCHAKU=1",
+  "-fvisibility=hidden",
+  "-g",
+  "-std=c++20",
+  "-UNDEBUG",
+  "-Og",
+]
+cuda-flags = [
+  "-DENABLE_BF16=1",
+  "-DBUILD_NUNCHAKU=1",
+  "-g",
+  "-std=c++20",
+  "-UNDEBUG",
+  "-Xcudafe",
+  "--diag_suppress=20208",
+  "-U__CUDA_NO_HALF_OPERATORS__",
+  "-U__CUDA_NO_HALF_CONVERSIONS__",
+  "-U__CUDA_NO_HALF2_OPERATORS__",
+  "-U__CUDA_NO_HALF2_CONVERSIONS__",
+  "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+  "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+  "-U__CUDA_NO_BFLOAT162_OPERATORS__",
+  "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
+  "--expt-relaxed-constexpr",
+  "--expt-extended-lambda",
+  "--generate-line-info",
+]
+cuda-capabilities = [
+  "7.5",
+  "8.0",
+  "8.6",
+  "8.9",
+  "12.0a",
+  "12.1a",
+]
+src = [
+  "nunchaku_lite_kernels_cuda/ops_lite.h",
+  "nunchaku_lite_kernels_cuda/Tensor.h",
+  "nunchaku_lite_kernels_cuda/common.h",
+  "nunchaku_lite_kernels_cuda/interop/torch.cpp",
+  "nunchaku_lite_kernels_cuda/interop/torch.h",
+  "nunchaku_lite_kernels_cuda/kernels/dispatch_utils.h",
+  "nunchaku_lite_kernels_cuda/kernels/utils.cuh",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4.cu",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4.cuh",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_fp16_int4.cu",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_fp16_int4_fasteri2f.cu",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_fp16_fp4.cu",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_bf16_int4.cu",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_bf16_fp4.cu",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch.cuh",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_impl.cuh",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_base.cuh",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_utils.cuh",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/epilogues.cuh",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/lora.cuh",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/mma.cuh",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/mma_earlycuda.cuh",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/attention.cu",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/attention.cuh",
+  "nunchaku_lite_kernels_cuda/kernels/zgemm/zgemm.h",
+  "nunchaku_lite_kernels_cuda/kernels/awq/gemm_awq.cu",
+  "nunchaku_lite_kernels_cuda/kernels/awq/gemm_awq.h",
+  "nunchaku_lite_kernels_cuda/kernels/awq/gemv_awq.cu",
+  "nunchaku_lite_kernels_cuda/kernels/awq/gemv_awq.h",
+  "nunchaku_lite_kernels_cuda/kernels/awq/dequantize.cuh",
+  "nunchaku_lite_kernels_cuda/kernels/awq/semaphore.h",
+]

@@ -7,7 +7,6 @@
 #include <fstream>
 #include <sstream>
 #include <memory>
-#include <source_location>
 #include <vector>
 #include <list>
 #include <stack>
@@ -24,41 +23,41 @@
 
 class CUDAError : public std::runtime_error {
 public:
-    CUDAError(cudaError_t errorCode, std::source_location location)
-        : std::runtime_error(format(errorCode, location)), errorCode(errorCode), location(location) {}
+    CUDAError(cudaError_t errorCode, const char *file, int line)
+        : std::runtime_error(format(errorCode, file, line)), errorCode(errorCode), file(file), line(line) {}
 
 public:
     const cudaError_t errorCode;
-    const std::source_location location;
+    const char *file;
+    const int line;
 
 private:
-    static std::string format(cudaError_t errorCode, std::source_location location) {
+    static std::string format(cudaError_t errorCode, const char *file, int line) {
         std::ostringstream oss;
-        oss << "CUDA error: " << cudaGetErrorString(errorCode) << " (at " << location.file_name() << ":"
-            << location.line() << ")";
+        oss << "CUDA error: " << cudaGetErrorString(errorCode) << " (at " << file << ":" << line << ")";
         return oss.str();
     }
 };
 
-inline cudaError_t checkCUDA(cudaError_t retValue,
-                             const std::source_location location = std::source_location::current()) {
+inline cudaError_t checkCUDAImpl(cudaError_t retValue, const char *file, int line) {
     if (retValue != cudaSuccess) {
         (void)cudaGetLastError();
-        throw CUDAError(retValue, location);
+        throw CUDAError(retValue, file, line);
     }
     return retValue;
 }
 
-inline cublasStatus_t checkCUBLAS(cublasStatus_t retValue,
-                                  const std::source_location location = std::source_location::current()) {
+inline cublasStatus_t checkCUBLASImpl(cublasStatus_t retValue, const char *file, int line) {
     if (retValue != CUBLAS_STATUS_SUCCESS) {
         std::ostringstream oss;
-        oss << "CUBLAS error: " << cublasGetStatusString(retValue) << " (at " << location.file_name() << ":"
-            << location.line() << ")";
+        oss << "CUBLAS error: " << cublasGetStatusString(retValue) << " (at " << file << ":" << line << ")";
         throw std::runtime_error(oss.str());
     }
     return retValue;
 }
+
+#define checkCUDA(retValue) checkCUDAImpl((retValue), __FILE__, __LINE__)
+#define checkCUBLAS(retValue) checkCUBLASImpl((retValue), __FILE__, __LINE__)
 
 inline thread_local std::stack<cudaStream_t> stackCUDAStreams;
 
@@ -197,7 +196,7 @@ inline cudaDeviceProp *getCurrentDeviceProperties() {
     static thread_local std::map<int, cudaDeviceProp> props;
 
     int deviceId = CUDADeviceContext::getDevice();
-    if (!props.contains(deviceId)) {
+    if (props.find(deviceId) == props.end()) {
         cudaDeviceProp prop;
         checkCUDA(cudaGetDeviceProperties(&prop, deviceId));
         props[deviceId] = prop;

@@ -1,0 +1,26 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = [
+  "ninja",
+  "packaging>=23",
+  "setuptools",
+  "torch>=2.7",
+  "wheel",
+]
+
+[project]
+name = "nunchaku_lite_kernels"
+description = "Local CUDA kernel package for nunchaku_lite."
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dynamic = [ "version" ]
+dependencies = [
+  "torch>=2.7",
+]
+
+[tool.black]
+line-length = 120
+target-version = [ 'py311' ]
+
+[tool.ruff]
+line-length = 120

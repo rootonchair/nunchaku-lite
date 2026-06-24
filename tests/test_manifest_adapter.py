@@ -146,6 +146,16 @@ def test_parse_runtime_manifest_rejects_unsupported_schema():
         parse_runtime_manifest(quantization_config)
 
 
+def test_parse_runtime_manifest_allows_missing_torch_dtype_requirement():
+    manifest = _manifest(precision="fp4")
+    manifest["requirements"].pop("torch_dtype")
+
+    parsed = parse_runtime_manifest(_quantization_config(manifest))
+
+    assert parsed is not None
+    assert parsed.runtime_precision == "nvfp4"
+
+
 def test_patch_transformer_manifest_target_replaces_svdq_linear(tmp_path):
     manifest = _manifest()
     checkpoint = _write_manifest_checkpoint(tmp_path, TinyManifestModel(), manifest)

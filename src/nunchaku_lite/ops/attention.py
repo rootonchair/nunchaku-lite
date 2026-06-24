@@ -1,18 +1,8 @@
-"""Attention kernel wrappers exposed by the native extension."""
+"""Attention kernel wrappers exposed by the active backend."""
 
 import torch
 
-
-def _ops():
-    """Import native ops lazily.
-
-    Returns:
-        Native extension ``ops`` namespace.
-    """
-
-    from nunchaku_lite._C import ops
-
-    return ops
+from .backend import get_ops
 
 
 def attention_fp16_cuda(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, o: torch.Tensor, scale: float) -> None:
@@ -29,4 +19,4 @@ def attention_fp16_cuda(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, o: to
         None.
     """
 
-    _ops().attention_fp16(q, k, v, o, scale)
+    get_ops().attention_fp16(q, k, v, o, scale)

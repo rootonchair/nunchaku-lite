@@ -85,23 +85,26 @@ coverage and remaining feature work.
 
 - Python 3.10 or newer
 - PyTorch 2.7 or newer with CUDA
-- CUDA toolkit 12.6 or newer with `nvcc`
 - Diffusers 0.36 or newer
 
-The build detects the local GPU architecture by default. Supported targets are
-`sm75`, `sm80`, `sm86`, `sm89`, `sm120a`, and `sm121a`, subject to the
-installed CUDA toolkit version. CUDA 12.6 or newer is the documented minimum;
-`sm120a` requires CUDA 12.8 or newer, and `sm121a` requires CUDA 13.0 or newer.
+Native source builds also require CUDA toolkit 12.6 or newer with `nvcc`. The
+default runtime path uses prebuilt kernels from `rootonchair/nunchaku-lite-kernels`
+through the Hugging Face `kernels` library instead.
 
-The Python package metadata installs the runtime Python dependencies. The CUDA
-toolkit and a compatible PyTorch CUDA build must already be available in the
-environment before building from source.
+The native build detects the local GPU architecture by default. Supported
+targets are `sm75`, `sm80`, `sm86`, `sm89`, `sm120a`, and `sm121a`, subject to
+the installed CUDA toolkit version. CUDA 12.6 or newer is the documented
+minimum; `sm120a` requires CUDA 12.8 or newer, and `sm121a` requires CUDA 13.0
+or newer. The Hugging Face kernels package provides prebuilt kernels for CUDA
+`7.5`, `8.0`, `8.6`, `8.9`, `12.0a`, and `12.1a`.
 
-> **CUDA version note:** Source installs and wheel builds compile the native
-> `nunchaku_lite._C` CUDA extension. Use a CUDA toolkit with `nvcc` that is
-> compatible with your installed PyTorch CUDA build. CUDA 12.6 or newer is the
-> documented minimum; Blackwell `sm120a` requires CUDA 12.8 or newer, and
-> `sm121a` requires CUDA 13.0 or newer.
+The root Python package does not compile CUDA code. CUDA toolkit requirements
+apply only when installing the local `nunchaku_lite_kernels` package from
+`./nunchaku-lite-kernels`.
+
+> **CUDA version note:** `nunchaku_lite` first tries a locally installed
+> `nunchaku_lite_kernels` package, then falls back to
+> `rootonchair/nunchaku-lite-kernels` through Hugging Face `kernels`.
 
 ## Installation
 
@@ -111,6 +114,18 @@ Install from source:
 pip install .
 ```
 
+This installs the root Python runtime and uses Hugging Face prebuilt kernels by
+default.
+
+To build and use the local CUDA kernels package:
+
+```bash
+pip install ./nunchaku-lite-kernels
+```
+
+When `nunchaku_lite_kernels` is installed locally, `nunchaku_lite` prefers it
+over the Hugging Face fallback.
+
 Build and install a wheel:
 
 ```bash
@@ -118,11 +133,12 @@ python setup.py bdist_wheel
 pip install dist/nunchaku_lite-*.whl
 ```
 
-By default, the build uses `NUNCHAKU_INSTALL_MODE=FAST` and compiles for visible
-local CUDA devices. To build all supported architectures:
+By default, the local kernels package build uses `NUNCHAKU_INSTALL_MODE=FAST`
+and compiles for visible local CUDA devices. To build all supported
+architectures:
 
 ```bash
-NUNCHAKU_INSTALL_MODE=ALL pip install .
+NUNCHAKU_INSTALL_MODE=ALL pip install ./nunchaku-lite-kernels
 ```
 
 ## Quick Start
