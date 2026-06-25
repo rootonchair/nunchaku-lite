@@ -137,8 +137,6 @@ def _validate_requirements(requirements: dict[str, Any]) -> None:
     _required(requirements, "rank", int)
     _required(requirements, "weight_dtype", str)
     _required(requirements, "activation_dtype", str)
-    if "torch_dtype" not in requirements:
-        raise ValueError("runtime_manifest requirements missing required field 'torch_dtype'.")
 
 
 def _parse_target(index: int, raw: Any) -> RuntimeManifestTarget:

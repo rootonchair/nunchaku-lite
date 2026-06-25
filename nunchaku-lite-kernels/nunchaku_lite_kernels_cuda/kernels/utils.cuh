@@ -14,6 +14,9 @@
 #ifdef ENABLE_BF16
 #include <cuda_bf16.h>
 #endif
+#ifdef ENABLE_FP8
+#include <cuda_fp8.h>
+#endif
 
 __device__ __forceinline__ static void trap_unsupported_arch() {
     if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {

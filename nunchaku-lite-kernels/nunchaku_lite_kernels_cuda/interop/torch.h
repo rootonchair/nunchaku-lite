@@ -1,6 +1,6 @@
 #pragma once
 
-#include <torch/extension.h>
+#include <torch/torch.h>
 
 #include "common.h"
 #include "Tensor.h"
@@ -38,10 +38,10 @@ public:
     TensorsProviderTorch(std::map<std::string, at::Tensor> dict) : storage(std::move(dict)) {}
 
     virtual bool contains(const std::string &key) const override {
-        return storage.contains(key);
+        return storage.find(key) != storage.end();
     }
     virtual Tensor getTensor(const std::string &key) override {
-        if (!storage.contains(key)) {
+        if (storage.find(key) == storage.end()) {
             return Tensor{};
         }
         return from_torch(storage.at(key));

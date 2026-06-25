@@ -21,11 +21,11 @@ either `0.1.0` or `0.1.0dev`. For tag builds, CI strips only the build version
 by setting `NUNCHAKU_LITE_RELEASE_VERSION`; it does not edit the committed
 source file.
 
-The final wheel version still includes the existing CUDA and Torch local suffix,
-for example:
+The root `nunchaku_lite` wheel is pure Python and uses the package version
+directly, for example:
 
 ```text
-0.1.0+cu13.0torch2.11
+0.1.0
 ```
 
 After release, bump to the next dev version:
@@ -40,54 +40,29 @@ Manual builds are available from the `Release Wheels` workflow through
 
 ## Build Matrix
 
-The release workflow builds Linux `x86_64` wheels for Python 3.10 through 3.13.
-Wheels are split by Python version, Torch version, and CUDA variant. They are
-not split by individual GPU architecture.
+The release workflow builds the root Python package. CUDA kernels are provided
+by Hugging Face `kernels` by default or by installing the vendored
+`./nunchaku-lite-kernels` package separately.
 
-| Torch | CUDA variants |
-| --- | --- |
-| 2.9.1 | cu128, cu130 |
-| 2.10.0 | cu128, cu130 |
-| 2.11.0 | cu128, cu130 |
-| 2.12.0 | cu130 |
-
-Torch 2.12 does not build a `cu128` wheel in this project matrix. CUDA 13.2
-(`cu132`) is intentionally excluded until the project decides to support
-experimental CUDA release wheels.
-
-Each wheel is built with `NUNCHAKU_INSTALL_MODE=ALL`, so the compiled extension
-contains every supported SM target for the selected CUDA toolkit. CUDA 12.8
-builds include `sm75`, `sm80`, `sm86`, `sm89`, and `sm120a`. CUDA 13.0 builds
-also include `sm121a`.
-
-CI builds one Python wheel per job and limits CUDA compiler parallelism to keep
-GitHub-hosted runners from being terminated during heavy CUDA builds.
+Local CUDA kernel package builds still support `NUNCHAKU_INSTALL_MODE=FAST` and
+`NUNCHAKU_INSTALL_MODE=ALL`.
 
 ## Local Reproduction
 
-Install `cibuildwheel`, choose a Torch/CUDA pair, and run the Linux build. Set
-`NUNCHAKU_LITE_RELEASE_VERSION` only when reproducing a tag release; omit it for
-normal dev builds.
+Install `build` and create the root Python wheel. Set
+`NUNCHAKU_LITE_RELEASE_VERSION` only when reproducing a tag release; omit it
+for normal dev builds.
 
 ```bash
-python -m pip install cibuildwheel==3.4.1
+python -m pip install build
 
-export CUDA_VISIBLE_DEVICES=""
-export NUNCHAKU_BUILD_WHEELS=1
-export NUNCHAKU_CUDA_VERSION=13.0
-export NUNCHAKU_INSTALL_MODE=ALL
 export NUNCHAKU_LITE_RELEASE_VERSION=0.1.0
-export NUNCHAKU_NVCC_THREADS=2
-export NUNCHAKU_TORCH_CUDA_TAG=cu130
-export NUNCHAKU_TORCH_VERSION=2.11.0
-export MAX_JOBS=2
-export PIP_NO_CACHE_DIR=1
-export CIBW_BUILD=cp313-manylinux_x86_64
 
-python -m cibuildwheel --platform linux --output-dir wheelhouse
+python -m build --wheel
 ```
 
-Local builds require Docker because Linux `cibuildwheel` runs inside manylinux
-containers. The workflow installs the matching CUDA toolkit inside the build
-container and installs the exact PyTorch wheel before building without build
-isolation.
+To build the local CUDA kernels package from source:
+
+```bash
+NUNCHAKU_INSTALL_MODE=ALL pip install ./nunchaku-lite-kernels
+```
