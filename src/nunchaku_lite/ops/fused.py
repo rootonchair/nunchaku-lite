@@ -6,7 +6,8 @@ from torch.nn import RMSNorm
 
 from ..linear import SVDQW4A4Linear
 from ..utils import ceil_divide
-from .gemm import _ops, svdq_gemm_w4a4_cuda
+from .backend import get_ops
+from .gemm import svdq_gemm_w4a4_cuda
 
 
 def fused_gelu_mlp(x: torch.Tensor, fc1: SVDQW4A4Linear, fc2: SVDQW4A4Linear, pad_size: int = 256) -> torch.Tensor:
@@ -188,7 +189,7 @@ def fused_rms_norm_modulate(
         and not torch.is_grad_enabled()
     ):
         try:
-            return _ops().fused_rms_norm_modulate(
+            return get_ops().fused_rms_norm_modulate(
                 x.contiguous(),
                 weight,
                 native_scale.contiguous(),
@@ -224,7 +225,7 @@ def fused_affine_modulate(x: torch.Tensor, scale: torch.Tensor, shift: torch.Ten
         and not torch.is_grad_enabled()
     ):
         try:
-            return _ops().fused_affine_modulate(
+            return get_ops().fused_affine_modulate(
                 x.contiguous(), native_scale.contiguous(), native_shift.contiguous()
             )
         except (ImportError, ModuleNotFoundError, AttributeError, RuntimeError):
@@ -389,7 +390,7 @@ def fused_cross_head_qk_norm_rope(
         device=k.device,
     )
 
-    q_out, k_out = _ops().fused_cross_head_qk_norm_rope(
+    q_out, k_out = get_ops().fused_cross_head_qk_norm_rope(
         q.contiguous(),
         k.contiguous(),
         q_weight,
