@@ -120,8 +120,11 @@ default.
 To build and use the local CUDA kernels package:
 
 ```bash
-pip install ./nunchaku-lite-kernels
+pip install --no-build-isolation ./nunchaku-lite-kernels
 ```
+
+`--no-build-isolation` ensures the extension is compiled against the PyTorch
+version installed in the active environment.
 
 When `nunchaku_lite_kernels` is installed locally, `nunchaku_lite` prefers it
 over the Hugging Face fallback.
@@ -138,7 +141,7 @@ and compiles for visible local CUDA devices. To build all supported
 architectures:
 
 ```bash
-NUNCHAKU_INSTALL_MODE=ALL pip install ./nunchaku-lite-kernels
+NUNCHAKU_INSTALL_MODE=ALL pip install --no-build-isolation ./nunchaku-lite-kernels
 ```
 
 ## Quick Start

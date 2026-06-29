@@ -1,6 +1,7 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/ops/empty_like.h>
 #include <c10/cuda/CUDAException.h>
-#include <torch/extension.h>
+#include <torch/types.h>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -280,8 +281,8 @@ std::vector<torch::Tensor> fused_cross_head_qk_norm_rope(torch::Tensor q,
     check_optional_rope(q_cos, q_sin, q, q_heads, head_dim, interleaved, "q");
     check_optional_rope(k_cos, k_sin, k, k_heads, head_dim, interleaved, "k");
 
-    auto q_out = torch::empty_like(q);
-    auto k_out = torch::empty_like(k);
+    auto q_out = at::empty_like(q);
+    auto k_out = at::empty_like(k);
     if (q.numel() == 0 && k.numel() == 0) {
         return {q_out, k_out};
     }

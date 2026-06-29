@@ -10,6 +10,10 @@ import torch
 _DISPATCH_NAMESPACE = "nunchaku_lite_kernels"
 
 
+def add_op_namespace_prefix(op_name: str) -> str:
+    return f"{_DISPATCH_NAMESPACE}::{op_name}"
+
+
 def _load_extension_module():
     try:
         from . import _C
@@ -26,7 +30,8 @@ def _load_extension_module():
 _extension_module = _load_extension_module()
 ops = getattr(torch.ops, _DISPATCH_NAMESPACE)
 
-@torch.library.register_fake(f"{_DISPATCH_NAMESPACE}::gemm_w4a4")
+
+@torch.library.register_fake(add_op_namespace_prefix("gemm_w4a4"))
 def _fake_gemm_w4a4(
     act,
     wgt,
@@ -61,7 +66,7 @@ def _fake_gemm_w4a4(
     return None
 
 
-@torch.library.register_fake(f"{_DISPATCH_NAMESPACE}::quantize_w4a4_act_fuse_lora")
+@torch.library.register_fake(add_op_namespace_prefix("quantize_w4a4_act_fuse_lora"))
 def _fake_quantize_w4a4_act_fuse_lora(
     input,
     output,
@@ -75,37 +80,37 @@ def _fake_quantize_w4a4_act_fuse_lora(
     return None
 
 
-@torch.library.register_fake(f"{_DISPATCH_NAMESPACE}::fused_rms_norm_modulate")
+@torch.library.register_fake(add_op_namespace_prefix("fused_rms_norm_modulate"))
 def _fake_fused_rms_norm_modulate(x, norm_weight, scale, shift, eps: float):
     return torch.empty_like(x)
 
 
-@torch.library.register_fake(f"{_DISPATCH_NAMESPACE}::fused_affine_modulate")
+@torch.library.register_fake(add_op_namespace_prefix("fused_affine_modulate"))
 def _fake_fused_affine_modulate(x, scale, shift):
     return torch.empty_like(x)
 
 
-@torch.library.register_fake(f"{_DISPATCH_NAMESPACE}::awq_gemm_w4a16_g128_int16")
+@torch.library.register_fake(add_op_namespace_prefix("awq_gemm_w4a16_g128_int16"))
 def _fake_awq_gemm_w4a16_g128_int16(in_feats, qweight, scaling_factors, zeros):
     return in_feats.new_empty((*in_feats.shape[:-1], qweight.shape[0] * 4))
 
 
-@torch.library.register_fake(f"{_DISPATCH_NAMESPACE}::awq_gemm_w4a16_g64_int32")
+@torch.library.register_fake(add_op_namespace_prefix("awq_gemm_w4a16_g64_int32"))
 def _fake_awq_gemm_w4a16_g64_int32(in_feats, qweight, scaling_factors, zeros):
     return in_feats.new_empty((*in_feats.shape[:-1], qweight.shape[0] * 4))
 
 
-@torch.library.register_fake(f"{_DISPATCH_NAMESPACE}::gemv_awq")
+@torch.library.register_fake(add_op_namespace_prefix("gemv_awq"))
 def _fake_gemv_awq(in_feats, qweight, scaling_factors, zeros, m: int, n: int, k: int, group_size: int):
     return in_feats.new_empty((m, n))
 
 
-@torch.library.register_fake(f"{_DISPATCH_NAMESPACE}::attention_fp16")
+@torch.library.register_fake(add_op_namespace_prefix("attention_fp16"))
 def _fake_attention_fp16(q, k, v, o, scale: float) -> None:
     return None
 
 
-@torch.library.register_fake(f"{_DISPATCH_NAMESPACE}::fused_cross_head_qk_norm_rope")
+@torch.library.register_fake(add_op_namespace_prefix("fused_cross_head_qk_norm_rope"))
 def _fake_fused_cross_head_qk_norm_rope(
     q,
     k,

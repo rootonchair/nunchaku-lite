@@ -2,7 +2,19 @@ import math
 
 import torch
 
-from ._ops import ops
+from . import _ops as _loaded_ops  # noqa: F401
+
+
+def _get_ops():
+    ops = getattr(torch.ops, "nunchaku_lite_kernels")
+    try:
+        ops.gemm_w4a4
+    except AttributeError as exc:
+        raise ImportError("nunchaku_lite_kernels extension did not register dispatcher ops") from exc
+    return ops
+
+
+ops = _get_ops()
 
 gemm_w4a4 = ops.gemm_w4a4
 quantize_w4a4_act_fuse_lora = ops.quantize_w4a4_act_fuse_lora

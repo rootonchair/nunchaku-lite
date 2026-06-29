@@ -1,6 +1,7 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/ops/empty_like.h>
 #include <c10/cuda/CUDAException.h>
-#include <torch/extension.h>
+#include <torch/types.h>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -178,7 +179,7 @@ torch::Tensor fused_rms_norm_modulate(torch::Tensor x,
     TORCH_CHECK(shift.numel() == channels || shift.numel() == batch * channels,
                 "shift must be broadcastable as [channels] or [batch, channels]");
 
-    auto out = torch::empty_like(x);
+    auto out = at::empty_like(x);
     if (x.numel() == 0) {
         return out;
     }
@@ -246,7 +247,7 @@ torch::Tensor fused_affine_modulate(torch::Tensor x, torch::Tensor scale, torch:
     TORCH_CHECK(shift_elements == channels || shift_elements == batch * channels || shift_elements == x.numel(),
                 "shift must be broadcastable as [channels], [batch, channels], or x shape");
 
-    auto out = torch::empty_like(x);
+    auto out = at::empty_like(x);
     if (x.numel() == 0) {
         return out;
     }
