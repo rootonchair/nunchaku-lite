@@ -2,8 +2,10 @@ import platform
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 import nunchaku_lite_kernels
+from nunchaku_lite_kernels._ops import ops
 
 
 def _awq_code_order(device: torch.device) -> torch.Tensor:
@@ -56,6 +58,54 @@ def test_exports_expected_wrappers():
 
     for name in nunchaku_lite_kernels.__all__:
         assert callable(getattr(nunchaku_lite_kernels, name))
+
+
+def test_local_backend_prefers_dispatcher_ops():
+    assert ops is torch.ops.nunchaku_lite_kernels
+    assert str(ops.gemm_w4a4) == "nunchaku_lite_kernels.gemm_w4a4"
+    assert str(ops.quantize_w4a4_act_fuse_lora) == "nunchaku_lite_kernels.quantize_w4a4_act_fuse_lora"
+    assert str(ops.fused_cross_head_qk_norm_rope) == "nunchaku_lite_kernels.fused_cross_head_qk_norm_rope"
+
+
+def test_top_level_dispatcher_aliases():
+    assert str(nunchaku_lite_kernels.gemm_w4a4) == "nunchaku_lite_kernels.gemm_w4a4"
+    assert (
+        str(nunchaku_lite_kernels.quantize_w4a4_act_fuse_lora)
+        == "nunchaku_lite_kernels.quantize_w4a4_act_fuse_lora"
+    )
+    assert (
+        str(nunchaku_lite_kernels.fused_cross_head_qk_norm_rope)
+        == "nunchaku_lite_kernels.fused_cross_head_qk_norm_rope"
+    )
+
+
+def test_dispatcher_ops_have_fake_kernels():
+    with FakeTensorMode():
+        q = torch.empty(1, 4, 8, device="cuda", dtype=torch.bfloat16)
+        k = torch.empty(1, 4, 8, device="cuda", dtype=torch.bfloat16)
+        q_out, k_out = ops.fused_cross_head_qk_norm_rope(
+            q, k, None, None, None, None, None, None, 1, 1, 8, 1e-6, False
+        )
+        assert q_out.shape == q.shape
+        assert k_out.shape == k.shape
+        assert q_out.dtype == q.dtype
+        assert k_out.dtype == k.dtype
+
+        x = torch.empty(256, 16, device="cuda", dtype=torch.bfloat16)
+        output = torch.empty(256, 8, device="cuda", dtype=torch.uint8)
+        oscales = torch.empty(1, 256, device="cuda", dtype=torch.float8_e4m3fn)
+        lora_down = torch.empty(16, 4, device="cuda", dtype=torch.bfloat16)
+        lora_act_out = torch.empty(256, 4, device="cuda", dtype=torch.float32)
+        assert (
+            ops.quantize_w4a4_act_fuse_lora(x, output, oscales, lora_down, lora_act_out, None, False, True)
+            is None
+        )
+        scale = torch.empty(8, device="cuda", dtype=torch.bfloat16)
+        shift = torch.empty(8, device="cuda", dtype=torch.bfloat16)
+        modulated = ops.fused_rms_norm_modulate(q, None, scale, shift, 1e-6)
+        assert modulated.shape == q.shape
+        affine = ops.fused_affine_modulate(q, scale, shift)
+        assert affine.shape == q.shape
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="AWQ GEMM correctness requires CUDA")

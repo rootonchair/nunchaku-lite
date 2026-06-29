@@ -3,7 +3,11 @@ import torch
 import torch.nn.functional as F
 from diffusers.models.transformers.transformer_ltx2 import apply_interleaved_rotary_emb, apply_split_rotary_emb
 
-from nunchaku_lite.ops.fused import fused_affine_modulate, fused_cross_head_qk_norm_rope, fused_rms_norm_modulate
+from nunchaku_lite.ops.fused import (
+    fused_affine_modulate,
+    fused_cross_head_qk_norm_rope,
+    fused_rms_norm_modulate,
+)
 
 
 def _has_native_cross_head_qk_op() -> bool:
@@ -17,8 +21,9 @@ def _has_native_cross_head_qk_op() -> bool:
 
 def _has_native_modulation_ops() -> bool:
     try:
-        from nunchaku_lite._C import ops
+        from nunchaku_lite.ops.backend import get_ops
 
+        ops = get_ops()
         return hasattr(ops, "fused_rms_norm_modulate") and hasattr(ops, "fused_affine_modulate")
     except Exception:
         return False
