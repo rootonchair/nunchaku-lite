@@ -115,6 +115,7 @@ if __name__ == "__main__":
         name="nunchaku_lite_kernels._C",
         sources=[
             "nunchaku_lite_kernels_cuda/pybind.cpp",
+            "nunchaku_lite_kernels_cuda/torch_dispatch.cpp",
             "nunchaku_lite_kernels_cuda/interop/torch.cpp",
             "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4.cu",
             "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_fp16_int4.cu",
