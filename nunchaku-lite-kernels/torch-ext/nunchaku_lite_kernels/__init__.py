@@ -2,7 +2,27 @@ import math
 
 import torch
 
-from ._ops import ops
+from . import _ops as _loaded_ops  # noqa: F401
+
+
+def _get_ops():
+    ops = getattr(torch.ops, "nunchaku_lite_kernels")
+    try:
+        ops.gemm_w4a4
+    except AttributeError as exc:
+        raise ImportError("nunchaku_lite_kernels extension did not register dispatcher ops") from exc
+    return ops
+
+
+ops = _get_ops()
+
+gemm_w4a4 = ops.gemm_w4a4
+quantize_w4a4_act_fuse_lora = ops.quantize_w4a4_act_fuse_lora
+fused_rms_norm_modulate = ops.fused_rms_norm_modulate
+fused_affine_modulate = ops.fused_affine_modulate
+fused_cross_head_qk_norm_rope = ops.fused_cross_head_qk_norm_rope
+gemv_awq = ops.gemv_awq
+attention_fp16 = ops.attention_fp16
 
 
 def _ceil_divide(a: int, b: int) -> int:
@@ -46,8 +66,12 @@ def svdq_gemm_w4a4_cuda(
         else:
             rank = lora_up.shape[1]
             lora_scales = [1.0] * math.ceil(rank / 16)
-    if alpha is None:
-        alpha = 1.0
+    if isinstance(alpha, torch.Tensor):
+        alpha_arg = alpha
+    elif alpha is None or float(alpha) == 1.0:
+        alpha_arg = None
+    else:
+        alpha_arg = torch.tensor(float(alpha), device=act.device)
     ops.gemm_w4a4(
         act,
         wgt,
@@ -72,7 +96,7 @@ def svdq_gemm_w4a4_cuda(
         lora_scales,
         fuse_silu,
         fp4,
-        alpha,
+        alpha_arg,
         wcscales,
         out_q,
         out_k,
@@ -153,9 +177,16 @@ def attention_fp16_cuda(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, o: to
 
 __all__ = [
     "attention_fp16_cuda",
+    "attention_fp16",
     "awq_gemm_w4a16_g128_int16",
     "awq_gemm_w4a16_g64_int32",
     "awq_gemv_w4a16_cuda",
+    "fused_affine_modulate",
+    "fused_cross_head_qk_norm_rope",
+    "fused_rms_norm_modulate",
+    "gemm_w4a4",
+    "gemv_awq",
+    "quantize_w4a4_act_fuse_lora",
     "svdq_gemm_w4a4_cuda",
     "svdq_quantize_w4a4_act_fuse_lora_cuda",
 ]

@@ -79,9 +79,14 @@ def svdq_gemm_w4a4_cuda(
     if lora_scales is None:
         rank = lora_up.shape[1]
         lora_scales = [1.0] * math.ceil(rank / 16)
-    if alpha is None:
-        alpha = 1.0
-    get_ops().gemm_w4a4(
+    ops = get_ops()
+    if isinstance(alpha, torch.Tensor):
+        alpha_arg = alpha
+    elif alpha is None or float(alpha) == 1.0:
+        alpha_arg = None
+    else:
+        alpha_arg = torch.tensor(float(alpha), device=act.device)
+    ops.gemm_w4a4(
         act,
         wgt,
         out,
@@ -105,7 +110,7 @@ def svdq_gemm_w4a4_cuda(
         lora_scales,
         fuse_silu,
         fp4,
-        alpha,
+        alpha_arg,
         wcscales,
         out_q,
         out_k,

@@ -17,6 +17,7 @@ include = [
 src = [
   "torch-ext/torch_binding.cpp",
   "torch-ext/torch_binding.h",
+  "nunchaku_lite_kernels_cuda/torch_registration.h",
 ]
 
 [kernel.nunchaku_lite_kernels]
@@ -89,6 +90,8 @@ src = [
   "nunchaku_lite_kernels_cuda/kernels/zgemm/attention.cu",
   "nunchaku_lite_kernels_cuda/kernels/zgemm/attention.cuh",
   "nunchaku_lite_kernels_cuda/kernels/zgemm/zgemm.h",
+  "nunchaku_lite_kernels_cuda/kernels/modulation.cu",
+  "nunchaku_lite_kernels_cuda/kernels/cross_head_qk_norm_rope.cu",
   "nunchaku_lite_kernels_cuda/kernels/awq/gemm_awq.cu",
   "nunchaku_lite_kernels_cuda/kernels/awq/gemm_awq.h",
   "nunchaku_lite_kernels_cuda/kernels/awq/gemv_awq.cu",
