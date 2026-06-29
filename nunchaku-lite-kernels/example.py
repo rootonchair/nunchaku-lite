@@ -32,10 +32,17 @@ if device.type != "cuda":
     raise RuntimeError("nunchaku_lite_kernels currently exposes CUDA native kernels only")
 
 available = [
+    "attention_fp16",
     "attention_fp16_cuda",
     "awq_gemm_w4a16_g128_int16",
     "awq_gemm_w4a16_g64_int32",
     "awq_gemv_w4a16_cuda",
+    "fused_affine_modulate",
+    "fused_cross_head_qk_norm_rope",
+    "fused_rms_norm_modulate",
+    "gemm_w4a4",
+    "gemv_awq",
+    "quantize_w4a4_act_fuse_lora",
     "svdq_gemm_w4a4_cuda",
     "svdq_quantize_w4a4_act_fuse_lora_cuda",
 ]

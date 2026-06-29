@@ -4,6 +4,14 @@ import torch
 
 from ._ops import ops
 
+gemm_w4a4 = ops.gemm_w4a4
+quantize_w4a4_act_fuse_lora = ops.quantize_w4a4_act_fuse_lora
+fused_rms_norm_modulate = ops.fused_rms_norm_modulate
+fused_affine_modulate = ops.fused_affine_modulate
+fused_cross_head_qk_norm_rope = ops.fused_cross_head_qk_norm_rope
+gemv_awq = ops.gemv_awq
+attention_fp16 = ops.attention_fp16
+
 
 def _ceil_divide(a: int, b: int) -> int:
     return -(-a // b)
@@ -157,9 +165,16 @@ def attention_fp16_cuda(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, o: to
 
 __all__ = [
     "attention_fp16_cuda",
+    "attention_fp16",
     "awq_gemm_w4a16_g128_int16",
     "awq_gemm_w4a16_g64_int32",
     "awq_gemv_w4a16_cuda",
+    "fused_affine_modulate",
+    "fused_cross_head_qk_norm_rope",
+    "fused_rms_norm_modulate",
+    "gemm_w4a4",
+    "gemv_awq",
+    "quantize_w4a4_act_fuse_lora",
     "svdq_gemm_w4a4_cuda",
     "svdq_quantize_w4a4_act_fuse_lora_cuda",
 ]
