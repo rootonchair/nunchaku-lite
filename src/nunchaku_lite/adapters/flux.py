@@ -4,19 +4,22 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from diffusers.models.activations import GELU as DiffusersGELU
 from diffusers.models.attention import AttentionModuleMixin, FeedForward
 from diffusers.models.normalization import AdaLayerNormZero, AdaLayerNormZeroSingle
 from diffusers.models.transformers.transformer_flux import (
     FluxAttention,
     FluxSingleTransformerBlock,
+    FluxTransformerBlock,
 )
 from packaging.version import Version
 import diffusers
 import torch.nn.functional as F
+from torch.nn import GELU as TorchGELU
 
 from ..core import PatchOptions, register_adapter
 from ..linear import AWQW4A16Linear, SVDQW4A4Linear
-from ..ops.fused import fused_qkv_norm_rotary
+from ..ops.fused import fused_gelu_mlp, fused_qkv_norm_rotary
 from .common import (
     SVDQPatchContext,
     build_svdq_context,
@@ -552,7 +555,93 @@ def _patch_flux_feed_forward(ff: nn.Module, context: SVDQPatchContext, **kwargs)
     )
     if len(ff.net) > 2 and isinstance(ff.net[2], SVDQW4A4Linear):
         ff.net[2].act_unsigned = ff.net[2].precision != "nvfp4"
-    return ff
+    return NunchakuFluxFeedForward(ff)
+
+
+class NunchakuFluxFeedForward(nn.Module):
+    """Flux feed-forward wrapper that preserves Nunchaku's fused GELU MLP path."""
+
+    def __init__(self, ff: FeedForward) -> None:
+        super().__init__()
+        self.net = ff.net
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if len(self.net) > 2 and isinstance(self.net[0], DiffusersGELU):
+            return fused_gelu_mlp(hidden_states, self.net[0].proj, self.net[2])
+        for module in self.net:
+            hidden_states = module(hidden_states)
+        return hidden_states
+
+
+class NunchakuFluxTransformerBlock(nn.Module):
+    """Double-stream Flux block with Nunchaku-compatible modulation and MLP paths."""
+
+    def __init__(
+        self,
+        block: FluxTransformerBlock,
+        context: SVDQPatchContext,
+        *,
+        scale_shift: float = 0.0,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        torch_dtype = context.torch_dtype if context is not None else kwargs.get("torch_dtype", torch.bfloat16)
+        self.norm1 = NunchakuAdaLayerNormZero(block.norm1, scale_shift=scale_shift, torch_dtype=torch_dtype)
+        self.norm1_context = NunchakuAdaLayerNormZero(
+            block.norm1_context,
+            scale_shift=scale_shift,
+            torch_dtype=torch_dtype,
+        )
+        self.attn = NunchakuFluxAttention(block.attn, context=context, **kwargs)
+        self.norm2 = block.norm2
+        self.norm2_context = block.norm2_context
+        self.ff = _patch_flux_feed_forward(block.ff, context, **kwargs)
+        self.ff_context = _patch_flux_feed_forward(block.ff_context, context, **kwargs)
+        self._nunchaku_lite_flux_block_patched = True
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | torch.Tensor | None = None,
+        joint_attention_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
+        norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
+            encoder_hidden_states,
+            emb=temb,
+        )
+
+        attention_outputs = self.attn(
+            hidden_states=norm_hidden_states,
+            encoder_hidden_states=norm_encoder_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+            **(joint_attention_kwargs or {}),
+        )
+
+        if len(attention_outputs) == 2:
+            attn_output, context_attn_output = attention_outputs
+        elif len(attention_outputs) == 3:
+            attn_output, context_attn_output, ip_attn_output = attention_outputs
+
+        hidden_states = hidden_states + gate_msa.unsqueeze(1) * attn_output
+        norm_hidden_states = self.norm2(hidden_states)
+        norm_hidden_states = norm_hidden_states * scale_mlp[:, None] + shift_mlp[:, None]
+        hidden_states = hidden_states + gate_mlp.unsqueeze(1) * self.ff(norm_hidden_states)
+        if len(attention_outputs) == 3:
+            hidden_states = hidden_states + ip_attn_output
+
+        encoder_hidden_states = encoder_hidden_states + c_gate_msa.unsqueeze(1) * context_attn_output
+        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
+        norm_encoder_hidden_states = norm_encoder_hidden_states * c_scale_mlp[:, None] + c_shift_mlp[:, None]
+        encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * self.ff_context(
+            norm_encoder_hidden_states
+        )
+        if encoder_hidden_states.dtype == torch.float16:
+            encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
+
+        return encoder_hidden_states, hidden_states
 
 
 class NunchakuFluxSingleTransformerBlock(nn.Module):
@@ -593,9 +682,12 @@ class NunchakuFluxSingleTransformerBlock(nn.Module):
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
 
-        mlp_hidden_states = self.mlp_fc1(norm_hidden_states)
-        mlp_hidden_states = self.act_mlp(mlp_hidden_states)
-        mlp_hidden_states = self.mlp_fc2(mlp_hidden_states)
+        if isinstance(self.act_mlp, TorchGELU):
+            mlp_hidden_states = fused_gelu_mlp(norm_hidden_states, self.mlp_fc1, self.mlp_fc2)
+        else:
+            mlp_hidden_states = self.mlp_fc1(norm_hidden_states)
+            mlp_hidden_states = self.act_mlp(mlp_hidden_states)
+            mlp_hidden_states = self.mlp_fc2(mlp_hidden_states)
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
             image_rotary_emb=image_rotary_emb,
@@ -695,6 +787,11 @@ class FluxAdapter:
             transformer,
             skips=lambda _path, module: isinstance(module, nn.Linear),
             module_converters={
+                FluxTransformerBlock: lambda _path, block: NunchakuFluxTransformerBlock(
+                    block,
+                    context=context,
+                    scale_shift=0.0,
+                ),
                 AdaLayerNormZero: lambda _path, norm: NunchakuAdaLayerNormZero(
                     norm,
                     scale_shift=0.0,
