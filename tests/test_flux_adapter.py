@@ -11,6 +11,8 @@ from nunchaku_lite.adapters.flux import (
     FluxAdapter,
     NunchakuFluxAttention,
     NunchakuFluxAttnProcessor,
+    NunchakuFluxFeedForward,
+    NunchakuFluxTransformerBlock,
     convert_flux_state_dict,
 )
 from nunchaku_lite.linear import SVDQW4A4Linear
@@ -90,9 +92,11 @@ def test_patch_transformer_patches_flux_from_synthetic_checkpoint(tmp_path):
     assert returned is transformer
     assert transformer._nunchaku_lite_patched
     assert transformer._nunchaku_lite_target == "flux"
-    assert transformer.transformer_blocks[0].__class__.__name__ == "FluxTransformerBlock"
+    assert isinstance(transformer.transformer_blocks[0], NunchakuFluxTransformerBlock)
     assert transformer.single_transformer_blocks[0].__class__.__name__ == "NunchakuFluxSingleTransformerBlock"
     assert isinstance(transformer.transformer_blocks[0].attn, NunchakuFluxAttention)
+    assert isinstance(transformer.transformer_blocks[0].ff, NunchakuFluxFeedForward)
+    assert isinstance(transformer.transformer_blocks[0].ff_context, NunchakuFluxFeedForward)
     assert isinstance(transformer.transformer_blocks[0].attn.to_qkv, SVDQW4A4Linear)
     assert isinstance(transformer.single_transformer_blocks[0].attn.to_out, SVDQW4A4Linear)
     assert not hasattr(transformer.single_transformer_blocks[0], "proj_out")
