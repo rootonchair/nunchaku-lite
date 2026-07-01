@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch.nn import GELU as TorchGELU
 
 from ..core import PatchOptions, register_adapter
-from ..linear import AWQW4A16Linear, DenseRuntimeLoraLinear, SVDQW4A4Linear
+from ..linear import DenseRuntimeLoraLinear, SVDQW4A4Linear
 from ..ops.fused import fused_gelu_mlp, fused_qkv_norm_rotary
 from .common import (
     SVDQPatchContext,
