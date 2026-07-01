@@ -9,13 +9,15 @@ from diffusers.models.transformers.transformer_flux import FluxIPAdapterAttnProc
 from nunchaku_lite import patch_transformer
 from nunchaku_lite.adapters.flux import (
     FluxAdapter,
+    NunchakuAdaLayerNormZero,
+    NunchakuAdaLayerNormZeroSingle,
     NunchakuFluxAttention,
     NunchakuFluxAttnProcessor,
     NunchakuFluxFeedForward,
     NunchakuFluxTransformerBlock,
     convert_flux_state_dict,
 )
-from nunchaku_lite.linear import SVDQW4A4Linear
+from nunchaku_lite.linear import AWQW4A16Linear, DenseRuntimeLoraLinear, SVDQW4A4Linear
 
 
 def make_tiny_flux_transformer():
@@ -30,6 +32,23 @@ def make_tiny_flux_transformer():
         guidance_embeds=False,
         axes_dims_rope=(4, 6, 6),
     )
+
+
+def replace_flux_adanorm_awq_with_dense(state):
+    state = dict(state)
+    dense_state = make_tiny_flux_transformer().state_dict()
+    prefixes = (
+        "transformer_blocks.0.norm1.linear",
+        "transformer_blocks.0.norm1_context.linear",
+        "single_transformer_blocks.0.norm.linear",
+    )
+
+    for prefix in prefixes:
+        for suffix in ("qweight", "wscales", "wzeros"):
+            state.pop(f"{prefix}.{suffix}", None)
+        state[f"{prefix}.weight"] = dense_state[f"{prefix}.weight"].clone()
+        state[f"{prefix}.bias"] = dense_state[f"{prefix}.bias"].clone()
+    return state
 
 
 def test_flux_adapter_matches_diffusers_transformer():
@@ -97,9 +116,73 @@ def test_patch_transformer_patches_flux_from_synthetic_checkpoint(tmp_path):
     assert isinstance(transformer.transformer_blocks[0].attn, NunchakuFluxAttention)
     assert isinstance(transformer.transformer_blocks[0].ff, NunchakuFluxFeedForward)
     assert isinstance(transformer.transformer_blocks[0].ff_context, NunchakuFluxFeedForward)
+    assert isinstance(transformer.transformer_blocks[0].norm1.linear, AWQW4A16Linear)
+    assert isinstance(transformer.transformer_blocks[0].norm1_context.linear, AWQW4A16Linear)
+    assert isinstance(transformer.single_transformer_blocks[0].norm.linear, AWQW4A16Linear)
     assert isinstance(transformer.transformer_blocks[0].attn.to_qkv, SVDQW4A4Linear)
     assert isinstance(transformer.single_transformer_blocks[0].attn.to_out, SVDQW4A4Linear)
     assert not hasattr(transformer.single_transformer_blocks[0], "proj_out")
+
+
+def test_patch_transformer_loads_flux_with_dense_adanorm_checkpoint(tmp_path):
+    rank = 4
+    source = make_tiny_flux_transformer()
+    FluxAdapter().patch(
+        source,
+        {},
+        {"rank": rank},
+        SimpleNamespace(
+            precision="int4",
+            torch_dtype=torch.bfloat16,
+            device=None,
+            strict=True,
+            adapter_options={},
+        ),
+    )
+    state = replace_flux_adanorm_awq_with_dense(source.state_dict())
+    checkpoint = tmp_path / "flux-lite-dense-adanorm.safetensors"
+    save_file(state, checkpoint, metadata={"quantization_config": json.dumps({"rank": rank})})
+
+    transformer = make_tiny_flux_transformer()
+    returned = patch_transformer(transformer, checkpoint, precision="int4", torch_dtype=torch.bfloat16)
+
+    assert returned is transformer
+    assert transformer._nunchaku_lite_patched
+    assert isinstance(transformer.transformer_blocks[0], NunchakuFluxTransformerBlock)
+    assert isinstance(transformer.transformer_blocks[0].norm1.linear, DenseRuntimeLoraLinear)
+    assert isinstance(transformer.transformer_blocks[0].norm1_context.linear, DenseRuntimeLoraLinear)
+    assert isinstance(transformer.single_transformer_blocks[0].norm.linear, DenseRuntimeLoraLinear)
+    assert isinstance(transformer.transformer_blocks[0].attn.to_qkv, SVDQW4A4Linear)
+    assert isinstance(transformer.single_transformer_blocks[0].attn.to_out, SVDQW4A4Linear)
+
+
+def test_dense_adanorm_zero_uses_diffusers_channel_layout():
+    norm = make_tiny_flux_transformer().transformer_blocks[0].norm1
+    wrapped = NunchakuAdaLayerNormZero(norm, scale_shift=0.0, linear_mode="dense")
+    x = torch.randn(2, 3, norm.norm.normalized_shape[0])
+    emb = torch.randn(2, norm.linear.in_features)
+
+    expected = norm(x, emb=emb)
+    actual = wrapped(x, emb=emb)
+
+    assert torch.allclose(actual[0], expected[0])
+    assert torch.allclose(actual[1], expected[1])
+    assert torch.allclose(actual[2], expected[2])
+    assert torch.allclose(actual[3], expected[3] + 1.0)
+    assert torch.allclose(actual[4], expected[4])
+
+
+def test_dense_adanorm_zero_single_uses_diffusers_channel_layout():
+    norm = make_tiny_flux_transformer().single_transformer_blocks[0].norm
+    wrapped = NunchakuAdaLayerNormZeroSingle(norm, scale_shift=0.0, linear_mode="dense")
+    x = torch.randn(2, 3, norm.norm.normalized_shape[0])
+    emb = torch.randn(2, norm.linear.in_features)
+
+    expected = norm(x, emb=emb)
+    actual = wrapped(x, emb=emb)
+
+    for expected_tensor, actual_tensor in zip(expected, actual, strict=True):
+        assert torch.allclose(actual_tensor, expected_tensor)
 
 
 def test_patch_transformer_is_idempotent_for_flux(tmp_path):

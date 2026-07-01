@@ -10,7 +10,7 @@ from nunchaku_lite.adapters.flux import FluxAdapter
 from nunchaku_lite.lora.core.layout import unpack_lowrank_weight
 from nunchaku_lite.lora.core.runtime import NunchakuPipelineLoraMixin, bind_pipeline_lora_methods
 
-from test_flux_adapter import make_tiny_flux_transformer
+from test_flux_adapter import make_tiny_flux_transformer, replace_flux_adanorm_awq_with_dense
 
 
 def make_patched_flux_transformer(tmp_path, rank=4):
@@ -35,6 +35,27 @@ def make_patched_flux_transformer(tmp_path, rank=4):
             state[key] = torch.zeros_like(value)
 
     checkpoint = tmp_path / "flux-lite.safetensors"
+    save_file(state, checkpoint, metadata={"quantization_config": json.dumps({"rank": rank})})
+    transformer = make_tiny_flux_transformer()
+    return patch_transformer(transformer, checkpoint, precision="int4", torch_dtype=torch.bfloat16)
+
+
+def make_dense_adanorm_patched_flux_transformer(tmp_path, rank=4):
+    source = make_tiny_flux_transformer()
+    FluxAdapter().patch(
+        source,
+        {},
+        {"rank": rank},
+        SimpleNamespace(
+            precision="int4",
+            torch_dtype=torch.bfloat16,
+            device=None,
+            strict=True,
+            adapter_options={},
+        ),
+    )
+    state = replace_flux_adanorm_awq_with_dense(source.state_dict())
+    checkpoint = tmp_path / "flux-lite-dense-adanorm.safetensors"
     save_file(state, checkpoint, metadata={"quantization_config": json.dumps({"rank": rank})})
     transformer = make_tiny_flux_transformer()
     return patch_transformer(transformer, checkpoint, precision="int4", torch_dtype=torch.bfloat16)
@@ -177,6 +198,23 @@ def test_load_diffusers_adanorm_lora_sets_awq_side_branch(tmp_path):
         torch.full_like(module._nunchaku_lite_lora_down[:, :2], 0.5),
     )
     assert torch.count_nonzero(module._nunchaku_lite_lora_down[:, 2:]) == 0
+    transformer.reset_lora()
+
+
+def test_load_diffusers_adanorm_lora_keeps_dense_side_branch_layout(tmp_path):
+    transformer = make_dense_adanorm_patched_flux_transformer(tmp_path, rank=4)
+    module_name = "transformer_blocks.0.norm1.linear"
+    module = transformer.get_submodule(module_name)
+    lora_up = torch.arange(module.out_features * 2, dtype=torch.bfloat16).reshape(module.out_features, 2)
+    lora = {
+        f"transformer.{module_name}.lora_A.weight": torch.ones(2, module.in_features, dtype=torch.bfloat16),
+        f"transformer.{module_name}.lora_B.weight": lora_up,
+    }
+
+    transformer.load_lora(lora, strength=0.5, name="norm")
+
+    assert torch.equal(module._nunchaku_lite_lora_up[:, :2], lora_up)
+    assert torch.count_nonzero(module._nunchaku_lite_lora_up[:, 2:]) == 0
     transformer.reset_lora()
     assert module._nunchaku_lite_lora_down.shape == (module.in_features, 0)
     assert module._nunchaku_lite_lora_up.shape == (module.out_features, 0)

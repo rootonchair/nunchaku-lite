@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch.nn import GELU as TorchGELU
 
 from ..core import PatchOptions, register_adapter
-from ..linear import AWQW4A16Linear, SVDQW4A4Linear
+from ..linear import AWQW4A16Linear, DenseRuntimeLoraLinear, SVDQW4A4Linear
 from ..ops.fused import fused_gelu_mlp, fused_qkv_norm_rotary
 from .common import (
     SVDQPatchContext,
@@ -133,8 +133,33 @@ def prepare_flux_rotary(
     return rotary_txt, rotary_img, rotary_single
 
 
+def _flux_adanorm_linear_mode(checkpoint_state: dict[str, torch.Tensor], prefix: str) -> str:
+    if f"{prefix}.weight" in checkpoint_state:
+        return "dense"
+    return "awq"
+
+
+def _flux_adanorm_scale_shift(mode: str, scale_shift: float) -> float:
+    if mode == "dense" and scale_shift == 0:
+        return 1.0
+    return scale_shift
+
+
+def _flux_adanorm_linear_from_linear(
+    linear: nn.Linear,
+    *,
+    mode: str,
+    torch_dtype: torch.dtype,
+) -> nn.Module:
+    if mode == "dense":
+        return DenseRuntimeLoraLinear.from_linear(linear)
+    if mode == "awq":
+        return AWQW4A16Linear.from_linear(linear, torch_dtype=torch_dtype)
+    raise ValueError(f"Unsupported Flux AdaNorm linear mode: {mode}")
+
+
 class NunchakuAdaLayerNormZero(nn.Module):
-    """Flux AdaLayerNormZero variant whose projection uses AWQ W4A16 weights."""
+    """Flux AdaLayerNormZero variant with checkpoint-selected modulation projection."""
 
     def __init__(
         self,
@@ -142,6 +167,7 @@ class NunchakuAdaLayerNormZero(nn.Module):
         scale_shift: float = 1.0,
         torch_dtype: torch.dtype = torch.bfloat16,
         return_scale_shift: float = 0.0,
+        linear_mode: str = "awq",
     ):
         """Copy normalization components and replace the modulation projection.
 
@@ -149,17 +175,19 @@ class NunchakuAdaLayerNormZero(nn.Module):
             other: Source Diffusers AdaLayerNormZero module.
             scale_shift: Additive offset applied to scale outputs.
             torch_dtype: Runtime dtype for AWQ modulation projection buffers.
+            linear_mode: Checkpoint format for the modulation projection.
 
         Returns:
             None.
         """
 
         super().__init__()
-        self.scale_shift = scale_shift
+        self.scale_shift = _flux_adanorm_scale_shift(linear_mode, scale_shift)
         self.return_scale_shift = return_scale_shift
+        self._nunchaku_lite_adanorm_linear_mode = linear_mode
         self.emb = other.emb
         self.silu = other.silu
-        self.linear = AWQW4A16Linear.from_linear(other.linear, torch_dtype=torch_dtype)
+        self.linear = _flux_adanorm_linear_from_linear(other.linear, mode=linear_mode, torch_dtype=torch_dtype)
         self.norm = other.norm
 
     def forward(
@@ -187,12 +215,15 @@ class NunchakuAdaLayerNormZero(nn.Module):
         if self.emb is not None:
             emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
         emb = self.linear(self.silu(emb))
-        emb = emb.view(emb.shape[0], -1, 6).permute(2, 0, 1)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb
+        if self._nunchaku_lite_adanorm_linear_mode == "dense":
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
+        else:
+            emb = emb.view(emb.shape[0], -1, 6).permute(2, 0, 1)
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb
         norm_x = self.norm(x)
         if self.scale_shift != 0:
-            scale_msa.add_(self.scale_shift)
-            scale_mlp.add_(self.scale_shift)
+            scale_msa = scale_msa + self.scale_shift
+            scale_mlp = scale_mlp + self.scale_shift
         norm_x = norm_x * scale_msa[:, None] + shift_msa[:, None]
         if self.return_scale_shift != 0:
             scale_mlp = scale_mlp + self.return_scale_shift
@@ -200,10 +231,14 @@ class NunchakuAdaLayerNormZero(nn.Module):
 
 
 class NunchakuAdaLayerNormZeroSingle(nn.Module):
-    """Single-stream Flux AdaLayerNormZero variant using AWQ for modulation."""
+    """Single-stream Flux AdaLayerNormZero variant with checkpoint-selected projection."""
 
     def __init__(
-        self, other: AdaLayerNormZeroSingle, scale_shift: float = 1.0, torch_dtype: torch.dtype = torch.bfloat16
+        self,
+        other: AdaLayerNormZeroSingle,
+        scale_shift: float = 1.0,
+        torch_dtype: torch.dtype = torch.bfloat16,
+        linear_mode: str = "awq",
     ):
         """Copy single-stream normalization components and replace projection.
 
@@ -211,15 +246,17 @@ class NunchakuAdaLayerNormZeroSingle(nn.Module):
             other: Source Diffusers AdaLayerNormZeroSingle module.
             scale_shift: Additive offset applied to scale outputs.
             torch_dtype: Runtime dtype for AWQ modulation projection buffers.
+            linear_mode: Checkpoint format for the modulation projection.
 
         Returns:
             None.
         """
 
         super().__init__()
-        self.scale_shift = scale_shift
+        self.scale_shift = _flux_adanorm_scale_shift(linear_mode, scale_shift)
+        self._nunchaku_lite_adanorm_linear_mode = linear_mode
         self.silu = other.silu
-        self.linear = AWQW4A16Linear.from_linear(other.linear, torch_dtype=torch_dtype)
+        self.linear = _flux_adanorm_linear_from_linear(other.linear, mode=linear_mode, torch_dtype=torch_dtype)
         self.norm = other.norm
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -234,10 +271,13 @@ class NunchakuAdaLayerNormZeroSingle(nn.Module):
         """
 
         emb = self.linear(self.silu(emb))
-        emb = emb.view(emb.shape[0], -1, 3).permute(2, 0, 1)
-        shift_msa, scale_msa, gate_msa = emb
+        if self._nunchaku_lite_adanorm_linear_mode == "dense":
+            shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=1)
+        else:
+            emb = emb.view(emb.shape[0], -1, 3).permute(2, 0, 1)
+            shift_msa, scale_msa, gate_msa = emb
         if self.scale_shift != 0:
-            scale_msa.add_(self.scale_shift)
+            scale_msa = scale_msa + self.scale_shift
         norm_x = self.norm(x)
         norm_x = norm_x * scale_msa[:, None] + shift_msa[:, None]
         return norm_x, gate_msa
@@ -582,15 +622,23 @@ class NunchakuFluxTransformerBlock(nn.Module):
         context: SVDQPatchContext,
         *,
         scale_shift: float = 0.0,
+        norm1_linear_mode: str = "awq",
+        norm1_context_linear_mode: str = "awq",
         **kwargs,
     ) -> None:
         super().__init__()
         torch_dtype = context.torch_dtype if context is not None else kwargs.get("torch_dtype", torch.bfloat16)
-        self.norm1 = NunchakuAdaLayerNormZero(block.norm1, scale_shift=scale_shift, torch_dtype=torch_dtype)
+        self.norm1 = NunchakuAdaLayerNormZero(
+            block.norm1,
+            scale_shift=scale_shift,
+            torch_dtype=torch_dtype,
+            linear_mode=norm1_linear_mode,
+        )
         self.norm1_context = NunchakuAdaLayerNormZero(
             block.norm1_context,
             scale_shift=scale_shift,
             torch_dtype=torch_dtype,
+            linear_mode=norm1_context_linear_mode,
         )
         self.attn = NunchakuFluxAttention(block.attn, context=context, **kwargs)
         self.norm2 = block.norm2
@@ -653,6 +701,7 @@ class NunchakuFluxSingleTransformerBlock(nn.Module):
         context: SVDQPatchContext,
         *,
         scale_shift: float = 0.0,
+        norm_linear_mode: str = "awq",
         **kwargs,
     ) -> None:
         super().__init__()
@@ -660,7 +709,12 @@ class NunchakuFluxSingleTransformerBlock(nn.Module):
         proj_mlp = block.proj_mlp
         proj_out = block.proj_out
         self.mlp_hidden_dim = block.mlp_hidden_dim
-        self.norm = NunchakuAdaLayerNormZeroSingle(block.norm, scale_shift=scale_shift, torch_dtype=torch_dtype)
+        self.norm = NunchakuAdaLayerNormZeroSingle(
+            block.norm,
+            scale_shift=scale_shift,
+            torch_dtype=torch_dtype,
+            linear_mode=norm_linear_mode,
+        )
         self.mlp_fc1 = svdq_from_linear(proj_mlp, context, **kwargs)
         self.act_mlp = block.act_mlp
         self.mlp_fc2 = svdq_from_linear(proj_out, context, in_features=self.mlp_hidden_dim, **kwargs)
@@ -745,10 +799,9 @@ class FluxAdapter:
         prepare_transformer_dtype(transformer, context)
         axes_dim = tuple(getattr(transformer.pos_embed, "axes_dim", transformer.config.axes_dims_rope))
         transformer.pos_embed = NunchakuFluxPosEmbed(dim=transformer.inner_dim, theta=10000, axes_dim=axes_dim)
-        self._patch_transformer(transformer, context)
-
         if _flux_state_dict_needs_conversion(checkpoint_state):
             checkpoint_state = convert_flux_state_dict(checkpoint_state)
+        self._patch_transformer(transformer, context, checkpoint_state)
         finalize_svdq_checkpoint(transformer, checkpoint_state, context)
         transformer._nunchaku_lite_flux_patched = True
         from ..lora.core.runtime import bind_transformer_lora_methods
@@ -770,13 +823,20 @@ class FluxAdapter:
 
         bind_pipeline_lora_methods(pipeline, NunchakuPipelineLoraMixin)
 
-    def _patch_transformer(self, transformer: torch.nn.Module, context: SVDQPatchContext) -> None:
+    def _patch_transformer(
+        self,
+        transformer: torch.nn.Module,
+        context: SVDQPatchContext,
+        checkpoint_state: dict[str, torch.Tensor],
+    ) -> None:
         """Patch Flux block modules through the shared recursive traversal.
 
         Args:
             transformer: Flux transformer whose module tree should be patched.
             context: Shared SVDQ patch settings used by lite block
                 replacements.
+            checkpoint_state: Normalized checkpoint state dict used to select
+                AdaNorm projection formats.
 
         Returns:
             None.
@@ -791,12 +851,17 @@ class FluxAdapter:
                     block,
                     context=context,
                     scale_shift=0.0,
+                    norm1_linear_mode=_flux_adanorm_linear_mode(checkpoint_state, f"{_path}.norm1.linear"),
+                    norm1_context_linear_mode=_flux_adanorm_linear_mode(
+                        checkpoint_state, f"{_path}.norm1_context.linear"
+                    ),
                 ),
                 AdaLayerNormZero: lambda _path, norm: NunchakuAdaLayerNormZero(
                     norm,
                     scale_shift=0.0,
                     torch_dtype=torch_dtype,
                     return_scale_shift=-1.0,
+                    linear_mode=_flux_adanorm_linear_mode(checkpoint_state, f"{_path}.linear"),
                 ),
                 FluxAttention: lambda _path, attn: NunchakuFluxAttention(attn, context=context),
                 FeedForward: lambda _path, ff: _patch_flux_feed_forward(ff, context),
@@ -804,6 +869,7 @@ class FluxAdapter:
                     block,
                     context=context,
                     scale_shift=0.0,
+                    norm_linear_mode=_flux_adanorm_linear_mode(checkpoint_state, f"{_path}.norm.linear"),
                 ),
             },
         )
