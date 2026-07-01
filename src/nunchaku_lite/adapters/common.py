@@ -9,7 +9,7 @@ import torch.nn as nn
 from diffusers.models.attention import AttentionModuleMixin
 from diffusers.models.attention_processor import Attention
 
-from ..linear import SVDQW4A4Linear
+from ..linear import AWQW4A16Linear, DenseRuntimeLoraLinear, SVDQW4A4Linear
 from ..utils import convert_fp16, patch_scale_key
 
 PATCHED_MODULE_ATTR = "_nunchaku_lite_patched_module"
@@ -180,6 +180,152 @@ def svdq_from_linear(
     """
 
     return _mark_patched_module(SVDQW4A4Linear.from_linear(linear, **_linear_kwargs(context, kwargs)))
+
+
+LINEAR_REPLACEMENT_CLASSES = (DenseRuntimeLoraLinear, AWQW4A16Linear, SVDQW4A4Linear)
+
+
+def linear_class_from_checkpoint(
+    checkpoint_state: dict[str, torch.Tensor],
+    prefix: str,
+    default: type[nn.Module] | None = DenseRuntimeLoraLinear,
+    candidates: tuple[type[nn.Module], ...] = LINEAR_REPLACEMENT_CLASSES,
+) -> type[nn.Module]:
+    """Infer the replacement linear class from checkpoint tensors for one prefix.
+
+    Args:
+        checkpoint_state: Checkpoint tensors keyed by full module path.
+        prefix: Module prefix whose child tensor keys should be inspected.
+        default: Replacement class returned when no discriminating checkpoint
+            keys are present. Use ``None`` to require an explicit match.
+        candidates: Replacement classes to compare. Each class is instantiated on
+            ``meta`` through ``from_linear`` to derive its state-dict schema.
+
+    Returns:
+        The single candidate class identified by unique state-dict suffixes or
+        suffix/dtype pairs.
+
+    Raises:
+        ValueError: If multiple candidate schemas match, or if no schema matches
+            and ``default`` is ``None``.
+    """
+
+    signatures = {candidate: _linear_state_dict_signature(candidate) for candidate in candidates}
+    unique_discriminators, dtype_discriminators = _linear_signature_discriminators(signatures)
+    unique_matches = set()
+    dtype_matches = set()
+    for key, value in checkpoint_state.items():
+        if not key.startswith(f"{prefix}."):
+            continue
+        suffix = key[len(prefix) + 1 :]
+        unique_matches.update(unique_discriminators.get(suffix, ()))
+        dtype_matches.update(dtype_discriminators.get(suffix, {}).get(value.dtype, ()))
+
+    matches = unique_matches | dtype_matches
+    if len(matches) == 1:
+        return next(iter(matches))
+    if len(matches) > 1:
+        names = ", ".join(candidate.__name__ for candidate in matches)
+        raise ValueError(f"Ambiguous linear checkpoint format for {prefix!r}: {names}.")
+    if default is not None:
+        return default
+    raise ValueError(f"Could not infer linear checkpoint format for {prefix!r}.")
+
+
+def _linear_state_dict_signature(
+    linear_cls: type[nn.Module],
+) -> dict[str, torch.dtype]:
+    """Return the state-dict suffix and dtype schema for one replacement class.
+
+    Args:
+        linear_cls: Replacement class exposing ``from_linear``.
+
+    Returns:
+        Mapping from state-dict suffix, such as ``"qweight"``, to tensor dtype.
+    """
+
+    with torch.device("meta"):
+        linear = nn.Linear(128, 128, dtype=torch.bfloat16)
+    replacement = linear_cls.from_linear(
+        linear,
+        torch_dtype=torch.bfloat16,
+        device=torch.device("meta"),
+    )
+    return {key: tensor.dtype for key, tensor in replacement.state_dict().items()}
+
+
+def _linear_signature_discriminators(
+    signatures: dict[type[nn.Module], dict[str, torch.dtype]],
+) -> tuple[dict[str, tuple[type[nn.Module], ...]], dict[str, dict[torch.dtype, tuple[type[nn.Module], ...]]]]:
+    """Build unique suffix and suffix/dtype discriminators from class schemas.
+
+    Args:
+        signatures: Per-class state-dict suffix and dtype schemas.
+
+    Returns:
+        Pair of discriminator mappings. The first maps suffixes owned by exactly
+        one candidate class. The second maps shared, non-universal suffixes whose
+        dtype identifies exactly one candidate class.
+    """
+
+    suffix_classes: dict[str, list[tuple[type[nn.Module], torch.dtype]]] = {}
+    for linear_cls, signature in signatures.items():
+        for suffix, dtype in signature.items():
+            suffix_classes.setdefault(suffix, []).append((linear_cls, dtype))
+
+    unique_discriminators = {}
+    dtype_discriminators = {}
+    for suffix, classes in suffix_classes.items():
+        if len(classes) == 1:
+            linear_cls, dtype = classes[0]
+            del dtype
+            unique_discriminators[suffix] = (linear_cls,)
+            continue
+        if len(classes) == len(signatures):
+            continue
+
+        dtype_classes: dict[torch.dtype, list[type[nn.Module]]] = {}
+        for linear_cls, dtype in classes:
+            dtype_classes.setdefault(dtype, []).append(linear_cls)
+        unique_dtype_classes = {
+            dtype: tuple(linear_classes)
+            for dtype, linear_classes in dtype_classes.items()
+            if len(linear_classes) == 1
+        }
+        if unique_dtype_classes:
+            dtype_discriminators[suffix] = unique_dtype_classes
+    return unique_discriminators, dtype_discriminators
+
+
+def linear_from_class(
+    linear: nn.Linear,
+    linear_cls: type[nn.Module],
+    context: SVDQPatchContext | None = None,
+    *,
+    torch_dtype: torch.dtype | None = None,
+    **kwargs,
+) -> nn.Module:
+    """Create a linear replacement of ``linear_cls`` from a source ``nn.Linear``.
+
+    Args:
+        linear: Source dense linear whose shape, bias, device, and dtype metadata
+            are copied by the replacement class.
+        linear_cls: Replacement class to instantiate.
+        context: Optional SVDQ context used to supply precision, rank, and dtype
+            defaults for SVDQ replacements.
+        torch_dtype: Optional runtime dtype override for floating-point buffers.
+        **kwargs: Additional replacement constructor overrides.
+
+    Returns:
+        Replacement module marked as patched for recursive traversal.
+    """
+
+    linear_kwargs = _linear_kwargs(context, kwargs) if issubclass(linear_cls, SVDQW4A4Linear) else dict(kwargs)
+    if torch_dtype is not None:
+        linear_kwargs["torch_dtype"] = torch_dtype
+    elif context is not None:
+        linear_kwargs.setdefault("torch_dtype", context.torch_dtype)
+    return _mark_patched_module(linear_cls.from_linear(linear, **linear_kwargs))
 
 
 class NunchakuAttention(nn.Module, AttentionModuleMixin):

@@ -13,7 +13,7 @@ class DenseRuntimeLoraLinear(nn.Linear):
     """Dense linear layer with runtime LoRA branches managed by Nunchaku Lite."""
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear) -> "DenseRuntimeLoraLinear":
+    def from_linear(cls, linear: nn.Linear, **kwargs) -> "DenseRuntimeLoraLinear":
         """Wrap an existing dense linear while preserving its state-dict keys.
 
         Args:

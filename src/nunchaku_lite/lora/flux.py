@@ -10,7 +10,7 @@ from diffusers.utils.state_dict_utils import convert_unet_state_dict_to_peft
 from torch import nn
 
 from ..adapters.flux import convert_flux_state_dict
-from ..linear import AWQW4A16Linear, SVDQW4A4Linear
+from ..linear import AWQW4A16Linear, DenseRuntimeLoraLinear, SVDQW4A4Linear
 from .core.runtime import (
     NunchakuLoraMixin,
     load_lora_state_dict,
@@ -174,7 +174,7 @@ def set_flux_converted_lora_pair(
     target_name: str,
     down: torch.Tensor,
     up: torch.Tensor,
-    module: SVDQW4A4Linear | AWQW4A16Linear,
+    module: SVDQW4A4Linear | AWQW4A16Linear | DenseRuntimeLoraLinear,
 ) -> None:
     """Store a converted Flux LoRA pair with Flux-specific AWQ handling.
 
@@ -191,10 +191,15 @@ def set_flux_converted_lora_pair(
     if isinstance(module, SVDQW4A4Linear):
         down = pack_lowrank_weight(down, down=True)
         up = pack_lowrank_weight(up, down=False)
-    else:
+    elif isinstance(module, AWQW4A16Linear):
         up = reorder_flux_adanorm_lora_up(target_name, up)
         down = pad_lora_tensor(down, divisor=16, dim=0)
         up = pad_lora_tensor(up, divisor=16, dim=1)
+    elif isinstance(module, DenseRuntimeLoraLinear):
+        down = pad_lora_tensor(down, divisor=16, dim=0)
+        up = pad_lora_tensor(up, divisor=16, dim=1)
+    else:
+        raise TypeError(f"Unsupported Flux LoRA module type: {module.__class__.__name__}")
     converted[f"{target_name}.proj_down"] = down
     converted[f"{target_name}.proj_up"] = up
 
@@ -203,7 +208,7 @@ def flux_direct_lora_targets(
     base_name: str,
     lora_a: torch.Tensor,
     lora_b: torch.Tensor,
-    modules: dict[str, SVDQW4A4Linear | AWQW4A16Linear],
+    modules: dict[str, SVDQW4A4Linear | AWQW4A16Linear | DenseRuntimeLoraLinear],
 ) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
     """Map one normalized Flux PEFT LoRA pair to lite target module pairs.
 
