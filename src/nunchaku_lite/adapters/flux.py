@@ -25,6 +25,8 @@ from .common import (
     build_svdq_context,
     finalize_svdq_checkpoint,
     fuse_linears,
+    linear_class_from_checkpoint,
+    linear_from_class,
     pack_rotemb,
     pad_tensor,
     patch_modules_recursively,
@@ -133,29 +135,21 @@ def prepare_flux_rotary(
     return rotary_txt, rotary_img, rotary_single
 
 
-def _flux_adanorm_linear_mode(checkpoint_state: dict[str, torch.Tensor], prefix: str) -> str:
-    if f"{prefix}.weight" in checkpoint_state:
-        return "dense"
-    return "awq"
+def _flux_adanorm_scale_shift(linear_cls: type[nn.Module], scale_shift: float) -> float:
+    """Return the scale-shift offset required for one Flux AdaNorm layout.
 
+    Args:
+        linear_cls: Replacement class used for the AdaNorm modulation linear.
+        scale_shift: Requested scale-shift offset.
 
-def _flux_adanorm_scale_shift(mode: str, scale_shift: float) -> float:
-    if mode == "dense" and scale_shift == 0:
+    Returns:
+        Dense-layout offset for dense and SVDQ replacements, otherwise the
+        original offset for packed AWQ AdaNorm checkpoints.
+    """
+
+    if linear_cls in {DenseRuntimeLoraLinear, SVDQW4A4Linear} and scale_shift == 0:
         return 1.0
     return scale_shift
-
-
-def _flux_adanorm_linear_from_linear(
-    linear: nn.Linear,
-    *,
-    mode: str,
-    torch_dtype: torch.dtype,
-) -> nn.Module:
-    if mode == "dense":
-        return DenseRuntimeLoraLinear.from_linear(linear)
-    if mode == "awq":
-        return AWQW4A16Linear.from_linear(linear, torch_dtype=torch_dtype)
-    raise ValueError(f"Unsupported Flux AdaNorm linear mode: {mode}")
 
 
 class NunchakuAdaLayerNormZero(nn.Module):
@@ -167,7 +161,8 @@ class NunchakuAdaLayerNormZero(nn.Module):
         scale_shift: float = 1.0,
         torch_dtype: torch.dtype = torch.bfloat16,
         return_scale_shift: float = 0.0,
-        linear_mode: str = "awq",
+        linear_cls: type[nn.Module] = DenseRuntimeLoraLinear,
+        context: SVDQPatchContext | None = None,
     ):
         """Copy normalization components and replace the modulation projection.
 
@@ -175,19 +170,24 @@ class NunchakuAdaLayerNormZero(nn.Module):
             other: Source Diffusers AdaLayerNormZero module.
             scale_shift: Additive offset applied to scale outputs.
             torch_dtype: Runtime dtype for AWQ modulation projection buffers.
-            linear_mode: Checkpoint format for the modulation projection.
+            linear_cls: Replacement class for the modulation projection.
 
         Returns:
             None.
         """
 
         super().__init__()
-        self.scale_shift = _flux_adanorm_scale_shift(linear_mode, scale_shift)
+        self.scale_shift = _flux_adanorm_scale_shift(linear_cls, scale_shift)
         self.return_scale_shift = return_scale_shift
-        self._nunchaku_lite_adanorm_linear_mode = linear_mode
+        self._nunchaku_lite_adanorm_linear_cls = linear_cls
         self.emb = other.emb
         self.silu = other.silu
-        self.linear = _flux_adanorm_linear_from_linear(other.linear, mode=linear_mode, torch_dtype=torch_dtype)
+        self.linear = linear_from_class(
+            other.linear,
+            linear_cls,
+            torch_dtype=torch_dtype,
+            context=context,
+        )
         self.norm = other.norm
 
     def forward(
@@ -214,8 +214,12 @@ class NunchakuAdaLayerNormZero(nn.Module):
 
         if self.emb is not None:
             emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
-        emb = self.linear(self.silu(emb))
-        if self._nunchaku_lite_adanorm_linear_mode == "dense":
+        emb = self.silu(emb)
+        if self._nunchaku_lite_adanorm_linear_cls is SVDQW4A4Linear:
+            emb = self.linear(emb[:, None, :]).squeeze(1)
+        else:
+            emb = self.linear(emb)
+        if self._nunchaku_lite_adanorm_linear_cls in {DenseRuntimeLoraLinear, SVDQW4A4Linear}:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
         else:
             emb = emb.view(emb.shape[0], -1, 6).permute(2, 0, 1)
@@ -238,7 +242,8 @@ class NunchakuAdaLayerNormZeroSingle(nn.Module):
         other: AdaLayerNormZeroSingle,
         scale_shift: float = 1.0,
         torch_dtype: torch.dtype = torch.bfloat16,
-        linear_mode: str = "awq",
+        linear_cls: type[nn.Module] = DenseRuntimeLoraLinear,
+        context: SVDQPatchContext | None = None,
     ):
         """Copy single-stream normalization components and replace projection.
 
@@ -246,17 +251,22 @@ class NunchakuAdaLayerNormZeroSingle(nn.Module):
             other: Source Diffusers AdaLayerNormZeroSingle module.
             scale_shift: Additive offset applied to scale outputs.
             torch_dtype: Runtime dtype for AWQ modulation projection buffers.
-            linear_mode: Checkpoint format for the modulation projection.
+            linear_cls: Replacement class for the modulation projection.
 
         Returns:
             None.
         """
 
         super().__init__()
-        self.scale_shift = _flux_adanorm_scale_shift(linear_mode, scale_shift)
-        self._nunchaku_lite_adanorm_linear_mode = linear_mode
+        self.scale_shift = _flux_adanorm_scale_shift(linear_cls, scale_shift)
+        self._nunchaku_lite_adanorm_linear_cls = linear_cls
         self.silu = other.silu
-        self.linear = _flux_adanorm_linear_from_linear(other.linear, mode=linear_mode, torch_dtype=torch_dtype)
+        self.linear = linear_from_class(
+            other.linear,
+            linear_cls,
+            torch_dtype=torch_dtype,
+            context=context,
+        )
         self.norm = other.norm
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -270,8 +280,12 @@ class NunchakuAdaLayerNormZeroSingle(nn.Module):
             Tuple ``(norm_x, gate_msa)``.
         """
 
-        emb = self.linear(self.silu(emb))
-        if self._nunchaku_lite_adanorm_linear_mode == "dense":
+        emb = self.silu(emb)
+        if self._nunchaku_lite_adanorm_linear_cls is SVDQW4A4Linear:
+            emb = self.linear(emb[:, None, :]).squeeze(1)
+        else:
+            emb = self.linear(emb)
+        if self._nunchaku_lite_adanorm_linear_cls in {DenseRuntimeLoraLinear, SVDQW4A4Linear}:
             shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=1)
         else:
             emb = emb.view(emb.shape[0], -1, 3).permute(2, 0, 1)
@@ -622,8 +636,8 @@ class NunchakuFluxTransformerBlock(nn.Module):
         context: SVDQPatchContext,
         *,
         scale_shift: float = 0.0,
-        norm1_linear_mode: str = "awq",
-        norm1_context_linear_mode: str = "awq",
+        norm1_linear_cls: type[nn.Module] = DenseRuntimeLoraLinear,
+        norm1_context_linear_cls: type[nn.Module] = DenseRuntimeLoraLinear,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -632,13 +646,15 @@ class NunchakuFluxTransformerBlock(nn.Module):
             block.norm1,
             scale_shift=scale_shift,
             torch_dtype=torch_dtype,
-            linear_mode=norm1_linear_mode,
+            linear_cls=norm1_linear_cls,
+            context=context,
         )
         self.norm1_context = NunchakuAdaLayerNormZero(
             block.norm1_context,
             scale_shift=scale_shift,
             torch_dtype=torch_dtype,
-            linear_mode=norm1_context_linear_mode,
+            linear_cls=norm1_context_linear_cls,
+            context=context,
         )
         self.attn = NunchakuFluxAttention(block.attn, context=context, **kwargs)
         self.norm2 = block.norm2
@@ -701,7 +717,7 @@ class NunchakuFluxSingleTransformerBlock(nn.Module):
         context: SVDQPatchContext,
         *,
         scale_shift: float = 0.0,
-        norm_linear_mode: str = "awq",
+        norm_linear_cls: type[nn.Module] = DenseRuntimeLoraLinear,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -713,7 +729,8 @@ class NunchakuFluxSingleTransformerBlock(nn.Module):
             block.norm,
             scale_shift=scale_shift,
             torch_dtype=torch_dtype,
-            linear_mode=norm_linear_mode,
+            linear_cls=norm_linear_cls,
+            context=context,
         )
         self.mlp_fc1 = svdq_from_linear(proj_mlp, context, **kwargs)
         self.act_mlp = block.act_mlp
@@ -851,9 +868,10 @@ class FluxAdapter:
                     block,
                     context=context,
                     scale_shift=0.0,
-                    norm1_linear_mode=_flux_adanorm_linear_mode(checkpoint_state, f"{_path}.norm1.linear"),
-                    norm1_context_linear_mode=_flux_adanorm_linear_mode(
-                        checkpoint_state, f"{_path}.norm1_context.linear"
+                    norm1_linear_cls=linear_class_from_checkpoint(checkpoint_state, f"{_path}.norm1.linear"),
+                    norm1_context_linear_cls=linear_class_from_checkpoint(
+                        checkpoint_state,
+                        f"{_path}.norm1_context.linear",
                     ),
                 ),
                 AdaLayerNormZero: lambda _path, norm: NunchakuAdaLayerNormZero(
@@ -861,7 +879,8 @@ class FluxAdapter:
                     scale_shift=0.0,
                     torch_dtype=torch_dtype,
                     return_scale_shift=-1.0,
-                    linear_mode=_flux_adanorm_linear_mode(checkpoint_state, f"{_path}.linear"),
+                    linear_cls=linear_class_from_checkpoint(checkpoint_state, f"{_path}.linear"),
+                    context=context,
                 ),
                 FluxAttention: lambda _path, attn: NunchakuFluxAttention(attn, context=context),
                 FeedForward: lambda _path, ff: _patch_flux_feed_forward(ff, context),
@@ -869,7 +888,7 @@ class FluxAdapter:
                     block,
                     context=context,
                     scale_shift=0.0,
-                    norm_linear_mode=_flux_adanorm_linear_mode(checkpoint_state, f"{_path}.norm.linear"),
+                    norm_linear_cls=linear_class_from_checkpoint(checkpoint_state, f"{_path}.norm.linear"),
                 ),
             },
         )
