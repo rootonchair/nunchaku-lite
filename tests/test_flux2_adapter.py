@@ -112,6 +112,35 @@ def test_patch_transformer_patches_flux2_from_synthetic_checkpoint(tmp_path):
     assert hasattr(transformer, "_nunchaku_lite_flux2_original_forward")
 
 
+def test_patch_transformer_flux2_accepts_legacy_smooth_factor_orig_checkpoint(tmp_path):
+    rank = 4
+    source = make_tiny_flux2_transformer()
+    Flux2Adapter().patch(
+        source,
+        {},
+        {"rank": rank},
+        SimpleNamespace(
+            precision="int4",
+            torch_dtype=torch.bfloat16,
+            device=None,
+            strict=True,
+            adapter_options={},
+        ),
+    )
+    state = source.state_dict()
+    for key, value in list(state.items()):
+        if key.endswith(".smooth_factor"):
+            state[f"{key}_orig"] = value.clone()
+    checkpoint = tmp_path / "flux2-legacy-smooth-orig.safetensors"
+    save_file(state, checkpoint, metadata={"quantization_config": json.dumps({"rank": rank})})
+
+    transformer = make_tiny_flux2_transformer()
+    patch_transformer(transformer, checkpoint, target="flux2", precision="int4", torch_dtype=torch.bfloat16)
+
+    assert transformer._nunchaku_lite_patched
+    assert all("smooth_factor_orig" not in key for key in transformer.state_dict())
+
+
 def test_flux2_checkpoint_keys_match_nunchaku_module_names():
     transformer = make_tiny_flux2_transformer()
     Flux2Adapter().patch(
@@ -134,3 +163,4 @@ def test_flux2_checkpoint_keys_match_nunchaku_module_names():
     assert "single_transformer_blocks.0.attn.mlp_fc1.qweight" in keys
     assert "single_transformer_blocks.0.attn.out_proj.qweight" in keys
     assert "single_transformer_blocks.0.attn.mlp_fc2.qweight" in keys
+    assert all("smooth_factor_orig" not in key for key in keys)
