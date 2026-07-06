@@ -115,7 +115,6 @@ def normalize_native_lora_test_base(transformer):
                 module.qweight.zero_()
                 module.wscales.fill_(1)
                 module.smooth_factor.fill_(1)
-                module.smooth_factor_orig.fill_(1)
                 module.proj_down.zero_()
                 module.proj_up.zero_()
                 if module.bias is not None:

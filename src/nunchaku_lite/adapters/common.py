@@ -139,9 +139,18 @@ def finalize_svdq_checkpoint(
         None.
     """
 
+    drop_obsolete_svdq_tensors(checkpoint_state)
     patch_scale_key(transformer, checkpoint_state)
     if context.torch_dtype == torch.float16:
         convert_fp16(transformer, checkpoint_state)
+
+
+def drop_obsolete_svdq_tensors(checkpoint_state: dict[str, torch.Tensor]) -> None:
+    """Drop SVDQ tensors retained only for legacy checkpoint compatibility."""
+
+    for key in list(checkpoint_state):
+        if key.endswith(".smooth_factor_orig"):
+            checkpoint_state.pop(key)
 
 
 def _linear_kwargs(context: SVDQPatchContext | None, explicit_kwargs: dict) -> dict:

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from torch import nn
 
 from nunchaku_lite import patch_transformer
@@ -175,6 +175,33 @@ def test_patch_transformer_manifest_target_replaces_svdq_linear(tmp_path):
     assert transformer.proj.rank == 4
     assert transformer.proj.precision == "int4"
     assert getattr(transformer.proj, PATCHED_MODULE_ATTR)
+
+
+def test_patch_transformer_manifest_accepts_legacy_smooth_factor_orig_checkpoint(tmp_path):
+    manifest = _manifest()
+    checkpoint = _write_manifest_checkpoint(tmp_path, TinyManifestModel(), manifest)
+
+    checkpoint_state = load_file(checkpoint)
+    checkpoint_state["proj.smooth_factor_orig"] = checkpoint_state["proj.smooth_factor"].clone()
+    legacy_checkpoint = tmp_path / "manifest-legacy-smooth-orig.safetensors"
+    save_file(
+        checkpoint_state,
+        legacy_checkpoint,
+        metadata={"quantization_config": json.dumps(_quantization_config(manifest))},
+    )
+
+    transformer = TinyManifestModel()
+    patch_transformer(
+        transformer,
+        legacy_checkpoint,
+        target="manifest",
+        precision="int4",
+        torch_dtype=torch.bfloat16,
+        device="cpu",
+    )
+
+    assert isinstance(transformer.proj, SVDQW4A4Linear)
+    assert all("smooth_factor_orig" not in key for key in transformer.state_dict())
 
 
 def test_patch_transformer_auto_uses_manifest_before_matching_adapter(tmp_path, monkeypatch):
