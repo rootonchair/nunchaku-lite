@@ -61,7 +61,7 @@ def replace_flux_adanorm_dense_with_awq(state):
     )
 
     for prefix in prefixes:
-        for suffix in ("weight", "proj_down", "proj_up", "smooth_factor"):
+        for suffix in ("weight", "proj_down", "proj_up", "smooth_factor", "smooth_factor_orig"):
             state.pop(f"{prefix}.{suffix}", None)
         linear = dense.get_submodule(prefix)
         awq = AWQW4A16Linear.from_linear(linear, torch_dtype=torch.bfloat16)
