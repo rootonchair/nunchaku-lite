@@ -149,7 +149,11 @@ std::vector<torch::Tensor> dispatch_fused_cross_head_qk_norm_rope(torch::Tensor 
 
 } // namespace
 
+#if defined(CUDA_KERNEL) || defined(ROCM_KERNEL)
+TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+#else
 TORCH_LIBRARY(nunchaku_lite_kernels, ops) {
+#endif
     ops.def("gemm_w4a4(Tensor? act, Tensor? wgt, Tensor(a!)? out, Tensor(b!)? qout, "
             "Tensor? ascales, Tensor? wscales, Tensor(c!)? oscales, Tensor(d!)? "
             "poolout, Tensor? lora_act_in, Tensor? lora_up, Tensor? lora_down, "
