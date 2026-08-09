@@ -102,8 +102,11 @@ Arguments:
 - `transformer`: the Diffusers transformer or UNet module to patch.
 - `checkpoint`: local or Hugging Face `.safetensors` checkpoint path.
 - `target`: adapter name, or `"auto"` to select the only matching adapter.
-- `precision`: `"auto"`, `"fp4"`, or `"int4"`. Internally, `"fp4"` maps to
-  NVFP4 kernels.
+- `precision`: `"auto"`, `"fp4"`, `"int4"`, or `"int8"`. Internally, `"fp4"`
+  maps to NVFP4 kernels. `"int8"` selects the W8A8 (int8 weight, int8
+  activation) kernel path and is opt-in only -- `"auto"` never selects it.
+  Not all adapters accept `"int8"` yet; see
+  [roadmap.md](roadmap.md) for current coverage.
 - `torch_dtype`: optional model dtype, typically `torch.bfloat16` or
   `torch.float16`.
 - `device`: optional destination device after patching.

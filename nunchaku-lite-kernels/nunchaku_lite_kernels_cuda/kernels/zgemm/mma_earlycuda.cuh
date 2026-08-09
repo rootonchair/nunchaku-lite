@@ -27,6 +27,9 @@ struct s4 {
 struct u4 {
     static constexpr const char value[] = "u4";
 };
+struct s8 {
+    static constexpr const char value[] = "s8";
+};
 
 template<bool is_bf16>
 using f16bf16 = std::conditional_t<is_bf16, bf16, f16>;
@@ -203,6 +206,60 @@ __device__ __forceinline__ uint4 mma_m16n8kx_s32common<mma_helper::u4, mma_helpe
                  "{%9},"
                  "{tmp0, tmp1};\n"
                  "mma.sync.aligned.m8n8k%14.row.col.s32.u4.s4.s32 "
+                 "{%2,  %3},"
+                 "{%7},"
+                 "{%9},"
+                 "{tmp2, tmp3};\n"
+                 "}\n"
+                 : "=r"(d.x), "=r"(d.y), "=r"(d.z), "=r"(d.w)
+                 : "r"(a.x),
+                   "r"(a.y),
+                   "r"(a.z),
+                   "r"(a.w),
+                   "r"(b.x),
+                   "r"(b.y),
+                   "r"(c.x),
+                   "r"(c.y),
+                   "r"(c.z),
+                   "r"(c.w),
+                   "n"(K / 2));
+#endif
+    return d;
+}
+
+template<>
+__device__ __forceinline__ uint4 mma_m16n8kx_s32common<mma_helper::s8, mma_helper::s8>(uint4 a, uint2 b, uint4 c) {
+    uint4 d;
+    static constexpr int K = 32;
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k%14.row.col.s32.s8.s8.s32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5,  %6,  %7},"
+        "{%8,  %9},"
+        "{%10,  %11,  %12,  %13};\n"
+        : "=r"(d.x), "=r"(d.y), "=r"(d.z), "=r"(d.w)
+        : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b.x), "r"(b.y), "r"(c.x), "r"(c.y), "r"(c.z), "r"(c.w), "n"(K));
+#else
+    asm volatile("{"
+                 ".reg .b32 tmp0, tmp1, tmp2, tmp3;"
+                 "mma.sync.aligned.m8n8k%14.row.col.s32.s8.s8.s32 "
+                 "{tmp0, tmp1},"
+                 "{%4},"
+                 "{%8},"
+                 "{%10,  %11};\n"
+                 "mma.sync.aligned.m8n8k%14.row.col.s32.s8.s8.s32 "
+                 "{tmp2, tmp3},"
+                 "{%5},"
+                 "{%8},"
+                 "{%12,  %13};\n"
+                 "mma.sync.aligned.m8n8k%14.row.col.s32.s8.s8.s32 "
+                 "{%0,  %1},"
+                 "{%6},"
+                 "{%9},"
+                 "{tmp0, tmp1};\n"
+                 "mma.sync.aligned.m8n8k%14.row.col.s32.s8.s8.s32 "
                  "{%2,  %3},"
                  "{%7},"
                  "{%9},"

@@ -64,7 +64,8 @@ inline void gemm_w4a4(std::optional<torch::Tensor> act,
                       std::optional<torch::Tensor> out_q,
                       std::optional<torch::Tensor> out_k,
                       std::optional<torch::Tensor> out_v,
-                      int attn_tokens) {
+                      int attn_tokens,
+                      bool w8a8) {
     TorchOpContext ctx;
     nunchaku::kernels::gemm_w4a4(as_tensor(act),
                                  as_tensor(wgt),
@@ -94,7 +95,8 @@ inline void gemm_w4a4(std::optional<torch::Tensor> act,
                                  as_tensor(out_q),
                                  as_tensor(out_k),
                                  as_tensor(out_v),
-                                 attn_tokens);
+                                 attn_tokens,
+                                 w8a8);
 }
 
 inline void quantize_w4a4_act_fuse_lora(std::optional<torch::Tensor> input,
@@ -104,7 +106,8 @@ inline void quantize_w4a4_act_fuse_lora(std::optional<torch::Tensor> input,
                                         std::optional<torch::Tensor> lora_act_out,
                                         std::optional<torch::Tensor> smooth,
                                         bool fuse_glu,
-                                        bool fp4) {
+                                        bool fp4,
+                                        bool w8a8) {
     TorchOpContext ctx;
     nunchaku::kernels::quantize_w4a4_act_fuse_lora(as_tensor(input),
                                                    as_tensor(output),
@@ -113,7 +116,8 @@ inline void quantize_w4a4_act_fuse_lora(std::optional<torch::Tensor> input,
                                                    as_tensor(lora_act_out),
                                                    as_tensor(smooth),
                                                    fuse_glu,
-                                                   fp4);
+                                                   fp4,
+                                                   w8a8);
 }
 
 inline torch::Tensor gemv_awq(torch::Tensor in_feats,

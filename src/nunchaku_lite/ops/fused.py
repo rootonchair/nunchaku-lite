@@ -28,10 +28,15 @@ def fused_gelu_mlp(x: torch.Tensor, fc1: SVDQW4A4Linear, fc2: SVDQW4A4Linear, pa
     quantized_x, ascales, lora_act = fc1.quantize(x)
 
     batch_size_pad = ceil_divide(batch_size * seq_len, pad_size) * pad_size
-    qout_act = torch.empty(batch_size_pad, fc1.out_features // 2, dtype=torch.uint8, device=x.device)
-    if fc2.precision == "nvfp4":
+    w8a8 = fc1.precision == "int8"
+    if w8a8:
+        qout_act = torch.empty(batch_size_pad, fc1.out_features, dtype=torch.uint8, device=x.device)
+        qout_ascales = torch.empty(fc1.out_features // 32, batch_size_pad, dtype=x.dtype, device=x.device)
+    elif fc2.precision == "nvfp4":
+        qout_act = torch.empty(batch_size_pad, fc1.out_features // 2, dtype=torch.uint8, device=x.device)
         qout_ascales = torch.empty(fc1.out_features // 16, batch_size_pad, dtype=torch.float8_e4m3fn, device=x.device)
     else:
+        qout_act = torch.empty(batch_size_pad, fc1.out_features // 2, dtype=torch.uint8, device=x.device)
         qout_ascales = torch.empty(fc1.out_features // 64, batch_size_pad, dtype=x.dtype, device=x.device)
     qout_lora_act = torch.empty(batch_size_pad, fc2.proj_down.shape[1], dtype=torch.float32, device=x.device)
 
@@ -51,6 +56,7 @@ def fused_gelu_mlp(x: torch.Tensor, fc1: SVDQW4A4Linear, fc2: SVDQW4A4Linear, pa
         fp4=fc1.precision == "nvfp4",
         alpha=fc1.wtscale,
         wcscales=fc1.wcscales,
+        w8a8=w8a8,
     )
     output = torch.empty(batch_size * seq_len, fc2.out_features, dtype=x.dtype, device=x.device)
     output = fc2.forward_quant(qout_act, qout_ascales, qout_lora_act, output=output)
@@ -84,6 +90,12 @@ def fused_qkv_norm_rotary(
         Dense fused QKV tensor when ``output`` is not a tuple, otherwise the
         populated ``(query, key, value)`` tuple.
     """
+
+    if proj.precision == "int8":
+        raise NotImplementedError(
+            "fused_qkv_norm_rotary does not support precision='int8' yet; "
+            "the W8A8 kernel does not implement the fused rotary/QKV-pack epilogue."
+        )
 
     batch_size, seq_len, channels = x.shape
     x = x.view(batch_size * seq_len, channels)

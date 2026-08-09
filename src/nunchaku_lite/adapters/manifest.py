@@ -298,7 +298,12 @@ def _mark_manifest_replacement(module: nn.Module) -> nn.Module:
 
 
 def _validate_svdq_group_size(target: RuntimeManifestTarget) -> None:
-    expected = 16 if target.precision == "fp4" else 64
+    if target.precision == "fp4":
+        expected = 16
+    elif target.precision == "int8":
+        expected = 32
+    else:
+        expected = 64
     if target.group_size != expected:
         raise ValueError(
             f"svdq_w4a4 target {target.checkpoint_prefix!r} precision={target.precision!r} "

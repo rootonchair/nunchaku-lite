@@ -1,7 +1,19 @@
 #include "zgemm.h"
 #include "gemm_w4a4_launch.cuh"
+#include "gemm_w8a8_launch.cuh"
 
 namespace nunchaku::kernels {
+
+template<typename F>
+static void invoke_launch_w8a8(Tensor::ScalarType dtype, F &&launch) {
+    if (dtype == Tensor::FP16) {
+        launch.template operator()<GEMMConfig_W8A8_FP16>();
+    } else if (dtype == Tensor::BF16) {
+        launch.template operator()<GEMMConfig_W8A8_BF16>();
+    } else {
+        assert(false);
+    }
+}
 
 // for sm_75 only
 struct FasterI2FMode {
@@ -59,7 +71,34 @@ void gemm_w4a4(Tensor act,            // packed act [M, K / 2]
                Tensor out_q, // packed attention [B, H, M, D]
                Tensor out_k, // packed attention [B, H, M, D]
                Tensor out_v, // packed attention [B, H, M, D]
-               int attn_tokens) {
+               int attn_tokens,
+               bool w8a8) {
+    if (w8a8) {
+        assert(!act_unsigned);
+        assert(!norm_q.valid() && !norm_k.valid() && !rotary_emb.valid());
+        assert(!out_vk.valid() && !out_linearattn.valid());
+        assert(!out_q.valid() && !out_k.valid() && !out_v.valid());
+        invoke_launch_w8a8(ascales.dtype(), [&]<typename Config>() {
+            GEMM_W8A8_Launch<Config>::gemm_w8a8(act,
+                                                wgt,
+                                                out,
+                                                qout,
+                                                ascales,
+                                                wscales,
+                                                oscales,
+                                                lora_act_in,
+                                                lora_up,
+                                                lora_down,
+                                                lora_act_out,
+                                                bias,
+                                                smooth_factor,
+                                                wcscales,
+                                                lora_scales,
+                                                fuse_silu);
+        });
+        return;
+    }
+
     Tensor::ScalarType dtype = Tensor::INVALID_SCALAR_TYPE;
     if (!fp4) {
         dtype = ascales.dtype();
@@ -117,7 +156,15 @@ void quantize_w4a4_act_fuse_lora(Tensor input,
                                  Tensor lora_act_out,
                                  Tensor smooth,
                                  bool fuse_glu,
-                                 bool fp4) {
+                                 bool fp4,
+                                 bool w8a8) {
+    if (w8a8) {
+        invoke_launch_w8a8(input.dtype(), [&]<typename Config>() {
+            GEMM_W8A8_Launch<Config>::quantize_w8a8_act_fuse_lora(
+                input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu);
+        });
+        return;
+    }
     invoke_launch(input.dtype(), fp4, false, [&]<typename Config, bool USE_FP4>() {
         GEMM_W4A4_Launch<Config, USE_FP4>::quantize_w4a4_act_fuse_lora(
             input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4);

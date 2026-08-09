@@ -621,7 +621,7 @@ def _validate_quantization_compatibility(
     device_index = 0 if target_device.index is None else target_device.index
     capability = torch.cuda.get_device_capability(device_index)
     sm = capability[0] * 10 + capability[1]
-    if sm >= 100 and checkpoint_precision != "nvfp4":
+    if sm >= 100 and checkpoint_precision == "int4":
         warnings.warn(
             "INT4 quantization on Blackwell GPUs may be slower than FP4. "
             "Use an FP4 checkpoint for best performance when one is available.",
@@ -629,8 +629,10 @@ def _validate_quantization_compatibility(
             stacklevel=3,
         )
         return
-    if sm in {75, 80, 86, 89} and checkpoint_precision != "int4":
-        raise ValueError('Please use "int4" quantization for Turing, Ampere, and Ada GPUs.')
+    if sm >= 100:
+        return
+    if sm in {75, 80, 86, 89} and checkpoint_precision not in ("int4", "int8"):
+        raise ValueError('Please use "int4" or "int8" quantization for Turing, Ampere, and Ada GPUs.')
     if sm not in {75, 80, 86, 89} and sm < 100:
         raise ValueError(
             f"Unsupported GPU architecture sm{sm}; Nunchaku Lite requires Turing, Ampere, Ada, or Blackwell."

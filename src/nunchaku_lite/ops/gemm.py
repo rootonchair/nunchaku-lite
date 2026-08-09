@@ -37,6 +37,7 @@ def svdq_gemm_w4a4_cuda(
     out_k: torch.Tensor | None = None,
     out_v: torch.Tensor | None = None,
     attn_tokens: int = 0,
+    w8a8: bool = False,
 ) -> None:
     """Run the native SVDQ W4A4 GEMM with optional fused output paths.
 
@@ -71,6 +72,7 @@ def svdq_gemm_w4a4_cuda(
         out_v: Optional preallocated V output for attention paths.
         attn_tokens: Number of unpadded attention tokens when using Q/K/V
             outputs.
+        w8a8: Whether to use the int8 weight / int8 activation kernel path.
 
     Returns:
         None.
@@ -116,6 +118,7 @@ def svdq_gemm_w4a4_cuda(
         out_k,
         out_v,
         attn_tokens,
+        w8a8,
     )
 
 

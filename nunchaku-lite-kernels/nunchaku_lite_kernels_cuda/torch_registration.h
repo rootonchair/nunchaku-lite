@@ -48,7 +48,8 @@ void dispatch_gemm_w4a4(OptionalTensor act,
                         OptionalTensor out_q,
                         OptionalTensor out_k,
                         OptionalTensor out_v,
-                        int64_t attn_tokens) {
+                        int64_t attn_tokens,
+                        bool w8a8) {
     nunchaku_lite::ops::gemm_w4a4(act,
                                   wgt,
                                   out,
@@ -77,7 +78,8 @@ void dispatch_gemm_w4a4(OptionalTensor act,
                                   out_q,
                                   out_k,
                                   out_v,
-                                  static_cast<int>(attn_tokens));
+                                  static_cast<int>(attn_tokens),
+                                  w8a8);
 }
 
 void dispatch_quantize_w4a4_act_fuse_lora(OptionalTensor input,
@@ -87,9 +89,10 @@ void dispatch_quantize_w4a4_act_fuse_lora(OptionalTensor input,
                                           OptionalTensor lora_act_out,
                                           OptionalTensor smooth,
                                           bool fuse_glu,
-                                          bool fp4) {
+                                          bool fp4,
+                                          bool w8a8) {
     nunchaku_lite::ops::quantize_w4a4_act_fuse_lora(
-        input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4);
+        input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4, w8a8);
 }
 
 torch::Tensor dispatch_fused_rms_norm_modulate(torch::Tensor x,
@@ -161,10 +164,11 @@ TORCH_LIBRARY(nunchaku_lite_kernels, ops) {
             "rotary_emb, Tensor? bias, Tensor? smooth_factor, Tensor(f!)? out_vk, "
             "Tensor(g!)? out_linearattn, bool act_unsigned, float[] lora_scales, "
             "bool fuse_silu, bool fp4, Tensor? alpha, Tensor? wcscales, Tensor(h!)? "
-            "out_q, Tensor(i!)? out_k, Tensor(j!)? out_v, int attn_tokens) -> ()");
+            "out_q, Tensor(i!)? out_k, Tensor(j!)? out_v, int attn_tokens, "
+            "bool w8a8) -> ()");
     ops.def("quantize_w4a4_act_fuse_lora(Tensor? input, Tensor(a!)? output, "
             "Tensor(b!)? oscales, Tensor? lora_down, Tensor(c!)? lora_act_out, "
-            "Tensor? smooth, bool fuse_glu, bool fp4) -> ()");
+            "Tensor? smooth, bool fuse_glu, bool fp4, bool w8a8) -> ()");
     ops.def("fused_rms_norm_modulate(Tensor x, Tensor? norm_weight, Tensor scale, "
             "Tensor shift, float eps) -> Tensor");
     ops.def("fused_affine_modulate(Tensor x, Tensor scale, Tensor shift) -> Tensor");

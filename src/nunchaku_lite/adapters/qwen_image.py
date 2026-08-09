@@ -106,7 +106,7 @@ class NunchakuQwenFeedForward(FeedForward):
         linear_kwargs.update(kwargs)
         self.net = _patch_linear(ff.net, SVDQW4A4Linear, **linear_kwargs)
         if len(self.net) > 2 and isinstance(self.net[2], SVDQW4A4Linear):
-            self.net[2].act_unsigned = self.net[2].precision != "nvfp4"
+            self.net[2].act_unsigned = self.net[2].precision not in ("nvfp4", "int8")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run the quantized feed-forward block.

@@ -52,6 +52,7 @@ using GEMMConfig_W4A4_FP16           = GEMMConfig_W4A4<false>;
 using GEMMConfig_W4A4_BF16           = GEMMConfig_W4A4<true>;
 using GEMMConfig_W4A4_FP16_FasterI2F = GEMMConfig_W4A4<false, true>;
 
+template<bool bf16>
 class GEMMConfig_W8A8 {
 public:
     static constexpr int BLOCK_M   = 256;
@@ -63,14 +64,12 @@ public:
     static constexpr int INSN_N = 16;
     static constexpr int INSN_K = 32;
 
-#if 0
-    using half_t  = half;
-    using half2_t = half2;
-#else
-    using half_t  = __nv_bfloat16;
-    using half2_t = __nv_bfloat162;
-#endif
+    using half_t  = typename std::conditional_t<bf16, __nv_bfloat16, half>;
+    using half2_t = typename std::conditional_t<bf16, __nv_bfloat162, half2>;
 };
+
+using GEMMConfig_W8A8_FP16 = GEMMConfig_W8A8<false>;
+using GEMMConfig_W8A8_BF16 = GEMMConfig_W8A8<true>;
 
 template<class Config>
 class GEMMBase : public Config {

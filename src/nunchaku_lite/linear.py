@@ -80,8 +80,8 @@ class SVDQW4A4Linear(nn.Module):
             out_features: Output feature dimension.
             rank: Low-rank correction rank.
             bias: Whether to allocate a bias parameter.
-            precision: Native weight precision, either ``"int4"`` or
-                ``"nvfp4"``.
+            precision: Native weight precision, one of ``"int4"``,
+                ``"nvfp4"``, or ``"int8"``.
             act_unsigned: Whether the activation quantization path should use
                 unsigned activations.
             torch_dtype: Runtime dtype for floating-point buffers.
@@ -107,11 +107,14 @@ class SVDQW4A4Linear(nn.Module):
             self.group_size = 16
         elif precision == "int4":
             self.group_size = 64
+        elif precision == "int8":
+            self.group_size = 32
         else:
             raise ValueError(f"Invalid precision: {precision}")
 
+        qweight_in_features = in_features if precision == "int8" else in_features // 2
         self.qweight = nn.Parameter(
-            torch.empty(out_features, in_features // 2, dtype=torch.int8, device=device), requires_grad=False
+            torch.empty(out_features, qweight_in_features, dtype=torch.int8, device=device), requires_grad=False
         )
         self.bias = (
             nn.Parameter(torch.empty(out_features, dtype=torch_dtype, device=device), requires_grad=True)
@@ -122,7 +125,7 @@ class SVDQW4A4Linear(nn.Module):
             torch.empty(
                 in_features // self.group_size,
                 out_features,
-                dtype=torch_dtype if precision == "int4" else torch.float8_e4m3fn,
+                dtype=torch_dtype if precision in ("int4", "int8") else torch.float8_e4m3fn,
                 device=device,
             ),
             requires_grad=False,
@@ -187,6 +190,7 @@ class SVDQW4A4Linear(nn.Module):
             lora_down=self.proj_down,
             smooth=self.smooth_factor,
             fp4=self.precision == "nvfp4",
+            w8a8=self.precision == "int8",
             pad_size=pad_size,
         )
 
@@ -227,6 +231,7 @@ class SVDQW4A4Linear(nn.Module):
             alpha=self.wtscale,
             wcscales=self.wcscales,
             act_unsigned=self.act_unsigned,
+            w8a8=self.precision == "int8",
         )
         return output
 

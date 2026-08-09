@@ -123,6 +123,8 @@ if __name__ == "__main__":
             "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_fp16_fp4.cu",
             "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_bf16_int4.cu",
             "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_bf16_fp4.cu",
+            "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w8a8_launch_fp16.cu",
+            "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w8a8_launch_bf16.cu",
             "nunchaku_lite_kernels_cuda/kernels/zgemm/attention.cu",
             "nunchaku_lite_kernels_cuda/kernels/awq/gemm_awq.cu",
             "nunchaku_lite_kernels_cuda/kernels/awq/gemv_awq.cu",

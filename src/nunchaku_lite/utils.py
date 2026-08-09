@@ -132,8 +132,8 @@ def get_precision(
         ValueError: If ``precision`` is not one of the supported values.
     """
 
-    if precision not in ("auto", "int4", "fp4"):
-        raise ValueError("precision must be one of 'auto', 'int4', or 'fp4'")
+    if precision not in ("auto", "int4", "fp4", "int8"):
+        raise ValueError("precision must be one of 'auto', 'int4', 'fp4', or 'int8'")
     if precision != "auto":
         return precision
 

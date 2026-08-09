@@ -33,7 +33,8 @@ void gemm_w4a4(Tensor act,            // packed act [M, K / 2]
                Tensor out_q, // packed attention [B, H, M, D]
                Tensor out_k, // packed attention [B, H, M, D]
                Tensor out_v, // packed attention [B, H, M, D]
-               int attn_tokens);
+               int attn_tokens,
+               bool w8a8 = false);
 void quantize_w4a4_act_fuse_lora(Tensor input,
                                  Tensor output,
                                  Tensor oscales,
@@ -41,7 +42,8 @@ void quantize_w4a4_act_fuse_lora(Tensor input,
                                  Tensor lora_act_out,
                                  Tensor smooth = {},
                                  bool fuse_glu = false,
-                                 bool fp4      = false);
+                                 bool fp4      = false,
+                                 bool w8a8     = false);
 void quantize_w4a4_act(Tensor input, Tensor output, Tensor oscales);
 void quantize_w4a4_wgt(Tensor input, Tensor output, Tensor oscales);
 

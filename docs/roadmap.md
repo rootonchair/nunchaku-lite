@@ -95,6 +95,17 @@ handwritten adapters use:
   dispatch to GEMM instead of chunked GEMV for larger batches.
 - [x] Bind model-family runtime APIs, such as LoRA loading and adapter
   management, when a manifest target corresponds to an existing family adapter.
+- [x] Add a native W8A8 (int8 weight, int8 activation) GEMM kernel as a
+  `precision="int8"` option on `SVDQW4A4Linear`, targeting broader
+  hardware/compatibility coverage (Turing through Blackwell) alongside the
+  existing INT4/NVFP4 paths. Covers the core linear/MLP path
+  (`quantize`/`forward_quant`, bias, up/down LoRA, SiLU, and the fused
+  GELU-MLP chained-quantize path). Does not yet cover the fused
+  QKV/rotary-embedding-pack epilogue (`fused_qkv_norm_rotary` raises
+  `NotImplementedError` for `precision="int8"`) or an offline W8A8
+  weight-quantization/calibration tool -- W8A8 checkpoints must be produced
+  by an external toolchain using the same per-32-group symmetric int8 packing
+  as the INT4 path's 64-group packing.
 
 ## Notes
 
