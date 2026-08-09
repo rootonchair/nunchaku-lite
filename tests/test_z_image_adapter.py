@@ -3,13 +3,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import save_file
-from torch import nn
-
 from diffusers.models.attention import FeedForward
 from diffusers.models.attention_processor import Attention
 from diffusers.models.transformers.transformer_z_image import FeedForward as DiffusersZImageFeedForward
 from diffusers.models.transformers.transformer_z_image import ZImageTransformer2DModel
+from safetensors.torch import save_file
+from torch import nn
+
 from nunchaku_lite import patch_transformer
 from nunchaku_lite.adapters.common import NunchakuAttention, patch_attention_module, patch_modules_recursively
 from nunchaku_lite.adapters.z_image import ZImageAdapter

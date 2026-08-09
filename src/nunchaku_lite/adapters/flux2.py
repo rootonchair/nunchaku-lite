@@ -5,7 +5,6 @@ import types
 from typing import Any
 
 import torch
-import torch.nn as nn
 from diffusers.models.attention import AttentionModuleMixin
 from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.embeddings import apply_rotary_emb
@@ -15,6 +14,7 @@ from diffusers.models.transformers.transformer_flux2 import (
     Flux2FeedForward,
     Flux2ParallelSelfAttention,
 )
+from torch import nn
 
 from ..core import PatchOptions, register_adapter
 from ..ops.fused import fused_qkv_norm_rotary

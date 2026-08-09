@@ -19,7 +19,6 @@ from .layout import (
     svdq_up_to_logical,
 )
 
-
 LORA_ERROR_LABEL = "Nunchaku LoRA"
 
 

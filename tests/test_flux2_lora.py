@@ -4,14 +4,13 @@ from types import MethodType, SimpleNamespace
 import pytest
 import torch
 from safetensors.torch import save_file
+from test_flux2_adapter import make_tiny_flux2_transformer
 
 from nunchaku_lite import patch_transformer
 from nunchaku_lite.adapters.flux2 import Flux2Adapter
 from nunchaku_lite.lora.core.layout import unpack_lowrank_weight
 from nunchaku_lite.lora.core.runtime import NunchakuPipelineLoraMixin, bind_pipeline_lora_methods
 from nunchaku_lite.lora.flux2 import normalize_flux2_comfyui_lora_keys
-
-from test_flux2_adapter import make_tiny_flux2_transformer
 
 
 def make_patched_flux2_transformer(tmp_path, rank: int = 4):

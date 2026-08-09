@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import torch
-
 from utils import (
     add_single_step_latency,
     cleanup,
@@ -15,7 +14,6 @@ from utils import (
     timed_cuda_call,
     write_comparison_plot,
 )
-
 
 DEFAULT_MODEL_ID = "tonera/FLUX.2-klein-9B-Nunchaku"
 DEFAULT_CHECKPOINT = "tonera/FLUX.2-klein-9B-Nunchaku/svdq-fp4_r32-FLUX.2-klein-9B-Nunchaku.safetensors"

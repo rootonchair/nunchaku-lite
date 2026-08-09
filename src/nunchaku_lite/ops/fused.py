@@ -273,7 +273,7 @@ def _cached_cross_head_rope_contiguous(x: torch.Tensor, device: torch.device) ->
     try:
         if cache is None:
             cache = {}
-            setattr(x, "_nunchaku_lite_cross_head_rope_contiguous_cache", cache)
+            x._nunchaku_lite_cross_head_rope_contiguous_cache = cache
         cache[cache_key] = cached
     except Exception:
         pass

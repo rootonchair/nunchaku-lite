@@ -7,10 +7,6 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from .core.runtime import (
-    NunchakuLoraMixin,
-    load_lora_state_dict,
-)
 from .core.convert import (
     LORA_ERROR_LABEL,
     QKV_PROJECTION_SPECS,
@@ -22,6 +18,7 @@ from .core.convert import (
     strip_transformer_prefix,
     validate_nunchaku_lora_state_dict,
 )
+from .core.layout import lora_modules
 from .core.peft import (
     LORA_A_SUFFIX,
     LORA_B_SUFFIX,
@@ -30,7 +27,10 @@ from .core.peft import (
     normalize_float_tensor,
     peft_lora_pairs,
 )
-from .core.layout import lora_modules
+from .core.runtime import (
+    NunchakuLoraMixin,
+    load_lora_state_dict,
+)
 
 
 class NunchakuQwenImageLoraMixin(NunchakuLoraMixin):

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from ..core import PatchOptions, register_adapter
 from ..linear import AWQW4A16Linear, SVDQW4A4Linear
@@ -78,7 +78,7 @@ class SplitLinearInput(nn.Module):
         self.out_features = self.linears[0].out_features
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear, splits: list[int]) -> "SplitLinearInput":
+    def from_linear(cls, linear: nn.Linear, splits: list[int]) -> SplitLinearInput:
         splits = _complete_splits(linear.in_features, splits, "split_linear_input")
         linears = []
         start = 0
@@ -114,7 +114,7 @@ class SplitLinearOutput(nn.Module):
         self.out_features = sum(self.out_features_list)
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear, splits: list[int]) -> "SplitLinearOutput":
+    def from_linear(cls, linear: nn.Linear, splits: list[int]) -> SplitLinearOutput:
         splits = _complete_splits(linear.out_features, splits, "split_linear_output")
         linears = []
         start = 0

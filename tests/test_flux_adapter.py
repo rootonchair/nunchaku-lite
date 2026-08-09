@@ -2,10 +2,10 @@ import json
 from types import SimpleNamespace
 
 import torch
-from safetensors.torch import save_file
-
 from diffusers import FluxTransformer2DModel
 from diffusers.models.transformers.transformer_flux import FluxIPAdapterAttnProcessor
+from safetensors.torch import save_file
+
 from nunchaku_lite import patch_transformer
 from nunchaku_lite.adapters.flux import (
     FluxAdapter,

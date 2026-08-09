@@ -9,7 +9,6 @@ import numpy as np
 import torch
 from diffusers.pipelines.ltx2.export_utils import encode_video
 from diffusers.pipelines.ltx2.utils import DEFAULT_NEGATIVE_PROMPT
-
 from utils import (
     add_single_step_latency,
     benchmark_device_label,
@@ -21,7 +20,6 @@ from utils import (
     summarize,
     timed_cuda_call,
 )
-
 
 DEFAULT_PROMPT = "A flowing river in a forest at golden hour, gentle wind in the leaves."
 DISTILLED_SIGMA_VALUES = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875]

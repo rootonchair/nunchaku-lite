@@ -1,13 +1,13 @@
 """Shared adapter utilities for replacing Diffusers modules with lite SVDQ modules."""
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
-import torch.nn as nn
 from diffusers.models.attention import AttentionModuleMixin
 from diffusers.models.attention_processor import Attention
+from torch import nn
 
 from ..linear import AWQW4A16Linear, DenseRuntimeLoraLinear, SVDQW4A4Linear
 from ..utils import convert_fp16, patch_scale_key

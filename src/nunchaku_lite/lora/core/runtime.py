@@ -19,7 +19,6 @@ from .layout import (
     svdq_up_to_logical,
 )
 
-
 TRANSFORMER_LORA_METHODS = (
     "load_lora",
     "load_lora_adapter",

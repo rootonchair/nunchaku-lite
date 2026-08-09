@@ -1,11 +1,10 @@
 import platform
 
+import nunchaku_lite_kernels
 import pytest
 import torch
-from torch._subclasses.fake_tensor import FakeTensorMode
-
-import nunchaku_lite_kernels
 from nunchaku_lite_kernels._ops import ops
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 
 def _awq_code_order(device: torch.device) -> torch.Tensor:

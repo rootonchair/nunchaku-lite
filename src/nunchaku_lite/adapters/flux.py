@@ -2,8 +2,9 @@
 
 from typing import Any
 
+import diffusers
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.models.activations import GELU as DiffusersGELU
 from diffusers.models.attention import AttentionModuleMixin, FeedForward
 from diffusers.models.normalization import AdaLayerNormZero, AdaLayerNormZeroSingle
@@ -13,8 +14,7 @@ from diffusers.models.transformers.transformer_flux import (
     FluxTransformerBlock,
 )
 from packaging.version import Version
-import diffusers
-import torch.nn.functional as F
+from torch import nn
 from torch.nn import GELU as TorchGELU
 
 from ..core import PatchOptions, register_adapter

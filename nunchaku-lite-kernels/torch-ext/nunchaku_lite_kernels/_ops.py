@@ -6,7 +6,6 @@ import sys
 
 import torch
 
-
 _DISPATCH_NAMESPACE = "nunchaku_lite_kernels"
 
 

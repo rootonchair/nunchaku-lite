@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import torch
-
 from utils import (
     add_benchmark_speedups,
     cleanup,
@@ -16,7 +15,6 @@ from utils import (
     run_generation_loop,
     timed_cuda_call,
 )
-
 
 DEFAULT_MODEL_ID = "black-forest-labs/FLUX.1-schnell"
 DEFAULT_CHECKPOINT = "nunchaku-ai/nunchaku-flux.1-schnell/svdq-fp4_r32-flux.1-schnell.safetensors"

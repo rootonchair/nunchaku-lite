@@ -278,10 +278,10 @@ def attention_fp16_cuda(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, o: to
 
 
 __all__ = [
-    "attention_fp16_cuda",
     "attention_fp16",
-    "awq_gemm_w4a16_g128_int16",
+    "attention_fp16_cuda",
     "awq_gemm_w4a16_g64_int32",
+    "awq_gemm_w4a16_g128_int16",
     "awq_gemv_w4a16_cuda",
     "fused_affine_modulate",
     "fused_cross_head_qk_norm_rope",

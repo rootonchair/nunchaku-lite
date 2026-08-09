@@ -126,13 +126,13 @@ def _fake_quantized_checkpoint(tmp_path, quantization_config):
 
 
 def _install_fake_adapter(monkeypatch):
-    import nunchaku_lite.core as core
+    from nunchaku_lite import core
 
     monkeypatch.setitem(core._ADAPTERS, FakeAdapter.target, FakeAdapter())
 
 
 def _install_fake_adapter_without_pipeline_patch(monkeypatch):
-    import nunchaku_lite.core as core
+    from nunchaku_lite import core
 
     monkeypatch.setitem(
         core._ADAPTERS,
@@ -194,8 +194,7 @@ def test_load_nunchaku_pipeline_injects_meta_loaded_transformer(tmp_path, monkey
 
 
 def test_load_nunchaku_pipeline_injects_quantized_encoder_component(tmp_path, monkeypatch):
-    import nunchaku_lite.core as core
-    from nunchaku_lite import load_nunchaku_pipeline
+    from nunchaku_lite import core, load_nunchaku_pipeline
 
     encoder = torch.nn.Linear(2, 2)
 

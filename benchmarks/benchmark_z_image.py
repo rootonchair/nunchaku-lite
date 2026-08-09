@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import torch
-
 from utils import (
     add_benchmark_speedups,
     add_single_step_latency,
@@ -18,7 +17,6 @@ from utils import (
     timed_cuda_call,
     write_comparison_plot,
 )
-
 
 DEFAULT_MODEL_ID = "Tongyi-MAI/Z-Image-Turbo"
 DEFAULT_CHECKPOINT = "nunchaku-ai/nunchaku-z-image-turbo/svdq-fp4_r128-z-image-turbo.safetensors"

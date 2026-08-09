@@ -2,9 +2,9 @@ import json
 from types import SimpleNamespace
 
 import torch
+from diffusers import QwenImageTransformer2DModel
 from safetensors.torch import save_file
 
-from diffusers import QwenImageTransformer2DModel
 from nunchaku_lite import patch_transformer
 from nunchaku_lite.adapters.qwen_image import (
     NunchakuQwenAttention,

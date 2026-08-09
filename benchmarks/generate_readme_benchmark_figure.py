@@ -5,9 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-
 from utils import benchmark_device_label
-
 
 DEFAULT_ENTRIES = [
     ("FLUX.2\nKlein 4B", Path("outputs/benchmark_flux2_klein_4b/summary.json")),

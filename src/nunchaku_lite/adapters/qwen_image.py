@@ -6,7 +6,6 @@ from math import prod
 from typing import Any
 
 import torch
-import torch.nn as nn
 from diffusers.models.activations import GELU
 from diffusers.models.attention import AttentionModuleMixin, FeedForward
 from diffusers.models.attention_dispatch import dispatch_attention_fn
@@ -15,6 +14,7 @@ from diffusers.models.transformers.transformer_qwenimage import (
     QwenImageTransformerBlock,
     apply_rotary_emb_qwen,
 )
+from torch import nn
 
 from ..core import PatchOptions, register_adapter
 from ..linear import AWQW4A16Linear, SVDQW4A4Linear
