@@ -273,9 +273,11 @@ def _cached_cross_head_rope_contiguous(x: torch.Tensor, device: torch.device) ->
     try:
         if cache is None:
             cache = {}
-            setattr(x, "_nunchaku_lite_cross_head_rope_contiguous_cache", cache)
+            x._nunchaku_lite_cross_head_rope_contiguous_cache = cache
         cache[cache_key] = cached
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 - best-effort cache attach; some tensor subclasses
+        # disallow dynamic attributes for reasons we can't fully enumerate here, and
+        # failing to cache must never break the actual (already-computed) result below.
         pass
     return cached
 

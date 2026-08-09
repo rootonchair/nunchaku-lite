@@ -9,7 +9,6 @@ from torch import nn
 
 from ...linear import AWQW4A16Linear, DenseRuntimeLoraLinear, SVDQW4A4Linear
 
-
 ModuleT = TypeVar("ModuleT", bound=nn.Module)
 
 

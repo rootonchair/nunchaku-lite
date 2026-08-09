@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import torch
 
-
 LORA_A_SUFFIX = ".lora_A.weight"
 LORA_B_SUFFIX = ".lora_B.weight"
 

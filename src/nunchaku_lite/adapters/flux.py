@@ -2,8 +2,9 @@
 
 from typing import Any
 
+import diffusers
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.models.activations import GELU as DiffusersGELU
 from diffusers.models.attention import AttentionModuleMixin, FeedForward
 from diffusers.models.normalization import AdaLayerNormZero, AdaLayerNormZeroSingle
@@ -13,8 +14,7 @@ from diffusers.models.transformers.transformer_flux import (
     FluxTransformerBlock,
 )
 from packaging.version import Version
-import diffusers
-import torch.nn.functional as F
+from torch import nn
 from torch.nn import GELU as TorchGELU
 
 from ..core import PatchOptions, register_adapter
@@ -124,7 +124,7 @@ def prepare_flux_rotary(
     if image_rotary_emb is None:
         return None
     if isinstance(image_rotary_emb, tuple):
-        raise ValueError("nunchaku_lite Flux expects packed Nunchaku rotary embeddings, not Diffusers cos/sin tuples.")
+        raise TypeError("nunchaku_lite Flux expects packed Nunchaku rotary embeddings, not Diffusers cos/sin tuples.")
     if image_rotary_emb.ndim == 6:
         image_rotary_emb = image_rotary_emb.reshape(1, text_tokens + image_tokens, *image_rotary_emb.shape[3:])
     if image_rotary_emb.shape[1] != text_tokens + image_tokens:

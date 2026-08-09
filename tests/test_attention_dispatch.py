@@ -1,6 +1,6 @@
 import torch
 
-import nunchaku_lite.adapters.attention_dispatch as attention_dispatch
+from nunchaku_lite.adapters import attention_dispatch
 from nunchaku_lite.adapters.attention_dispatch import dispatch_lite_attention_fn, lite_attention_backend
 
 

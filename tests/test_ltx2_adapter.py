@@ -1,13 +1,14 @@
 import json
 from types import SimpleNamespace
+from typing import ClassVar
 
 import torch
-import torch.nn as nn
 from diffusers import LTX2VideoTransformer3DModel
 from safetensors.torch import save_file
+from torch import nn
 
-from nunchaku_lite import list_adapters, patch_transformer
 import nunchaku_lite.adapters.ltx2 as ltx2_adapter
+from nunchaku_lite import list_adapters, patch_transformer
 from nunchaku_lite.adapters.ltx2 import (
     LTX2Adapter,
     NunchakuLTX2AudioVideoAttnProcessor,
@@ -18,23 +19,23 @@ from nunchaku_lite.linear import AWQW4A16Linear, SVDQW4A4Linear
 
 
 def make_tiny_ltx2_transformer(**kwargs):
-    config = dict(
-        in_channels=4,
-        out_channels=4,
-        audio_in_channels=4,
-        audio_out_channels=4,
-        num_attention_heads=1,
-        attention_head_dim=64,
-        audio_num_attention_heads=1,
-        audio_attention_head_dim=64,
-        cross_attention_dim=64,
-        audio_cross_attention_dim=64,
-        num_layers=1,
-        caption_channels=64,
-        norm_elementwise_affine=False,
-        gated_attn=True,
-        audio_gated_attn=True,
-    )
+    config = {
+        "in_channels": 4,
+        "out_channels": 4,
+        "audio_in_channels": 4,
+        "audio_out_channels": 4,
+        "num_attention_heads": 1,
+        "attention_head_dim": 64,
+        "audio_num_attention_heads": 1,
+        "audio_attention_head_dim": 64,
+        "cross_attention_dim": 64,
+        "audio_cross_attention_dim": 64,
+        "num_layers": 1,
+        "caption_channels": 64,
+        "norm_elementwise_affine": False,
+        "gated_attn": True,
+        "audio_gated_attn": True,
+    }
     config.update(kwargs)
     return LTX2VideoTransformer3DModel(**config)
 
@@ -160,7 +161,7 @@ def test_ltx2_processor_applies_fused_qk_norm_rope_when_rotary_present(monkeypat
         to_v = nn.Identity()
         norm_q = nn.Identity()
         norm_k = nn.Identity()
-        to_out = [nn.Identity(), nn.Identity()]
+        to_out: ClassVar = [nn.Identity(), nn.Identity()]
 
     calls = []
 
@@ -197,7 +198,7 @@ def test_ltx2_perturbed_attention_all_perturbed_skips_attention(monkeypatch):
         to_v = nn.Identity()
         norm_q = nn.Identity()
         norm_k = nn.Identity()
-        to_out = [nn.Identity(), nn.Identity()]
+        to_out: ClassVar = [nn.Identity(), nn.Identity()]
 
     def fail_dispatch(*args, **kwargs):
         raise AssertionError("attention should be skipped when all samples are perturbed")
@@ -222,7 +223,7 @@ def test_ltx2_perturbed_attention_mask_lerps_value_and_attention(monkeypatch):
         to_v = nn.Identity()
         norm_q = nn.Identity()
         norm_k = nn.Identity()
-        to_out = [nn.Identity(), nn.Identity()]
+        to_out: ClassVar = [nn.Identity(), nn.Identity()]
 
     hidden_states = torch.randn(1, 3, 8)
     attended = torch.randn(1, 3, 8)

@@ -28,7 +28,6 @@ from .core.peft import (
 )
 from .core.runtime import NunchakuLoraMixin, load_lora_state_dict, raise_if_text_encoder_lora
 
-
 KOHYA_DOWN_SUFFIX = ".lora_down.weight"
 KOHYA_UP_SUFFIX = ".lora_up.weight"
 ALPHA_SUFFIX = ".alpha"

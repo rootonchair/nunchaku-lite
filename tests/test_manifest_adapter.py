@@ -7,13 +7,13 @@ from safetensors.torch import load_file, save_file
 from torch import nn
 
 from nunchaku_lite import patch_transformer
+from nunchaku_lite.adapters.common import PATCHED_MODULE_ATTR
 from nunchaku_lite.adapters.manifest import (
-    ManifestAdapter,
     ManifestAdaNormAWQW4A16,
+    ManifestAdapter,
     SplitLinearInput,
     SplitLinearOutput,
 )
-from nunchaku_lite.adapters.common import PATCHED_MODULE_ATTR
 from nunchaku_lite.linear import AWQW4A16Linear, SVDQW4A4Linear
 from nunchaku_lite.lora.core.layout import unpack_lowrank_weight
 from nunchaku_lite.lora.manifest import COMFYUI_FORMAT, KOHYA_FORMAT, PEFT_FORMAT, detect_manifest_lora_format
@@ -205,7 +205,7 @@ def test_patch_transformer_manifest_accepts_legacy_smooth_factor_orig_checkpoint
 
 
 def test_patch_transformer_auto_uses_manifest_before_matching_adapter(tmp_path, monkeypatch):
-    import nunchaku_lite.core as core
+    from nunchaku_lite import core
 
     manifest = _manifest()
     checkpoint = _write_manifest_checkpoint(tmp_path, TinyManifestModel(), manifest)
@@ -219,7 +219,7 @@ def test_patch_transformer_auto_uses_manifest_before_matching_adapter(tmp_path, 
 
 
 def test_patch_transformer_auto_falls_back_when_manifest_absent(tmp_path, monkeypatch):
-    import nunchaku_lite.core as core
+    from nunchaku_lite import core
 
     checkpoint = tmp_path / "dense.safetensors"
     save_file(

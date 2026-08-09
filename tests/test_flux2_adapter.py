@@ -2,9 +2,9 @@ import json
 from types import SimpleNamespace
 
 import torch
+from diffusers import Flux2Transformer2DModel
 from safetensors.torch import save_file
 
-from diffusers import Flux2Transformer2DModel
 from nunchaku_lite import patch_transformer
 from nunchaku_lite.adapters.flux2 import (
     Flux2Adapter,

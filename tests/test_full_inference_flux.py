@@ -7,7 +7,6 @@ import torch
 
 from nunchaku_lite.utils import get_precision
 
-
 pytestmark = pytest.mark.full_inference
 
 

@@ -9,10 +9,9 @@ import torch
 from torch import nn
 
 from ..linear import AWQW4A16Linear, SVDQW4A4Linear
-from .core.runtime import NunchakuLoraMixin, load_lora_state_dict
 from .core.convert import (
-    FusedProjectionSpec,
     LORA_ERROR_LABEL,
+    FusedProjectionSpec,
     fuse_projection_branches,
     group_fused_projection_pairs,
     is_nunchaku_lite_lora_state_dict,
@@ -21,10 +20,16 @@ from .core.convert import (
     strip_transformer_prefix,
     validate_nunchaku_lora_state_dict,
 )
-from .core.peft import LORA_A_SUFFIX, LORA_B_SUFFIX, apply_network_alphas, extract_network_alphas, normalize_float_tensor
-from .core.peft import peft_lora_pairs
 from .core.layout import lora_modules
-
+from .core.peft import (
+    LORA_A_SUFFIX,
+    LORA_B_SUFFIX,
+    apply_network_alphas,
+    extract_network_alphas,
+    normalize_float_tensor,
+    peft_lora_pairs,
+)
+from .core.runtime import NunchakuLoraMixin, load_lora_state_dict
 
 FLUX2_COMFYUI_DOUBLE_BLOCK_REPLACEMENTS = (
     ("img_attn.qkv", "attn.to_qkv"),

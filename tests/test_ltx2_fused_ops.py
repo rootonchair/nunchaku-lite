@@ -15,7 +15,7 @@ def _has_native_cross_head_qk_op() -> bool:
         from nunchaku_lite._C import ops
 
         return hasattr(ops, "fused_cross_head_qk_norm_rope")
-    except Exception:
+    except Exception:  # noqa: BLE001 - feature probe: any failure means "unavailable", so skip
         return False
 
 
@@ -25,7 +25,7 @@ def _has_native_modulation_ops() -> bool:
 
         ops = get_ops()
         return hasattr(ops, "fused_rms_norm_modulate") and hasattr(ops, "fused_affine_modulate")
-    except Exception:
+    except Exception:  # noqa: BLE001 - feature probe: any failure means "unavailable", so skip
         return False
 
 

@@ -130,7 +130,7 @@ def run_generation_loop(
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
-        image, elapsed = timed_cuda_call(lambda: generate_image(generator))
+        image, elapsed = timed_cuda_call(lambda generator=generator: generate_image(generator))
         peak = cuda_gb() if torch.cuda.is_available() else 0.0
         print(f"{label} run {index + 1}/{total_runs}: {elapsed:.3f}s, peak {peak:.2f} GB", flush=True)
 

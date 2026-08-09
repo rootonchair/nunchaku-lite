@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .ops.gemm import awq_gemm_w4a16_g128_int16, awq_gemm_w4a16_g64_int32, svdq_gemm_w4a4_cuda
+from .ops.gemm import awq_gemm_w4a16_g64_int32, awq_gemm_w4a16_g128_int16, svdq_gemm_w4a4_cuda
 from .ops.gemv import awq_gemv_w4a16_cuda
 from .ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
 

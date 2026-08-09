@@ -7,10 +7,9 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from .core.runtime import NunchakuLoraMixin, load_lora_state_dict
 from .core.convert import (
-    FusedProjectionSpec,
     LORA_ERROR_LABEL,
+    FusedProjectionSpec,
     fuse_projection_branches,
     group_fused_projection_pairs,
     is_nunchaku_lite_lora_state_dict,
@@ -19,10 +18,16 @@ from .core.convert import (
     strip_transformer_prefix,
     validate_nunchaku_lora_state_dict,
 )
-from .core.peft import LORA_A_SUFFIX, LORA_B_SUFFIX, apply_network_alphas, extract_network_alphas, normalize_float_tensor
-from .core.peft import peft_lora_pairs
 from .core.layout import lora_modules
-
+from .core.peft import (
+    LORA_A_SUFFIX,
+    LORA_B_SUFFIX,
+    apply_network_alphas,
+    extract_network_alphas,
+    normalize_float_tensor,
+    peft_lora_pairs,
+)
+from .core.runtime import NunchakuLoraMixin, load_lora_state_dict
 
 Z_IMAGE_QKV_PROJECTION_SPECS = (
     FusedProjectionSpec(target=".attention.to_qkv", branches=(".attention.to_q", ".attention.to_k", ".attention.to_v")),
@@ -120,8 +125,7 @@ def normalize_z_image_diffusers_lora_state_dict(state_dict: dict[str, torch.Tens
     tensors = {}
     for key, value in state_dict.items():
         new_key = strip_transformer_prefix(key)
-        if new_key.startswith("diffusion_model."):
-            new_key = new_key[len("diffusion_model.") :]
+        new_key = new_key.removeprefix("diffusion_model.")
         new_key = new_key.replace(".lora_down.weight", LORA_A_SUFFIX)
         new_key = new_key.replace(".lora_up.weight", LORA_B_SUFFIX)
         tensors[new_key] = normalize_float_tensor(value)

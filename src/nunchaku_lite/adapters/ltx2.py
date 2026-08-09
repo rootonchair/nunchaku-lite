@@ -4,7 +4,6 @@ import types
 from typing import Any
 
 import torch
-import torch.nn as nn
 from diffusers.models.activations import GELU
 from diffusers.models.attention import FeedForward
 from diffusers.models.transformers.transformer_ltx2 import (
@@ -14,8 +13,8 @@ from diffusers.models.transformers.transformer_ltx2 import (
     LTX2VideoTransformer3DModel,
     LTX2VideoTransformerBlock,
 )
+from torch import nn
 
-from .attention_dispatch import dispatch_lite_attention_fn
 from ..core import PatchOptions, register_adapter
 from ..linear import AWQW4A16Linear, SVDQW4A4Linear
 from ..ops.fused import (
@@ -24,6 +23,7 @@ from ..ops.fused import (
     fused_gelu_mlp,
     fused_rms_norm_modulate,
 )
+from .attention_dispatch import dispatch_lite_attention_fn
 from .common import (
     SVDQPatchContext,
     build_svdq_context,

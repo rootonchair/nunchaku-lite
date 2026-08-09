@@ -5,9 +5,9 @@ from .core import TransformerAdapter, list_adapters, load_nunchaku_pipeline, pat
 from .text_encoders import NunchakuT5EncoderModel
 
 __all__ = [
-    "__version__",
     "NunchakuT5EncoderModel",
     "TransformerAdapter",
+    "__version__",
     "list_adapters",
     "load_nunchaku_pipeline",
     "patch_transformer",

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 HF_KERNEL_REPO = "rootonchair/nunchaku-lite-kernels"
-HF_KERNEL_VERSION = 1
+HF_KERNEL_VERSION = 2
 
 _OPS: Any | None = None
 

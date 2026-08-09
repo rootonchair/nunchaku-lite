@@ -1,5 +1,4 @@
 import torch
-
 from kernels.benchmark import Benchmark
 
 

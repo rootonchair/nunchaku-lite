@@ -6,14 +6,13 @@ import pytest
 import torch
 from diffusers.loaders.lora_pipeline import ZImageLoraLoaderMixin
 from diffusers.models.transformers.transformer_z_image import ZImageTransformer2DModel
+from test_z_image_adapter import make_tiny_z_image_transformer
 
 from nunchaku_lite.adapters.z_image import ZImageAdapter
 from nunchaku_lite.linear import DenseRuntimeLoraLinear, SVDQW4A4Linear
 from nunchaku_lite.lora.core.layout import unpack_lowrank_weight
 from nunchaku_lite.lora.core.runtime import NunchakuPipelineLoraMixin, bind_pipeline_lora_methods
 from nunchaku_lite.lora.z_image import normalize_z_image_diffusers_lora_state_dict
-
-from test_z_image_adapter import make_tiny_z_image_transformer
 
 Z_IMAGE_BLOCK_GROUPS = ("layers", "noise_refiner", "context_refiner")
 Z_IMAGE_LINEAR_TARGETS = (

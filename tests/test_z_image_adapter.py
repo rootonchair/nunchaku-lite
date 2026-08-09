@@ -3,13 +3,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import save_file
-from torch import nn
-
 from diffusers.models.attention import FeedForward
 from diffusers.models.attention_processor import Attention
 from diffusers.models.transformers.transformer_z_image import FeedForward as DiffusersZImageFeedForward
 from diffusers.models.transformers.transformer_z_image import ZImageTransformer2DModel
+from safetensors.torch import save_file
+from torch import nn
+
 from nunchaku_lite import patch_transformer
 from nunchaku_lite.adapters.common import NunchakuAttention, patch_attention_module, patch_modules_recursively
 from nunchaku_lite.adapters.z_image import ZImageAdapter
@@ -235,7 +235,7 @@ def test_patch_modules_recursively_descends_into_unconverted_attention_subclasse
             nn.Linear: lambda _path, linear: SVDQW4A4Linear.from_linear(linear, precision="int4", rank=4)
         },
         skips=lambda path, child: (
-            isinstance(child, nn.Linear) and not (path.endswith(".to_q") or path.endswith(".to_k"))
+            isinstance(child, nn.Linear) and not path.endswith((".to_q", ".to_k"))
         ),
     )
 

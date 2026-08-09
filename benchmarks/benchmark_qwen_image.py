@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import torch
-
 from utils import (
     add_benchmark_speedups,
     add_single_step_latency,
@@ -18,7 +17,6 @@ from utils import (
     timed_cuda_call,
     write_comparison_plot,
 )
-
 
 DEFAULT_MODEL_ID = "Qwen/Qwen-Image"
 DEFAULT_CHECKPOINT = "nunchaku-tech/nunchaku-qwen-image/svdq-fp4_r32-qwen-image.safetensors"
