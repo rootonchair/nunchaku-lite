@@ -103,7 +103,7 @@ def load_state_dict_in_safetensors(
     state_dict = {}
     with safetensors.safe_open(fetch_or_download(path), framework="pt", device=device) as f:
         metadata = f.metadata()
-        for key in f.keys():
+        for key in f.keys():  # noqa: SIM118 (safe_open handle has no __iter__, only .keys())
             if filter_prefix and not key.startswith(filter_prefix):
                 continue
             state_dict[key.removeprefix(filter_prefix)] = f.get_tensor(key)
@@ -227,5 +227,5 @@ def parse_config_metadata(metadata: dict[str, str] | None) -> dict[str, Any]:
         return {}
     parsed = json.loads(metadata["config"])
     if not isinstance(parsed, dict):
-        raise ValueError("Checkpoint config metadata must decode to a JSON object.")
+        raise TypeError("Checkpoint config metadata must decode to a JSON object.")
     return parsed

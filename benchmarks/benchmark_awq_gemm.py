@@ -115,8 +115,18 @@ def main() -> None:
     speedups = []
     for m, k, n in shapes:
         x, qweight, wscales, wzeros = _make_case(m, k, n, dtype)
-        gemv_ms = _time_cuda(lambda: _gemv_chunked(x, qweight, wscales, wzeros), args.warmup, args.repeat)
-        gemm_ms = _time_cuda(lambda: awq_gemm_w4a16_g64_int32(x, qweight, wscales, wzeros), args.warmup, args.repeat)
+        gemv_ms = _time_cuda(
+            lambda x=x, qweight=qweight, wscales=wscales, wzeros=wzeros: _gemv_chunked(x, qweight, wscales, wzeros),
+            args.warmup,
+            args.repeat,
+        )
+        gemm_ms = _time_cuda(
+            lambda x=x, qweight=qweight, wscales=wscales, wzeros=wzeros: awq_gemm_w4a16_g64_int32(
+                x, qweight, wscales, wzeros
+            ),
+            args.warmup,
+            args.repeat,
+        )
         speedup = gemv_ms / gemm_ms
         speedups.append(speedup)
         print(f"| {m} | {k} | {n} | {gemv_ms:.4f} | {gemm_ms:.4f} | {speedup:.3f}x |")

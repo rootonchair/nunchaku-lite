@@ -82,7 +82,7 @@ def parse_runtime_manifest(quantization_config: dict[str, Any]) -> RuntimeManife
     if raw is None:
         return None
     if not isinstance(raw, dict):
-        raise ValueError("quantization_config.runtime_manifest must be a JSON object.")
+        raise TypeError("quantization_config.runtime_manifest must be a JSON object.")
 
     schema = _required(raw, "schema", str)
     if schema != SCHEMA:
@@ -140,7 +140,7 @@ def _validate_requirements(requirements: dict[str, Any]) -> None:
 
 def _parse_target(index: int, raw: Any) -> RuntimeManifestTarget:
     if not isinstance(raw, dict):
-        raise ValueError(f"runtime_manifest.targets[{index}] must be a JSON object.")
+        raise TypeError(f"runtime_manifest.targets[{index}] must be a JSON object.")
 
     checkpoint_prefix = _required(raw, "checkpoint_prefix", str)
     source_modules = _required(raw, "source_modules", list)
@@ -194,7 +194,7 @@ def _parse_target(index: int, raw: Any) -> RuntimeManifestTarget:
 
 def _validate_structural_patch(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
-        raise ValueError("runtime_manifest structural patches must be JSON objects.")
+        raise TypeError("runtime_manifest structural patches must be JSON objects.")
     patch_type = _required(raw, "type", str)
     if patch_type not in {"split_linear_output", "split_linear_input"}:
         raise ValueError(f"Unsupported runtime_manifest structural patch type {patch_type!r}.")
@@ -202,7 +202,7 @@ def _validate_structural_patch(raw: Any) -> dict[str, Any]:
     args = _required(raw, "args", dict)
     splits = args.get("splits")
     if not isinstance(splits, list):
-        raise ValueError(f"runtime_manifest structural patch {module!r} requires args.splits list.")
+        raise TypeError(f"runtime_manifest structural patch {module!r} requires args.splits list.")
     return {"type": patch_type, "module": module, "args": dict(args)}
 
 
@@ -211,5 +211,5 @@ def _required(raw: dict[str, Any], key: str, expected_type: type) -> Any:
         raise ValueError(f"runtime_manifest is missing required field {key!r}.")
     value = raw[key]
     if not isinstance(value, expected_type):
-        raise ValueError(f"runtime_manifest field {key!r} must be {expected_type.__name__}.")
+        raise TypeError(f"runtime_manifest field {key!r} must be {expected_type.__name__}.")
     return value

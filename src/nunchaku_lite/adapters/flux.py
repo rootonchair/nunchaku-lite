@@ -124,7 +124,7 @@ def prepare_flux_rotary(
     if image_rotary_emb is None:
         return None
     if isinstance(image_rotary_emb, tuple):
-        raise ValueError("nunchaku_lite Flux expects packed Nunchaku rotary embeddings, not Diffusers cos/sin tuples.")
+        raise TypeError("nunchaku_lite Flux expects packed Nunchaku rotary embeddings, not Diffusers cos/sin tuples.")
     if image_rotary_emb.ndim == 6:
         image_rotary_emb = image_rotary_emb.reshape(1, text_tokens + image_tokens, *image_rotary_emb.shape[3:])
     if image_rotary_emb.shape[1] != text_tokens + image_tokens:

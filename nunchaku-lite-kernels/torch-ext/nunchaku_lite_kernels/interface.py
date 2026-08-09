@@ -110,7 +110,7 @@ def _fake_fused_cross_head_qk_norm_rope(
 
 def _get_ops():
     try:
-        ops.gemm_w4a4
+        _ = ops.gemm_w4a4
     except AttributeError as exc:
         raise ImportError("nunchaku_lite_kernels extension did not register dispatcher ops") from exc
     return ops

@@ -418,7 +418,9 @@ class NunchakuPipelineLoraMixin:
             transformer_name = getattr(self, "transformer_name", component_name)
             transformer = getattr(self, transformer_name)
         if not callable(getattr(transformer, "load_lora", None)):
-            raise RuntimeError(
+            # Not a type error: the transformer object is fine, it just hasn't been
+            # patched with its adapter yet. RuntimeError correctly describes this.
+            raise RuntimeError(  # noqa: TRY004
                 f"Pipeline component {component_name!r} is not bound to the nunchaku_lite "
                 "transformer LoRA runtime. Patch the transformer with its adapter before "
                 "binding pipeline LoRA methods."

@@ -235,7 +235,7 @@ def test_patch_modules_recursively_descends_into_unconverted_attention_subclasse
             nn.Linear: lambda _path, linear: SVDQW4A4Linear.from_linear(linear, precision="int4", rank=4)
         },
         skips=lambda path, child: (
-            isinstance(child, nn.Linear) and not (path.endswith(".to_q") or path.endswith(".to_k"))
+            isinstance(child, nn.Linear) and not path.endswith((".to_q", ".to_k"))
         ),
     )
 

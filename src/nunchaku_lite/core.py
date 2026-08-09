@@ -566,7 +566,7 @@ def _parse_json_metadata(metadata: dict[str, str] | None, key: str) -> dict[str,
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid JSON in checkpoint metadata field {key!r}: {exc}") from exc
     if not isinstance(parsed, dict):
-        raise ValueError(f"Checkpoint metadata field {key!r} must decode to a JSON object.")
+        raise TypeError(f"Checkpoint metadata field {key!r} must decode to a JSON object.")
     return parsed
 
 
