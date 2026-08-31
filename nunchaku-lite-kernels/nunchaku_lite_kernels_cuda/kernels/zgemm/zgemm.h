@@ -41,7 +41,8 @@ void quantize_w4a4_act_fuse_lora(Tensor input,
                                  Tensor lora_act_out,
                                  Tensor smooth = {},
                                  bool fuse_glu = false,
-                                 bool fp4      = false);
+                                 bool fp4      = false,
+                                 bool hadamard = false);
 void quantize_w4a4_act(Tensor input, Tensor output, Tensor oscales);
 void quantize_w4a4_wgt(Tensor input, Tensor output, Tensor oscales);
 
