@@ -87,9 +87,10 @@ void dispatch_quantize_w4a4_act_fuse_lora(OptionalTensor input,
                                           OptionalTensor lora_act_out,
                                           OptionalTensor smooth,
                                           bool fuse_glu,
-                                          bool fp4) {
+                                          bool fp4,
+                                          bool hadamard) {
     nunchaku_lite::ops::quantize_w4a4_act_fuse_lora(
-        input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4);
+        input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4, hadamard);
 }
 
 torch::Tensor dispatch_fused_rms_norm_modulate(torch::Tensor x,
@@ -164,7 +165,7 @@ TORCH_LIBRARY(nunchaku_lite_kernels, ops) {
             "out_q, Tensor(i!)? out_k, Tensor(j!)? out_v, int attn_tokens) -> ()");
     ops.def("quantize_w4a4_act_fuse_lora(Tensor? input, Tensor(a!)? output, "
             "Tensor(b!)? oscales, Tensor? lora_down, Tensor(c!)? lora_act_out, "
-            "Tensor? smooth, bool fuse_glu, bool fp4) -> ()");
+            "Tensor? smooth, bool fuse_glu, bool fp4, bool hadamard=False) -> ()");
     ops.def("fused_rms_norm_modulate(Tensor x, Tensor? norm_weight, Tensor scale, "
             "Tensor shift, float eps) -> Tensor");
     ops.def("fused_affine_modulate(Tensor x, Tensor scale, Tensor shift) -> Tensor");

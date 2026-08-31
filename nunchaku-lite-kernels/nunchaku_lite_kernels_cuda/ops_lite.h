@@ -104,7 +104,8 @@ inline void quantize_w4a4_act_fuse_lora(std::optional<torch::Tensor> input,
                                         std::optional<torch::Tensor> lora_act_out,
                                         std::optional<torch::Tensor> smooth,
                                         bool fuse_glu,
-                                        bool fp4) {
+                                        bool fp4,
+                                        bool hadamard = false) {
     TorchOpContext ctx;
     nunchaku::kernels::quantize_w4a4_act_fuse_lora(as_tensor(input),
                                                    as_tensor(output),
@@ -113,7 +114,8 @@ inline void quantize_w4a4_act_fuse_lora(std::optional<torch::Tensor> input,
                                                    as_tensor(lora_act_out),
                                                    as_tensor(smooth),
                                                    fuse_glu,
-                                                   fp4);
+                                                   fp4,
+                                                   hadamard);
 }
 
 inline torch::Tensor gemv_awq(torch::Tensor in_feats,

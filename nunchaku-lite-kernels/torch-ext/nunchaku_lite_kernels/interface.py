@@ -55,6 +55,7 @@ def _fake_quantize_w4a4_act_fuse_lora(
     smooth,
     fuse_glu: bool,
     fp4: bool,
+    hadamard: bool = False,
 ) -> None:
     return None
 
@@ -217,6 +218,7 @@ def svdq_quantize_w4a4_act_fuse_lora_cuda(
     fuse_glu: bool = False,
     fp4: bool = False,
     pad_size: int = 256,
+    hadamard: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if lora_down is None:
         raise ValueError("lora_down is required")
@@ -238,7 +240,7 @@ def svdq_quantize_w4a4_act_fuse_lora_cuda(
     if lora_act_out is None:
         lora_act_out = torch.empty(batch_size_pad, rank, dtype=torch.float32, device=input.device)
 
-    ops.quantize_w4a4_act_fuse_lora(input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4)
+    ops.quantize_w4a4_act_fuse_lora(input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4, hadamard)
     return output, oscales, lora_act_out
 
 

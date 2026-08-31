@@ -927,7 +927,7 @@ public:
         Epilogue()(binfo, f16psum, M, N, K, epilogueArgs);
     }
 
-    template<bool FUSE_GELU, bool USE_UNSIGNED, bool USE_FP4>
+    template<bool FUSE_GELU, bool USE_UNSIGNED, bool USE_FP4, bool USE_HADAMARD = false>
     struct EpilogueQuantize {
         using oscales_t = typename std::conditional_t<USE_FP4, packed_amscale_t, packed_ascale_t>;
 
@@ -991,6 +991,58 @@ public:
                         tmp[j].data[1] = h2div(tmp[j].data[1], ws1);
                         tmp[j].data[2] = h2div(tmp[j].data[2], ws2);
                         tmp[j].data[3] = h2div(tmp[j].data[3], ws2);
+                    }
+
+                    if constexpr (USE_HADAMARD) {
+                        // In-register 64-point Walsh-Hadamard transform along the channel
+                        // dimension of this 64-channel x 16-token tile (Sylvester order,
+                        // normalized by 1/8 => orthonormal H64 per 64-channel block; the
+                        // offline weight is packed as Q(R @ H64_blockdiag) to match).
+                        // Channel-bit layout of the mma C fragment:
+                        //   bit0 = half2 element (x/y)   bits1-2 = laneId bits 0-1
+                        //   bit3 = data[0/2] vs data[1/3] pair   bits4-5 = tmp[j] index
+                        // (data[k] bit0 selects the token row, not a channel.)
+#pragma unroll
+                        for (int j = 0; j < NUM_PACKS; j++) {
+#pragma unroll
+                            for (int k = 0; k < 4; k++) { // ch bit0: inside each half2
+                                half2_t v      = tmp[j].data[k];
+                                tmp[j].data[k] = half2_t(__hadd(v.x, v.y), __hsub(v.x, v.y));
+                            }
+                        }
+#pragma unroll
+                        for (int bit = 0; bit < 2; bit++) { // ch bits1-2: across lanes
+#pragma unroll
+                            for (int j = 0; j < NUM_PACKS; j++) {
+#pragma unroll
+                                for (int k = 0; k < 4; k++) {
+                                    half2_t v      = tmp[j].data[k];
+                                    half2_t o      = __shfl_xor_sync(~0u, v, 1 << bit);
+                                    tmp[j].data[k] = ((laneId >> bit) & 1) ? __hsub2(o, v) : __hadd2(v, o);
+                                }
+                            }
+                        }
+#pragma unroll
+                        for (int j = 0; j < NUM_PACKS; j++) { // ch bit3: same-row data pairs
+                            half2_t a0     = tmp[j].data[0], a2 = tmp[j].data[2];
+                            tmp[j].data[0] = __hadd2(a0, a2);
+                            tmp[j].data[2] = __hsub2(a0, a2);
+                            half2_t a1     = tmp[j].data[1], a3 = tmp[j].data[3];
+                            tmp[j].data[1] = __hadd2(a1, a3);
+                            tmp[j].data[3] = __hsub2(a1, a3);
+                        }
+                        const half2_t hnorm = half2_t(half_t(0.125f), half_t(0.125f));
+#pragma unroll
+                        for (int k = 0; k < 4; k++) { // ch bits4-5: across tmp[j], + 1/8 normalize
+                            half2_t a      = tmp[0].data[k], b = tmp[1].data[k];
+                            half2_t c      = tmp[2].data[k], d = tmp[3].data[k];
+                            half2_t ab0    = __hadd2(a, b), ab1 = __hsub2(a, b);
+                            half2_t cd0    = __hadd2(c, d), cd1 = __hsub2(c, d);
+                            tmp[0].data[k] = __hmul2(__hadd2(ab0, cd0), hnorm);
+                            tmp[1].data[k] = __hmul2(__hadd2(ab1, cd1), hnorm);
+                            tmp[2].data[k] = __hmul2(__hsub2(ab0, cd0), hnorm);
+                            tmp[3].data[k] = __hmul2(__hsub2(ab1, cd1), hnorm);
+                        }
                     }
 
                     packed_act_t qresult;
@@ -1094,7 +1146,7 @@ public:
         }
     };
 
-    template<bool fuse_glu, bool use_fp4>
+    template<bool fuse_glu, bool use_fp4, bool use_hadamard = false>
     struct quantize_w4a4_fuse_lora_kernel {
         using oscales_t = typename std::conditional_t<use_fp4, packed_amscale_t, packed_ascale_t>;
 
@@ -1170,16 +1222,16 @@ public:
                                    .alwaysfalse   = args.alwaysfalse,
                                });
 
-            EpilogueQuantize<false, false, use_fp4>()(
-                binfo,
-                fpsum,
-                args.M,
-                args.N,
-                0,
-                typename EpilogueQuantize<false, false, use_fp4>::Arguments{.qout          = args.output,
-                                                                            .oscales       = args.oscales,
-                                                                            .shift_value   = 0,
-                                                                            .smooth_factor = args.smooth_factor});
+            using Quantize = EpilogueQuantize<false, false, use_fp4, use_hadamard>;
+            Quantize()(binfo,
+                       fpsum,
+                       args.M,
+                       args.N,
+                       0,
+                       typename Quantize::Arguments{.qout          = args.output,
+                                                    .oscales       = args.oscales,
+                                                    .shift_value   = 0,
+                                                    .smooth_factor = args.smooth_factor});
         }
     };
 };

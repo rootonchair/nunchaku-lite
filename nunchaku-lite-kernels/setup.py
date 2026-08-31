@@ -38,6 +38,14 @@ def get_sm_targets() -> list[str]:
     support_sm121 = packaging_version.parse(nvcc_version) >= packaging_version.parse("13.0")
 
     install_mode = os.getenv("NUNCHAKU_INSTALL_MODE", "FAST")
+    explicit_sm = os.getenv("NUNCHAKU_BUILD_SM")
+    if explicit_sm:
+        # Explicit SM list (comma-separated), e.g. for building on a GPU-less node.
+        targets = [sm.strip() for sm in explicit_sm.split(",") if sm.strip()]
+        for sm in targets:
+            if sm not in ["75", "80", "86", "89", "120a", "121a"]:
+                raise RuntimeError(f"Unsupported SM {sm}")
+        return targets
     if install_mode == "FAST":
         targets = []
         for index in range(torch.cuda.device_count()):
