@@ -410,6 +410,7 @@ def test_auto_backend_falls_back_to_dense_without_kernels(monkeypatch):
 
 def test_configure_backend_sets_every_layer(monkeypatch):
     monkeypatch.setattr(mps_ops, "has_neural_accelerators", lambda: True)
+    monkeypatch.setattr(mps_ops, "mps_kernels_available", lambda: True)  # CI has no Metal kernels
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
     w = _logical(n=128, k=256, seed=13)
     model = torch.nn.Sequential(_module(w, "cpu"), torch.nn.LayerNorm(128), _module(w, "cpu"))
