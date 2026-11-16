@@ -23,6 +23,14 @@ def fused_gelu_mlp(x: torch.Tensor, fc1: SVDQW4A4Linear, fc2: SVDQW4A4Linear, pa
         MLP output with shape ``(batch, sequence, fc2.out_features)``.
     """
 
+    expected_unsigned = fc2.precision != "nvfp4"
+    if fc2.act_unsigned != expected_unsigned:
+        # fc1's epilogue writes unsigned, GELU-shifted codes for INT4 and signed codes for NVFP4
+        # (gemm_w4a4_launch_impl.cuh); fc2 reading them with the other signedness gives garbage.
+        raise ValueError(
+            f"fused_gelu_mlp needs fc2.act_unsigned={expected_unsigned} for precision={fc2.precision!r}, "
+            f"got {fc2.act_unsigned}."
+        )
     if x.device.type == "mps":
         from .mps import gelu_mlp_mps
 

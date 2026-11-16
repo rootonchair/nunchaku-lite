@@ -40,7 +40,9 @@ def _patch_ltx2_feed_forward(ff: FeedForward, context: SVDQPatchContext) -> Feed
         module_converters={nn.Linear: lambda _path, linear: svdq_from_linear(linear, context)},
     )
     if len(ff.net) > 2 and isinstance(ff.net[2], SVDQW4A4Linear):
-        ff.net[2].act_unsigned = False
+        # fused_gelu_mlp quantizes fc2's input in fc1's GEMM epilogue, which emits unsigned,
+        # GELU-shifted codes for INT4 and signed codes for NVFP4; fc2 must read them the same way.
+        ff.net[2].act_unsigned = ff.net[2].precision != "nvfp4"
     ff._nunchaku_lite_ltx2_original_forward = ff.forward
     ff.forward = types.MethodType(_ltx2_feed_forward, ff)
     return ff

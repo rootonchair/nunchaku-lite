@@ -252,6 +252,13 @@ class SVDQW4A4Linear(nn.Module):
             from .ops.mps import svdq_linear_mps
 
             return svdq_linear_mps(self, x)
+        if self.act_unsigned:
+            # The standalone quantizer always emits signed codes; unsigned (GELU-shifted) codes are
+            # only produced by fused_gelu_mlp, so reading them as unsigned here gives garbage.
+            raise ValueError(
+                "SVDQW4A4Linear with act_unsigned=True can only run through fused_gelu_mlp; "
+                "its standalone forward would misread signed activation codes as unsigned."
+            )
         batch_size, seq_len, channels = x.shape
         x = x.reshape(batch_size * seq_len, channels)
         if output is None:
