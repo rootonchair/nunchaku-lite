@@ -313,8 +313,8 @@ def test_awq_layer_matches_dense_reference():
     assert _rel_err(np.array(layer(mx.array(x))), x.astype(np.float64) @ dense.T + bias) < 2e-3
 
 
-def test_awq_adanorm_layout_restores_original_order():
-    splits = 6
+@pytest.mark.parametrize("splits", [3, 6])
+def test_awq_adanorm_layout_restores_original_order(splits):
     codes, scale, zero, bias, dense = _awq_case(n=384, seed=42)
     n = codes.shape[0]
 
@@ -322,9 +322,9 @@ def test_awq_adanorm_layout_restores_original_order():
     def interleave(t):
         return t.reshape(splits, n // splits, *t.shape[1:]).swapaxes(0, 1).reshape(t.shape)
 
+    # +1 folded into each scale chunk, as the torch adapters expect: scale_msa (and scale_mlp with 6 splits)
     b = bias.reshape(splits, n // splits).T.copy()
-    b[:, 1] += 1
-    b[:, -2] += 1
+    b[:, [1, 4] if splits == 6 else [1]] += 1
     stored = _awq_tensors(interleave(codes), interleave(scale), interleave(zero), b.reshape(n))
     layer = AWQW4A16Linear(256, n, adanorm_splits=splits, dtype=mx.float32)
     layer.load_weights(list(stored.items()))

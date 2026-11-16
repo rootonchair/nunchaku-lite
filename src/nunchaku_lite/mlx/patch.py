@@ -185,9 +185,11 @@ def patch_transformer(
     All remaining checkpoint tensors (norms, embeddings, unquantized layers) are
     loaded into the model as regular weights.
 
-    When the checkpoint carries a Nunchaku Lite runtime manifest (``quantization_config.runtime_manifest``), the
-    manifest decides which layers are quantized and how (as in ``nunchaku_lite``); ``act_unsigned`` and
-    ``adanorm_splits`` are then ignored.
+    When the checkpoint carries a Nunchaku Lite runtime manifest (``quantization_config.runtime_manifest``, or
+    the ``svdq_w4a4`` / ``awq_w4a16`` target lists of older lite checkpoints), the manifest decides which layers
+    are quantized and how (as in ``nunchaku_lite``); ``act_unsigned`` and ``adanorm_splits`` are then ignored.
+    Lite checkpoints run with signed activations and plain AWQ layers: their converter folds the unsigned shift
+    and AdaNorm layout into the stored tensors.
 
     Args:
         model: MLX model to patch in place.

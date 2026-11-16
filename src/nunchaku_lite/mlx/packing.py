@@ -250,11 +250,18 @@ def unpack_awq_w4(qweight: np.ndarray, out_features: int) -> np.ndarray:
     return codes.transpose(0, 2, 1, 3).reshape(out_features, groups * 64).astype(np.uint8)
 
 
+def adanorm_scale_chunks(splits: int) -> list[int]:
+    """AdaNorm chunks holding a scale with ``+1`` folded in: ``scale_msa`` (1) and, for 6 splits, ``scale_mlp`` (4).
+    With 3 splits (``shift, scale, gate``) chunk ``-2`` *is* chunk 1, so the ``+1`` is folded in once."""
+
+    return sorted({1, splits - 2})
+
+
 def undo_adanorm_layout(
     codes: np.ndarray, scale: np.ndarray, zero: np.ndarray, bias: np.ndarray | None, splits: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     """Invert Nunchaku's AdaNorm AWQ layout (output channels interleaved across ``splits`` chunks,
-    ``+1`` folded into the bias of chunks ``1`` and ``-2``), restoring the original ``nn.Linear`` order."""
+    ``+1`` folded into the bias of each scale chunk, see :func:`adanorm_scale_chunks`), restoring the original ``nn.Linear`` order."""
 
     if splits <= 1:
         return codes, scale, zero, bias
@@ -265,7 +272,6 @@ def undo_adanorm_layout(
 
     if bias is not None:
         b = bias.reshape(n // splits, splits).copy()
-        b[:, 1] -= 1
-        b[:, -2] -= 1
+        b[:, adanorm_scale_chunks(splits)] -= 1
         bias = np.ascontiguousarray(b.T).reshape(n)
     return unperm(codes), unperm(scale), unperm(zero), bias

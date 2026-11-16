@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import functools
 import subprocess
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -101,6 +102,8 @@ def resolve_backend(choice: str = "auto", int8_resident_bytes: int | None = None
         return choice
     if not has_neural_accelerators():
         return "dense"
+    if not mps_kernels_available():
+        return "dense"
     if int8_resident_bytes is not None and torch.backends.mps.is_available():
         budget = _AUTO_MEMORY_FRACTION * torch.mps.recommended_max_memory()
         if int8_resident_bytes > budget:
@@ -139,6 +142,23 @@ def configure_backend(model: torch.nn.Module, choice: str = "auto") -> str:
         layer.backend = resolved
     model._nunchaku_lite_backend = resolved
     return resolved
+
+
+@functools.cache
+def mps_kernels_available() -> bool:
+    """Whether the ``nunchaku_lite_kernels`` MPS ops load; ``"auto"`` falls back to ``"dense"`` (with a warning)
+    when they don't, e.g. after ``pip install nunchaku-lite[torch]`` without building the local kernels."""
+
+    try:
+        _kernel_ops()
+    except Exception as exc:  # noqa: BLE001 - any load failure means the kernels are unusable
+        warnings.warn(
+            f'backend="auto" uses the dense MPS fallback: the Metal kernels are unavailable ({exc}). Build them '
+            'with "pip install --no-build-isolation ./nunchaku-lite-kernels" for the faster int8/int4 backends.',
+            stacklevel=3,
+        )
+        return False
+    return True
 
 
 def _kernel_ops():
@@ -241,15 +261,32 @@ def preserve_cache_across_move(module, apply):
 
     A move changes every data pointer; without this, an ``mps -> cpu -> mps`` round trip (CPU offload)
     would look like swapped weights and rebuild the cache.
+
+    The cache keeps its own dtypes (float32 scales, float16 group multipliers) through a dtype cast such
+    as ``module.to(torch.bfloat16)``: cast buffers are replaced by their originals on the new device, since
+    a released ``qweight`` is recovered from them. A cast that changes parameter dtypes invalidates the
+    cache, which is then rebuilt from the cast parameters on the next call.
     """
 
     key = getattr(module, "_nunchaku_lite_mps_key", None)
-    names = _AWQ_KEY_TENSORS if key is not None and key[0] == "awq" else _SVDQ_KEY_TENSORS
-    valid = key is not None and _cache_valid(module, (*key[:2], *_tensor_states(module, names)))
+    names = _AWQ_KEY_TENSORS if hasattr(module, "wzeros") else _SVDQ_KEY_TENSORS
+    before = _tensor_states(module, names)
+    valid = key is not None and _cache_valid(module, (*key[:2], *before))
+    originals = {name: _cached(module, name) for name in getattr(module, "_nunchaku_lite_mps_buffers", ())}
     result = apply()
+    for name, original in originals.items():
+        moved = _cached(module, name)
+        if moved is not None and original is not None and moved.dtype != original.dtype:
+            module.register_buffer(f"_nl_mps_{name}", original.to(moved.device), persistent=False)
+    after = _tensor_states(module, names)
     if valid:
-        module._nunchaku_lite_mps_key = (*key[:2], *_tensor_states(module, names))
+        dtypes_kept = all(_state_dtype(a) == _state_dtype(b) for a, b in zip(before, after))
+        module._nunchaku_lite_mps_key = (*key[:2], *after) if dtypes_kept else None
     return result
+
+
+def _state_dtype(state: tuple | None):
+    return state[3] if state is not None and len(state) == 6 else state
 
 
 def _cache_valid(module, key: tuple) -> bool:

@@ -89,6 +89,7 @@ def _rel(out, ref):
     return float((out.detach().cpu().double() - ref.detach()).norm() / ref.detach().norm())
 
 
+_cached = mps_ops._cached
 requires_mps = pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires an MPS device")
 
 
@@ -287,6 +288,23 @@ def test_svdq_cache_follows_device_moves_and_stays_out_of_state_dict(monkeypatch
     assert not any(key.startswith("_nl_mps_") for key in module.state_dict())
 
 
+@requires_kernels
+@pytest.mark.parametrize("backend", ["int8", "int4"])
+def test_dtype_cast_after_release_keeps_weights_exact(backend):
+    w = _logical(seed=19)
+    w["wscale"] = torch.rand(w["wscale"].shape, generator=torch.Generator().manual_seed(4)) * 0.01 + 0.01  # invertible
+    module = _module(w, "mps", dtype=torch.float32, backend=backend)
+    packed = module.qweight.detach().cpu().clone()
+    x = torch.randn(1, 8, 512)
+    module(x.to("mps"))
+    assert module._nunchaku_lite_qweight_released
+    module.to(torch.bfloat16)  # e.g. pipe.to(torch.bfloat16) after a warm-up
+    assert _cached(module, "wr").dtype == torch.float16 and _cached(module, "wsc").dtype == torch.float32
+    torch.testing.assert_close(module.state_dict()["qweight"].cpu(), packed, rtol=0, atol=0)
+    out = module(x.to("mps", torch.bfloat16))
+    assert _rel(out, _reference(_rounded(w), x.to(torch.bfloat16))) < 2e-2
+
+
 @requires_mps
 def test_cache_tensors_do_not_pin_larger_freed_buffers():
     # The MPS allocator serves a new tensor from a larger cached free buffer and keeps all of it: a cache
@@ -366,12 +384,28 @@ def test_pack_svdq_weight_inverts_unpack():
 )
 def test_auto_backend_resolution(monkeypatch, nax, int8_bytes, expected):
     monkeypatch.setattr(mps_ops, "has_neural_accelerators", lambda: nax)
+    monkeypatch.setattr(mps_ops, "mps_kernels_available", lambda: True)
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
     monkeypatch.setattr(torch.mps, "recommended_max_memory", lambda: int(19e9))  # half = 9.5 GB budget
     assert mps_ops.resolve_backend("auto", None if int8_bytes is None else int(int8_bytes)) == expected
     assert mps_ops.resolve_backend("int4", 1) == "int4"  # explicit choices are kept
     with pytest.raises(ValueError, match="backend must be one of"):
         mps_ops.resolve_backend("w8a8")
+
+
+def test_auto_backend_falls_back_to_dense_without_kernels(monkeypatch):
+    def missing():
+        raise RuntimeError("The installed nunchaku_lite_kernels package has no MPS ops.")
+
+    monkeypatch.setattr(mps_ops, "has_neural_accelerators", lambda: True)
+    monkeypatch.setattr(mps_ops, "_kernel_ops", missing)
+    mps_ops.mps_kernels_available.cache_clear()
+    try:
+        with pytest.warns(UserWarning, match="dense MPS fallback"):
+            assert mps_ops.resolve_backend("auto", int(1e9)) == "dense"
+        assert mps_ops.resolve_backend("int8") == "int8"  # an explicit choice still fails loudly at first use
+    finally:
+        mps_ops.mps_kernels_available.cache_clear()
 
 
 def test_configure_backend_sets_every_layer(monkeypatch):

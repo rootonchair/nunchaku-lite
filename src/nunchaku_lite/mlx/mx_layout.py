@@ -10,7 +10,7 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 
-from .packing import _LR_PACK, _LR_PERM, _S_PERM, _W_PERM, _scale_dims
+from .packing import _LR_PACK, _LR_PERM, _S_PERM, _W_PERM, _scale_dims, adanorm_scale_chunks
 
 _W_PERM_INV = tuple(int(i) for i in np.argsort(_W_PERM))
 _S_PERM_INV = tuple(int(i) for i in np.argsort(_S_PERM))
@@ -96,12 +96,11 @@ def undo_adanorm_channels(t: mx.array, splits: int) -> mx.array:
 
 
 def undo_adanorm_bias(bias: mx.array, splits: int) -> mx.array:
-    """AdaNorm bias: drop the ``+1`` folded into chunks ``1`` and ``-2``, then restore the channel order."""
+    """AdaNorm bias: drop the ``+1`` folded into the scale chunks, then restore the channel order."""
 
     if splits <= 1:
         return bias
     offset = np.zeros(splits, dtype=np.float32)
-    offset[1] += 1
-    offset[-2] += 1
+    offset[adanorm_scale_chunks(splits)] = 1
     n = bias.shape[0]
     return (bias.reshape(n // splits, splits) - mx.array(offset)).T.reshape(n)
