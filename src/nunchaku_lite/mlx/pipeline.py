@@ -25,7 +25,15 @@ from .linear import AWQW4A16Linear, SVDQW4A4Linear, resolve_backend
 from .manifest import RuntimeManifest, apply_runtime_manifest, parse_runtime_manifest
 from .patch import configure_backend, load_checkpoint, load_dense_weights, svdq_layer_from_state
 
-__all__ = ["ManifestAdapter", "PipelineAdapter", "list_adapters", "load_nunchaku_pipeline", "register_adapter"]
+__all__ = [
+    "Flux1Adapter",
+    "Flux2Adapter",
+    "ManifestAdapter",
+    "PipelineAdapter",
+    "list_adapters",
+    "load_nunchaku_pipeline",
+    "register_adapter",
+]
 
 
 class PipelineAdapter(Protocol):
@@ -100,7 +108,7 @@ def load_nunchaku_pipeline(
         raise NotImplementedError("Only INT4 SVDQ checkpoints are supported on MLX (no NVFP4 yet).")
     resolve_backend(backend)  # validate before loading anything
     state, quantization_config = load_checkpoint(checkpoint, return_quantization_config=True)
-    manifest = parse_runtime_manifest(quantization_config)
+    manifest = parse_runtime_manifest(quantization_config, checkpoint_keys=state)
     if manifest is not None and manifest.precision == "fp4":
         raise NotImplementedError("NVFP4 (fp4) checkpoints are not supported on MLX yet; use an INT4 checkpoint.")
     pipeline = pipeline_cls(model_path=str(pretrained_model_name_or_path), **pipeline_kwargs)
@@ -372,5 +380,71 @@ class Flux2Adapter:
         return loaded
 
 
+# ---------------------------------------------------------------------------
+# FLUX.1 (mflux Flux1)
+# ---------------------------------------------------------------------------
+
+
+# Diffusers -> mflux names used when mflux is not importable; with mflux the map comes from FluxWeightMapping.
+_FLUX1_RENAMES = tuple(
+    (f"transformer_blocks.{{block}}.{ff}.{src}", f"transformer_blocks.{{block}}.{ff}.{dst}")
+    for ff in ("ff", "ff_context")
+    for src, dst in (("net.0.proj", "linear1"), ("net.2", "linear2"))
+)
+
+
+def flux1_key_map() -> PrefixMap:
+    """Diffusers -> mflux FLUX.1 transformer name map, derived from mflux's ``FluxWeightMapping``."""
+
+    try:
+        from mflux.models.flux.weights.flux_weight_mapping import FluxWeightMapping
+    except ImportError:
+        return PrefixMap(_FLUX1_RENAMES)
+    return PrefixMap.from_mflux(FluxWeightMapping.get_transformer_mapping())
+
+
+class Flux1Adapter:
+    """Nunchaku Lite FLUX.1 checkpoints on mflux's FLUX.1 transformer (``mflux.models.flux.variants.Flux1``).
+
+    Supports Nunchaku Lite checkpoints (e.g. ``lite-infer/flux.1-dev-nunchaku-lite-int4-r32``): Diffusers module
+    names with one quantized layer per Diffusers linear (separate ``to_q`` / ``to_k`` / ``to_v``, single-block
+    ``proj_out`` over ``[attention, mlp]``), which match mflux's modules one to one. The targets come from the
+    runtime manifest, or from the ``config.json`` target lists of checkpoints that predate it. Original Nunchaku
+    FLUX.1 checkpoints (fused ``qkv_proj``, split single-block projections) are not supported.
+
+    The base pipeline may be pre-quantized (e.g. ``mflux-community/flux-1-dev-mflux-q4``): its transformer is then
+    rebuilt and filled entirely from the Nunchaku checkpoint.
+    """
+
+    target = "flux1"
+
+    def matches(self, pipeline: Any) -> bool:
+        transformer = getattr(pipeline, "transformer", None)
+        cls = type(transformer)
+        return cls.__name__ == "Transformer" and cls.__module__.startswith("mflux.models.flux.model.")
+
+    def patch(self, pipeline: Any, state, *, manifest: RuntimeManifest | None, backend: str, strict: bool) -> None:
+        if manifest is None:
+            raise ValueError(
+                "The FLUX.1 MLX adapter needs a Nunchaku Lite checkpoint (runtime manifest or config.json target "
+                "lists, e.g. lite-infer/flux.1-dev-nunchaku-lite-int4-r32); original Nunchaku FLUX.1 checkpoints "
+                "are not supported on MLX."
+            )
+        rebuilt = _is_quantized_base(pipeline.transformer)
+        if rebuilt:
+            old = pipeline.transformer
+            pipeline.transformer = type(old)(
+                model_config=pipeline.model_config,
+                num_transformer_blocks=len(old.transformer_blocks),
+                num_single_transformer_blocks=len(old.single_transformer_blocks),
+            )
+        loaded = patch_from_manifest(
+            pipeline.transformer, state, manifest, key_map=flux1_key_map(), backend=backend, strict=strict
+        )
+        if rebuilt:
+            _require_complete(pipeline.transformer, loaded)
+
+
 register_adapter(ManifestAdapter())
+register_adapter(Flux1Adapter())
 register_adapter(Flux2Adapter())

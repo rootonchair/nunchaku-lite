@@ -570,31 +570,74 @@ def _awq_g64_channel_maps(device: torch.device) -> tuple[torch.Tensor, torch.Ten
 
 
 @torch.no_grad()
-def dequantize_awq_g64_int32(qweight: torch.Tensor, wscales: torch.Tensor, wzeros: torch.Tensor) -> torch.Tensor:
-    """Dequantize Nunchaku AWQ W4A16 group-64 int32 weights to a dense ``(N, K)`` float32 tensor."""
+def _awq_g64_codes(qweight: torch.Tensor, out_features: int) -> torch.Tensor:
+    """Unsigned 4-bit codes ``(N, K)`` int32 from Nunchaku AWQ W4A16 group-64 int32 ``qweight``."""
 
-    groups, out_features = wscales.shape
     rows = qweight.shape[0]
+    groups = qweight.shape[1] * 2 // 64
     packed = qweight.to(torch.int32).view(rows, groups, 4, 8)
     packed_index, nibble = _awq_g64_channel_maps(qweight.device)
     # Advanced indexing, not index_select: MPS index_select corrupts large-magnitude int32 values.
     selected = packed[..., packed_index]  # (rows, groups, 4, 64)
     codes = (selected >> (4 * nibble).to(torch.int32)) & 0xF
-    codes = codes.permute(0, 2, 1, 3).reshape(out_features, groups, 64).float()
+    return codes.permute(0, 2, 1, 3).reshape(out_features, groups * 64)
+
+
+@torch.no_grad()
+def dequantize_awq_g64_int32(qweight: torch.Tensor, wscales: torch.Tensor, wzeros: torch.Tensor) -> torch.Tensor:
+    """Dequantize Nunchaku AWQ W4A16 group-64 int32 weights to a dense ``(N, K)`` float32 tensor."""
+
+    groups, out_features = wscales.shape
+    codes = _awq_g64_codes(qweight, out_features).reshape(out_features, groups, 64).float()
     scale = wscales.float().t().reshape(out_features, groups, 1)
     zeros = wzeros.float().t().reshape(out_features, groups, 1)
     return (codes * scale + zeros).reshape(out_features, groups * 64)
 
 
+_INT4PACK_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
+@torch.no_grad()
+def _build_awq_int4pack(module, dtype: torch.dtype) -> dict | None:
+    """Convert to PyTorch's MPS 4-bit matmul format (``aten._weight_int4pack_mm``), or ``None`` if unavailable.
+
+    That op computes ``w = (q - 8) * scale + zero`` per group of 64 input channels, from codes packed two per
+    byte with the even input channel in the high nibble. AWQ stores ``w = q * scale + wzero``, so
+    ``zero = wzero + 8 * scale``. Same codes, a quarter of the dense bf16 weight, and about 3x faster for the
+    1-2 row modulation matmuls.
+    """
+
+    if dtype not in _INT4PACK_DTYPES or not hasattr(torch.ops.aten, "_weight_int4pack_mm"):
+        return None
+    n = module.out_features
+    codes = _awq_g64_codes(module.qweight, n).view(n, -1, 2)
+    try:
+        packed = torch.ops.aten._convert_weight_to_int4pack(((codes[..., 0] << 4) | codes[..., 1]).to(torch.uint8), 2)
+    except RuntimeError:
+        return None
+    scale, wzero = module.wscales.float(), module.wzeros.float()  # (K / 64, N)
+    scales_and_zeros = torch.stack([scale, wzero + 8 * scale], dim=-1).to(dtype).contiguous()  # (K / 64, N, 2)
+    return {"w4": packed, "scales_and_zeros": scales_and_zeros}
+
+
 def awq_linear_mps(module, x: torch.Tensor) -> torch.Tensor:
-    """Apply an AWQ W4A16 projection on MPS via a cached dequantized weight (small-M modulation layers)."""
+    """Apply an AWQ W4A16 projection on MPS.
+
+    Uses PyTorch's 4-bit MPS matmul when available (weights stay 4-bit), else a cached dequantized weight.
+    """
 
     if module.group_size != 64:
         raise NotImplementedError("Only group-size-64 AWQ W4A16 weights are supported on MPS.")
 
     key = ("awq", x.dtype, *_tensor_states(module, _AWQ_KEY_TENSORS))
     if not _cache_valid(module, key):
-        dense = dequantize_awq_g64_int32(module.qweight, module.wscales, module.wzeros).to(x.dtype)
-        _store_cache(module, key, {"weight": dense}, {"backend": "awq"})
+        int4pack = _build_awq_int4pack(module, x.dtype)
+        if int4pack is not None:
+            _store_cache(module, key, int4pack, {"backend": "awq_int4pack"})
+        else:
+            dense = dequantize_awq_g64_int32(module.qweight, module.wscales, module.wzeros).to(x.dtype)
+            _store_cache(module, key, {"weight": dense}, {"backend": "awq_dense"})
+    if module._nunchaku_lite_mps_meta["backend"] == "awq_int4pack":
+        return torch.ops.aten._weight_int4pack_mm(x, _cached(module, "w4"), 64, _cached(module, "scales_and_zeros"))
     weight = _cached(module, "weight")
     return F.linear(x, weight.to(x.dtype))

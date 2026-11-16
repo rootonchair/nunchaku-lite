@@ -213,7 +213,7 @@ def patch_transformer(
     resolve_backend(backend)  # validate before loading anything
     state, quantization_config = load_checkpoint(checkpoint, return_quantization_config=True)
     key_map = key_map or (lambda key: key)
-    manifest = parse_runtime_manifest(quantization_config)
+    manifest = parse_runtime_manifest(quantization_config, checkpoint_keys=state)
     if manifest is not None:
         consumed = apply_runtime_manifest(model, state, manifest, key_map=key_map, dtype=dtype)
         load_dense_weights(model, [(key_map(k), v) for k, v in state.items() if k not in consumed], strict)

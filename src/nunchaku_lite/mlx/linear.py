@@ -30,7 +30,8 @@ import numpy as np
 from mlx import nn
 
 from .kernels import TILE_M, has_neural_accelerators, svdq_gemm_w4a8, svdq_gemm_w8a8, svdq_quantize_act_int8
-from .packing import to_kernel_layout, undo_adanorm_layout, unpack_awq_w4, unpack_svdq_int4
+from . import mx_layout as mxl
+from .packing import _LR_PACK, _LR_PERM
 
 __all__ = ["BACKENDS", "GELU_SHIFT", "AWQW4A16Linear", "SVDQW4A4Linear", "resolve_backend"]
 
@@ -104,6 +105,38 @@ def _pack_svdq_qweight(q: mx.array) -> mx.array:
     w = w.transpose(0, 5, 6, 1, 3, 8, 2, 7, 4, 9)
     words = (w << _nibble_shifts()).sum(axis=-1).astype(mx.uint32)
     return words.reshape(n, k // 8).view(mx.int8).reshape(n, k // 2)
+
+
+def _pack_lowrank(w: mx.array, down: bool) -> mx.array:
+    """Lazy MLX twin of :func:`packing.pack_lowrank`: ``down`` ``(R, K)`` -> ``(K, R)``; up ``(N, R)`` -> ``(N, R)``."""
+
+    p = _LR_PACK
+    if down:
+        r, c = w.shape
+        w = w.reshape(r // p, p, c // p, p).transpose(2, 0, 1, 3)
+    else:
+        c, r = w.shape
+        w = w.reshape(c // p, p, r // p, p).transpose(0, 2, 1, 3)
+    return w.reshape(c // p, r // p, 2, 8, 1, 2, 4, 2).transpose(_LR_PERM).reshape(c, r)
+
+
+def _redo_adanorm_layout(t: mx.array, splits: int) -> mx.array:
+    """Inverse of the channel un-permutation in :func:`packing.undo_adanorm_layout` (lazy)."""
+
+    if splits <= 1:
+        return t
+    n = t.shape[0]
+    return t.reshape(splits, n // splits, *t.shape[1:]).swapaxes(0, 1).reshape(t.shape)
+
+
+def _pack_awq_qweight(codes: mx.array) -> mx.array:
+    """Lazy MLX twin of :func:`packing.pack_awq_w4`: unsigned codes ``(N, K)`` -> int32 ``(N / 4, K / 2)``."""
+
+    oc, ic = codes.shape
+    w = codes.astype(mx.uint32).reshape(-1, 4, 8)
+    w = w[:, 0] | (w[:, 1] << 4) | (w[:, 2] << 8) | (w[:, 3] << 12)
+    w = w.reshape(oc // 4, 4, ic // 64, 16).transpose(0, 2, 1, 3).reshape(oc // 4, ic)
+    return w.astype(mx.uint16).view(mx.int32).reshape(oc // 4, ic // 2)
 
 
 class SVDQW4A4Linear(nn.Module):
@@ -193,11 +226,18 @@ class SVDQW4A4Linear(nn.Module):
         ):
             return cached
         cached = self._build_cache(backend, dtype)
+        # Release checkpoint copies the backend copy duplicates: they become lazy re-packs of the cache, costing no
+        # memory until evaluated (e.g. when saving weights). Evaluating them reproduces the exact checkpoint bytes.
         if cached.pop("q_invertible"):
-            # Release the packed checkpoint copy: qweight becomes a lazy re-pack of the backend copy, costing no
-            # memory until evaluated (e.g. when saving weights). Evaluating it reproduces the exact packed bytes.
             self.qweight = _pack_svdq_qweight(self._q_from_cache(cached))
-            params = self._params()
+        rank = self.proj_down.shape[1]
+        if cached["down_t"].dtype == self.proj_down.dtype:
+            self.proj_down = _pack_lowrank(cached["down_t"][:, :rank].T, down=True)
+        if backend == "dense":
+            self.proj_up = _pack_lowrank(cached["up_t"].T[:, :rank], down=False)  # stored in the checkpoint dtype
+        elif cached.pop("up_invertible"):
+            self.proj_up = _pack_lowrank(cached["lup"][:, :rank], down=False).astype(self.proj_up.dtype)
+        params = self._params()
         cached["params"] = params  # identity check: load_weights / update replace the arrays
         self._cache = cached
         return cached
@@ -216,58 +256,59 @@ class SVDQW4A4Linear(nn.Module):
         return q.astype(mx.int32).reshape(n, k)
 
     def _build_cache(self, backend: str, dtype) -> dict:
-        weights = unpack_svdq_int4(
-            qweight=np.array(self.qweight).astype(np.int8),
-            wscales=_to_numpy(self.wscales),
-            smooth_factor=_to_numpy(self.smooth_factor),
-            proj_down=_to_numpy(self.proj_down),
-            proj_up=_to_numpy(self.proj_up),
-            bias=None if self.bias is None else _to_numpy(self.bias),
-        )
-        rank = weights.down.shape[0]
+        """Convert the checkpoint tensors to the backend's layout on the GPU (bit-identical to the NumPy
+        references in :mod:`.packing`) and evaluate the result, so the cache holds no graph back to them."""
+
+        n, k = self.out_features, self.in_features
+        q = mxl.unpack_weight(self.qweight)  # (N, K) int32
+        wscale = mxl.unpack_scale(self.wscales, n)  # (N, K / 64) float32
+        down = mxl.unpack_lowrank(self.proj_down, down=True)  # (R, K) float32
+        up = mxl.unpack_lowrank(self.proj_up, down=False)  # (N, R) float32
+        rank = down.shape[0]
         rank_pad = -rank % 32 if rank else 32  # kernels need a non-empty rank that is a multiple of 32
-        down = np.pad(weights.down, ((0, rank_pad), (0, 0)))
-        up = np.pad(weights.up, ((0, 0), (0, rank_pad)))
+        down = mx.pad(down, [(0, rank_pad), (0, 0)])
+        up = mx.pad(up, [(0, 0), (0, rank_pad)])
         cache = {
             "backend": backend,
             "dtype": dtype,
             "shift": mx.array([GELU_SHIFT if self.act_unsigned else 0.0], dtype=mx.float32),
-            "inv_smooth": mx.array(1.0 / weights.smooth.astype(np.float32)),
-            "down_t": mx.array(np.ascontiguousarray(down.T)).astype(dtype),  # (K, R)
-            "bias": None if weights.bias is None else mx.array(weights.bias.astype(np.float32)),
+            "inv_smooth": 1.0 / mxl.unpack_scale(self.smooth_factor, k).reshape(k),
+            # Low-rank weights stay in the checkpoint dtype whatever the activation dtype (mflux FLUX.1 runs float32
+            # activations on bf16 checkpoints): same values, half the memory, and the checkpoint copy can be released.
+            "down_t": down.T.astype(self.proj_down.dtype),  # (K, R)
+            "bias": None if self.bias is None else mxl.unpack_scale(self.bias, n).reshape(n),
         }
         if backend == "dense":
-            n, k = weights.q.shape
             # MLX affine 4-bit: w = scale * u + bias, with u = q + 8 in [0, 15] (lossless).
-            u = (weights.q.astype(np.int16) + 8).astype(np.uint32).reshape(n, k // 8, 8)
-            packed = np.zeros((n, k // 8), dtype=np.uint32)
-            for i in range(8):
-                packed |= u[..., i] << (4 * i)
-            cache["qw"] = mx.array(packed)
-            cache["qscales"] = mx.array(weights.wscale.astype(np.float32)).astype(dtype)
+            cache["qw"] = _pack_nibbles_u32(q + 8)
+            cache["qscales"] = wscale.astype(dtype)
             cache["qbiases"] = (-8.0 * cache["qscales"].astype(mx.float32)).astype(dtype)
-            cache["up_t"] = mx.array(np.ascontiguousarray(up.T)).astype(dtype)  # (R, N)
+            cache["up_t"] = up.T.astype(self.proj_up.dtype)  # (R, N)
             cache["q_invertible"] = True  # the affine packing stores q + 8 exactly
+            mx.eval([v for v in cache.values() if isinstance(v, mx.array)])
             return cache
 
         lr_dtype = mx.bfloat16 if dtype == mx.bfloat16 else mx.float16  # low-rank runs on the accelerators
-        if lr_dtype == mx.float16 and np.abs(up).max() > 65504:
+        if lr_dtype == mx.float16 and mx.abs(up).max().item() > 65504:
             raise ValueError("proj_up values exceed float16 range.")
-        layout = to_kernel_layout(weights)
+        wsc, wr = mxl.kernel_scales(wscale)
         cache["lr_dtype"] = lr_dtype
-        cache["lup"] = mx.array(up.astype(np.float32)).astype(lr_dtype)  # (N, R)
-        cache["wsc"] = mx.array(layout["wsc"])
-        cache["wr"] = mx.array(layout["wr"])
+        cache["lup"] = up.astype(lr_dtype)  # (N, R)
+        cache["wsc"] = wsc
+        cache["wr"] = wr.T  # (K / 64, N)
+        checks = {"up_invertible": mx.array_equal(cache["lup"].astype(mx.float32), up)}
         if backend == "int8":
-            cache["w8"] = mx.array(layout["w8"])
-            n, k = weights.q.shape
-            recovered = np.rint(
-                layout["w8"].astype(np.float32).reshape(n, k // 64, 64) / layout["wr"].T.astype(np.float32)[..., None]
-            ).reshape(n, k)
-            cache["q_invertible"] = bool(np.array_equal(recovered, weights.q))  # every group multiplier >= 1
+            cache["w8"] = mxl.kernel_w8(q, wr)
+            recovered = mx.round(
+                cache["w8"].astype(mx.float32).reshape(n, k // 64, 64) / wr.astype(mx.float32)[..., None]
+            )
+            checks["q_invertible"] = mx.array_equal(recovered.reshape(n, k), q)  # every group multiplier >= 1
         else:
-            cache["w4"] = mx.array(layout["w4"])
+            cache["w4"] = mxl.kernel_w4(q)
             cache["q_invertible"] = True
+        # proj_up can be released when lup holds its values exactly (e.g. bf16 checkpoint values in fp16)
+        mx.eval([v for v in (*cache.values(), *checks.values()) if isinstance(v, mx.array)])
+        cache.update({name: bool(flag.item()) for name, flag in checks.items()})
         return cache
 
     # ---------------------------------------------------------------- forward
@@ -284,7 +325,7 @@ class SVDQW4A4Linear(nn.Module):
         dtype = x.dtype
         xs = ((x.astype(mx.float32) + c["shift"]) * c["inv_smooth"]).astype(dtype)
         out = mx.quantized_matmul(xs, c["qw"], c["qscales"], c["qbiases"], transpose=True, group_size=64, bits=4)
-        out = out + (x @ c["down_t"]) @ c["up_t"]
+        out = out + ((x @ c["down_t"]) @ c["up_t"]).astype(dtype)
         if c["bias"] is not None:
             out = out + c["bias"].astype(dtype)
         return out
@@ -365,19 +406,26 @@ class AWQW4A16Linear(nn.Module):
         cached = getattr(self, "_cache", None)
         if cached is not None and cached["dtype"] == dtype and all(a is b for a, b in zip(cached["params"], params)):
             return cached
-        codes = unpack_awq_w4(np.array(self.qweight).astype(np.int32), self.out_features)
-        scale = _to_numpy(self.wscales).T.astype(np.float32)  # (N, G)
-        zero = _to_numpy(self.wzeros).T.astype(np.float32)
-        bias = None if self.bias is None else _to_numpy(self.bias).astype(np.float32)
-        codes, scale, zero, bias = undo_adanorm_layout(codes, scale, zero, bias, self.adanorm_splits)
+        splits = self.adanorm_splits
+        codes = mxl.undo_adanorm_channels(mxl.unpack_awq_codes(self.qweight, self.out_features), splits)  # (N, K)
+        scale = mxl.undo_adanorm_channels(self.wscales.T.astype(mx.float32), splits)  # (N, G)
+        zero = mxl.undo_adanorm_channels(self.wzeros.T.astype(mx.float32), splits)
+        bias = None if self.bias is None else mxl.undo_adanorm_bias(self.bias.astype(mx.float32), splits)
         cached = {
             "dtype": dtype,
-            "wq": _pack_nibbles_u32(mx.array(codes)),
-            "scales": mx.array(scale).astype(dtype),
-            "biases": mx.array(zero).astype(dtype),
-            "bias": None if bias is None else mx.array(bias),
+            "wq": _pack_nibbles_u32(codes),
+            "scales": scale.astype(dtype),
+            "biases": zero.astype(dtype),
+            "bias": bias,
         }
-        cached["params"] = params
+        mx.eval([v for v in cached.values() if isinstance(v, mx.array)])  # drop the graph back to the checkpoint
+        # Release the checkpoint copies (as SVDQW4A4Linear does): lazy re-packs of the cache, exact when evaluated.
+        self.qweight = _pack_awq_qweight(_redo_adanorm_layout(_unpack_nibbles_u32(cached["wq"]), splits))
+        if dtype == self.wscales.dtype:
+            self.wscales = _redo_adanorm_layout(cached["scales"], splits).T
+        if dtype == self.wzeros.dtype:
+            self.wzeros = _redo_adanorm_layout(cached["biases"], splits).T
+        cached["params"] = (self.qweight, self.wscales, self.wzeros, self.bias)
         self._cache = cached
         return cached
 

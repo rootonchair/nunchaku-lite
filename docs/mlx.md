@@ -70,6 +70,20 @@ model = load_nunchaku_pipeline(
 image = model.generate_image(seed=1, prompt="A cat holding a sign that says hello world", num_inference_steps=4)
 ```
 
+FLUX.1-dev works the same way with mflux's `Flux1`:
+
+```python
+from mflux.models.flux.variants.txt2img.flux import Flux1
+
+model = load_nunchaku_pipeline(
+    "mflux-community/flux-1-dev-mflux-q4",
+    pipeline_cls=Flux1,
+    checkpoint="lite-infer/flux.1-dev-nunchaku-lite-int4-r32",
+    model_config=ModelConfig.dev(),
+)
+image = model.generate_image(seed=0, prompt="A red fox in a misty forest", num_inference_steps=20, guidance=3.5)
+```
+
 `checkpoint` accepts a Diffusers repo on the Hub (`org/repo`, as above), a local
 repo or checkpoint folder (sharded files are merged), a `.safetensors` file, or
 `org/repo/path/file.safetensors`.
@@ -82,12 +96,16 @@ Two checkpoint layouts are supported, as in `nunchaku_lite`:
   names are Diffusers names. The adapter maps them to mflux's modules with a
   name map built from mflux's own Diffusers weight mapping, so no per-model
   table is needed. The manifest parser is the same code the PyTorch runtime
-  uses (`nunchaku_lite.manifest`).
+  uses (`nunchaku_lite.manifest`). Older lite checkpoints without a manifest
+  (`lite-infer/flux.1-dev-nunchaku-lite-int4-r32`) list their quantized layers
+  in `config.json` (`svdq_w4a4.targets`, `awq_w4a16.targets`); a manifest is
+  built from those lists.
 - **Original Nunchaku checkpoints** (for example
   `tonera/FLUX.2-klein-4B-Nunchaku/svdq-int4_r32-FLUX.2-klein-4B-Nunchaku.safetensors`).
   Keys are normalized with the same `convert_flux2_state_dict` as
   `nunchaku_lite`. Fused checkpoint layers such as `to_qkv` then serve mflux's
-  separate `to_q`/`to_k`/`to_v` with one matmul.
+  separate `to_q`/`to_k`/`to_v` with one matmul. Supported for FLUX.2 only;
+  original Nunchaku FLUX.1 checkpoints are not supported on MLX.
 
 The base pipeline can be a bf16 repo or a pre-quantized mflux repo (`-q4`,
 `-q8`). For a pre-quantized base, the transformer is rebuilt from the
@@ -99,7 +117,8 @@ On 24 GB Macs, cap MLX's buffer cache for the 9B (`mx.set_cache_limit(1 << 30)`)
 Otherwise freed buffers (up to about 9 GB) stay resident, and the first step of
 every image swaps.
 
-Registered adapters: `flux2` (FLUX.2 Klein), and `manifest`, a generic adapter
+Registered adapters: `flux1` (FLUX.1, mflux `Flux1`), `flux2` (FLUX.2 Klein),
+and `manifest`, a generic adapter
 for any transformer whose module names match the manifest's. `target="auto"`
 picks the model-family adapter, else `manifest` when the checkpoint has one.
 Requires `pip install mflux`.
@@ -208,7 +227,7 @@ and low-rank branch) does not change these figures.
 - INT4 SVDQ checkpoints only. NVFP4 is not supported yet.
 - `N % 64 == 0` and `K % 64 == 0`. Tokens are padded internally. The low-rank
   dimension is zero-padded to a multiple of 32.
-- Pipelines: only the `flux2` adapter (mflux FLUX.2 Klein) exists so far.
+- Pipelines: adapters exist for FLUX.1 (`flux1`) and FLUX.2 Klein (`flux2`).
   Other families can use the `manifest` adapter or `patch_transformer` with a
   `key_map` (for example `PrefixMap.from_mflux(<mflux WeightMapping>.get_transformer_mapping())`),
   or register an adapter.

@@ -6,6 +6,7 @@ of torch and diffusers imports (``tests/test_torch_free_imports.py``).
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -79,10 +80,20 @@ class RuntimeManifest:
         return int(self.requirements.get("rank", 32))
 
 
-def parse_runtime_manifest(quantization_config: dict[str, Any]) -> RuntimeManifest | None:
-    """Parse and validate ``quantization_config.runtime_manifest`` if present."""
+def parse_runtime_manifest(
+    quantization_config: dict[str, Any], checkpoint_keys: Iterable[str] | None = None
+) -> RuntimeManifest | None:
+    """Parse and validate ``quantization_config.runtime_manifest`` if present.
+
+    Some Nunchaku Lite checkpoints (e.g. ``lite-infer/flux.1-dev-nunchaku-lite-int4-r32``) predate the runtime
+    manifest. Their ``config.json`` lists the quantized modules instead (``svdq_w4a4.targets`` /
+    ``awq_w4a16.targets``, one per Diffusers linear, no structural patches). When ``checkpoint_keys`` is given, a
+    manifest is built from those lists, with ``has_bias`` taken from the presence of ``<target>.bias``.
+    """
 
     raw = quantization_config.get("runtime_manifest")
+    if raw is None and checkpoint_keys is not None:
+        raw = _manifest_from_target_lists(quantization_config, set(checkpoint_keys))
     if raw is None:
         return None
     if not isinstance(raw, dict):
@@ -127,6 +138,67 @@ def parse_runtime_manifest(quantization_config: dict[str, Any]) -> RuntimeManife
         structural_patches=tuple(_validate_structural_patch(patch) for patch in structural_patches),
         targets=tuple(_parse_target(index, target) for index, target in enumerate(targets_raw)),
     )
+
+
+_TARGET_LIST_OPS = ("svdq_w4a4", "awq_w4a16")
+
+
+def _manifest_from_target_lists(quantization_config: dict[str, Any], keys: set[str]) -> dict[str, Any] | None:
+    if quantization_config.get("quant_method") != "nunchaku_lite":
+        return None
+    targets: list[dict[str, Any]] = []
+    precisions: set[str] = set()
+    rank = 0
+    for op in _TARGET_LIST_OPS:
+        section = quantization_config.get(op)
+        if not isinstance(section, dict):
+            continue
+        names = section.get("targets")
+        if not isinstance(names, list):
+            raise TypeError(f"quantization_config.{op}.targets must be a list of module names.")
+        precision = section.get("precision", "int4")
+        precision = "fp4" if precision == "nvfp4" else precision
+        group_size = section.get("group_size", 64)
+        op_rank = section.get("rank", 0) if op == "svdq_w4a4" else 0
+        if op == "svdq_w4a4":
+            rank = op_rank
+        precisions.add(precision)
+        targets.extend(
+            {
+                "name": name,
+                "checkpoint_prefix": name,
+                "source_modules": [name],
+                "roles": [],
+                "kind": "linear",
+                "nunchaku_op": op,
+                "precision": precision,
+                "group_size": group_size,
+                "rank": op_rank,
+                "has_bias": f"{name}.bias" in keys,
+                "op_options": {},
+                "activation": {},
+            }
+            for name in names
+        )
+    if not targets:
+        return None
+    precision = precisions.pop() if len(precisions) == 1 else "mixed"
+    return {
+        "schema": SCHEMA,
+        "version": SUPPORTED_VERSION,
+        "component": "transformer",
+        "nunchaku_format_version": SUPPORTED_FORMAT_VERSION,
+        "producer": {"name": "nunchaku_lite.config_target_lists", "version": "1"},
+        "requirements": {
+            "method": "svdquant",
+            "precision": precision,
+            "rank": rank,
+            "weight_dtype": precision,
+            "activation_dtype": precision,
+        },
+        "structural_patches": [],
+        "targets": targets,
+    }
 
 
 def _validate_producer(producer: dict[str, Any]) -> None:

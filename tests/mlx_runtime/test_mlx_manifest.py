@@ -1,5 +1,6 @@
 """Runtime-manifest checkpoints (Nunchaku Lite / lite-infer layout) and the Diffusers -> MLX name map."""
 
+import dataclasses
 import json
 from types import SimpleNamespace
 
@@ -20,7 +21,8 @@ from nunchaku_lite.mlx import (
 )
 from nunchaku_lite.mlx.manifest import SplitLinearInput, SplitLinearOutput
 from nunchaku_lite.mlx.packing import pack_awq_w4
-from nunchaku_lite.mlx.pipeline import _FLUX2_RENAMES, flux2_key_map
+from nunchaku_lite.manifest import parse_runtime_manifest
+from nunchaku_lite.mlx.pipeline import _FLUX1_RENAMES, _FLUX2_RENAMES, flux1_key_map, flux2_key_map
 
 D, HEAD_DIM, MLP = 256, 128, 128
 
@@ -311,6 +313,176 @@ def test_quantized_base_transformer_is_rebuilt_from_the_checkpoint(tmp_path):
     folder = _save(tmp_path / "incomplete", state, manifest)
     with pytest.raises(ValueError, match="missing from it, e.g. 'x_embedder.weight'"):
         load_nunchaku_pipeline("p", pipeline_cls=QuantizedBaseFlux2Pipeline, checkpoint=folder, backend="dense")
+
+
+# ---------------------------------------------------------------------------
+# FLUX.1 (lite-infer layout without a runtime manifest: config.json target lists)
+# ---------------------------------------------------------------------------
+
+
+class _Flux1Attn(nn.Module):
+    def __init__(self, joint: bool):
+        super().__init__()
+        names = ("to_q", "to_k", "to_v") + (("add_q_proj", "add_k_proj", "add_v_proj", "to_add_out") if joint else ())
+        for name in names:
+            setattr(self, name, nn.Linear(D, D))
+        if joint:
+            self.to_out = [nn.Linear(D, D)]
+
+
+class _Flux1FF(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear1, self.linear2 = nn.Linear(D, MLP), nn.Linear(MLP, D)
+
+
+class _Flux1Joint(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.norm1, self.norm1_context = _Norm(), _Norm()
+        self.attn, self.ff, self.ff_context = _Flux1Attn(True), _Flux1FF(), _Flux1FF()
+
+
+class _Flux1Single(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.norm, self.attn = _Norm(), _Flux1Attn(False)
+        self.proj_mlp, self.proj_out = nn.Linear(D, MLP), nn.Linear(D + MLP, D)
+
+
+class Transformer(nn.Module):
+    """Miniature mflux FLUX.1 transformer (mflux module names and constructor)."""
+
+    def __init__(self, model_config=None, num_transformer_blocks=1, num_single_transformer_blocks=1):
+        super().__init__()
+        self.x_embedder = nn.Linear(128, D)
+        self.transformer_blocks = [_Flux1Joint() for _ in range(num_transformer_blocks)]
+        self.single_transformer_blocks = [_Flux1Single() for _ in range(num_single_transformer_blocks)]
+
+
+Transformer.__module__ = "mflux.models.flux.model.flux_transformer.transformer"
+
+
+class FakeFlux1Pipeline:
+    model_config = SimpleNamespace(transformer_overrides={})
+
+    def __init__(self, model_path: str, quantize: int | None = None, **kwargs):
+        self.transformer = Transformer(self.model_config)
+        if quantize:
+            nn.quantize(self.transformer, group_size=64, bits=quantize)
+
+
+_FLUX1_SVDQ = {
+    **{f"transformer_blocks.0.attn.{n}": (D, D) for n in ("to_q", "to_k", "to_v", "add_q_proj", "to_out.0")},
+    "transformer_blocks.0.ff.net.0.proj": (MLP, D),
+    "transformer_blocks.0.ff_context.net.2": (D, MLP),
+    "single_transformer_blocks.0.attn.to_q": (D, D),
+    "single_transformer_blocks.0.proj_mlp": (MLP, D),
+    "single_transformer_blocks.0.proj_out": (D, D + MLP),
+}
+_FLUX1_AWQ = {"transformer_blocks.0.norm1.linear": (6 * 64, D), "single_transformer_blocks.0.norm.linear": (6 * 64, D)}
+
+
+def _lite_flux1_repo(root):
+    """A lite-infer FLUX.1 repo: biases on every target, targets listed in config.json, no safetensors metadata."""
+
+    rng = np.random.default_rng(7)
+    ws, state, biases = {}, {}, {}
+    for prefix, (n, _) in {**_FLUX1_SVDQ, **_FLUX1_AWQ}.items():
+        if prefix != "transformer_blocks.0.attn.to_k":  # one target without bias
+            biases[prefix] = rng.standard_normal(n).astype(np.float32)
+    for i, (prefix, (n, k)) in enumerate(_FLUX1_SVDQ.items()):
+        ws[prefix] = dataclasses.replace(_svdq(n, k, 500 + i), bias=biases.get(prefix))
+        state.update({f"{prefix}.{name}": v for name, v in pack_svdq_int4(ws[prefix]).items()})
+    for i, (prefix, (n, k)) in enumerate(_FLUX1_AWQ.items()):
+        tensors, ws[prefix], _ = _awq(n, k, 600 + i)
+        state.update({f"{prefix}.{name}": v for name, v in tensors.items()})
+        state[f"{prefix}.bias"] = biases[prefix]  # AWQ bias: plain nn.Linear order
+    tr = Transformer()
+    for path, value in nn.utils.tree_flatten(tr.parameters()):
+        diffusers = path.replace(".linear1.", ".net.0.proj.").replace(".linear2.", ".net.2.")
+        if not any(diffusers.startswith(p + ".") for p in (*_FLUX1_SVDQ, *_FLUX1_AWQ)):
+            state[diffusers] = np.full(value.shape, 0.5, np.float32)
+    folder = _save(root / "transformer", state)
+    config = {
+        "quant_method": "nunchaku_lite",
+        "svdq_w4a4": {"precision": "int4", "group_size": 64, "rank": 32, "targets": sorted(_FLUX1_SVDQ)},
+        "awq_w4a16": {"precision": "int4", "group_size": 64, "targets": sorted(_FLUX1_AWQ)},
+    }
+    (folder / "config.json").write_text(
+        json.dumps({"_class_name": "FluxTransformer2DModel", "quantization_config": config})
+    )
+    return ws, state, config, biases
+
+
+def test_manifest_from_config_target_lists(tmp_path):
+    _, state, config, _ = _lite_flux1_repo(tmp_path)
+    assert parse_runtime_manifest(config) is None  # without checkpoint keys: no manifest
+    assert parse_runtime_manifest({**config, "quant_method": "other"}, checkpoint_keys=state) is None
+    manifest = parse_runtime_manifest(config, checkpoint_keys=state)
+    assert len(manifest.targets) == len(_FLUX1_SVDQ) + len(_FLUX1_AWQ) and manifest.structural_patches == ()
+    assert manifest.precision == "int4" and manifest.rank == 32
+    by_name = {t.checkpoint_prefix: t for t in manifest.targets}
+    assert by_name["transformer_blocks.0.attn.to_q"].has_bias and by_name["transformer_blocks.0.attn.to_q"].rank == 32
+    assert not by_name["transformer_blocks.0.attn.to_k"].has_bias
+    assert by_name["transformer_blocks.0.norm1.linear"].nunchaku_op == "awq_w4a16"
+
+
+@pytest.mark.parametrize("quantize", [None, 4])
+def test_lite_flux1_repo_loads_from_config_target_lists(tmp_path, quantize):
+    ws, _, _, biases = _lite_flux1_repo(tmp_path / "repo")
+    pipe = load_nunchaku_pipeline(
+        "base", pipeline_cls=FakeFlux1Pipeline, checkpoint=tmp_path / "repo", backend="dense", quantize=quantize
+    )
+    assert pipe._nunchaku_lite_target == "flux1"
+    tr = pipe.transformer
+    assert not any(isinstance(m, nn.QuantizedLinear) for _, m in tr.named_modules())
+    np.testing.assert_allclose(np.array(tr.x_embedder.weight), 0.5)
+    np.testing.assert_allclose(np.array(tr.transformer_blocks[0].attn.add_v_proj.weight), 0.5)  # unquantized
+    np.testing.assert_allclose(np.array(tr.transformer_blocks[0].ff.linear2.weight), 0.5)  # Diffusers ff.net.2
+
+    def check(module, prefix, k):
+        x = np.random.default_rng(len(prefix)).standard_normal((4, k)).astype(np.float32)
+        ref = x.astype(np.float64) @ ws[prefix].T if prefix in _FLUX1_AWQ else _svdq_ref(ws[prefix], x)
+        if prefix in biases:
+            ref = ref + biases[prefix]
+        assert _rel(_run(module, x), ref) < 2e-2, prefix
+
+    block, single = tr.transformer_blocks[0], tr.single_transformer_blocks[0]
+    assert isinstance(block.attn.to_k, SVDQW4A4Linear) and "bias" not in block.attn.to_k
+    check(block.attn.to_q, "transformer_blocks.0.attn.to_q", D)
+    check(block.attn.to_k, "transformer_blocks.0.attn.to_k", D)
+    check(block.attn.to_out[0], "transformer_blocks.0.attn.to_out.0", D)
+    check(block.ff.linear1, "transformer_blocks.0.ff.net.0.proj", D)
+    check(block.ff_context.linear2, "transformer_blocks.0.ff_context.net.2", MLP)
+    check(block.norm1.linear, "transformer_blocks.0.norm1.linear", D)
+    check(single.proj_out, "single_transformer_blocks.0.proj_out", D + MLP)
+    check(single.norm.linear, "single_transformer_blocks.0.norm.linear", D)
+
+
+def test_flux1_adapter_rejects_checkpoints_without_targets():
+    with pytest.raises(ValueError, match="original Nunchaku FLUX.1 checkpoints"):
+        load_nunchaku_pipeline(
+            "p", pipeline_cls=FakeFlux1Pipeline, checkpoint={"x_embedder.weight": mx.zeros((D, 128))}
+        )
+
+
+def test_flux1_key_map_matches_mflux_mapping():
+    pytest.importorskip("mflux")
+    key_map, fallback = flux1_key_map(), PrefixMap(_FLUX1_RENAMES)
+    for name in (
+        "transformer_blocks.3.ff.net.0.proj.qweight",
+        "transformer_blocks.3.ff.net.2.bias",
+        "transformer_blocks.0.ff_context.net.0.proj.wscales",
+        "transformer_blocks.18.ff_context.net.2.qweight",
+        "transformer_blocks.0.attn.to_out.0.qweight",
+        "transformer_blocks.0.norm1_context.linear.wzeros",
+        "single_transformer_blocks.37.proj_out.qweight",
+        "single_transformer_blocks.0.norm.linear.qweight",
+        "time_text_embed.guidance_embedder.linear_1.weight",
+    ):
+        assert key_map(name) == fallback(name), name
+    assert key_map("transformer_blocks.3.ff.net.2.bias") == "transformer_blocks.3.ff.linear2.bias"
 
 
 # ---------------------------------------------------------------------------

@@ -12,7 +12,14 @@ from nunchaku_lite.mlx import (
     pack_svdq_int4,
     patch_transformer,
 )
-from nunchaku_lite.mlx.packing import pack_awq_w4
+from nunchaku_lite.mlx import mx_layout
+from nunchaku_lite.mlx.packing import (
+    pack_awq_w4,
+    to_kernel_layout,
+    undo_adanorm_layout,
+    unpack_awq_w4,
+    unpack_svdq_int4,
+)
 
 needs_nax = pytest.mark.skipif(not has_neural_accelerators(), reason="requires an M5-class GPU")
 BACKENDS = ["dense", pytest.param("int8", marks=needs_nax), pytest.param("int4", marks=needs_nax)]
@@ -229,6 +236,34 @@ def test_qweight_released_as_exact_lazy_repack(backend):
     assert _rel_err(np.array(layer(x)), _reference(w2, np.array(x), 0.0)) < tol
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize(
+    ("dtype", "act_dtype"),
+    [(mx.bfloat16, mx.bfloat16), (mx.float32, mx.float32), (mx.bfloat16, mx.float32)],  # last: mflux FLUX.1
+)
+def test_lowrank_released_as_exact_lazy_repack(backend, dtype, act_dtype):
+    w = _weights(seed=34)
+    layer = _layer(w, dtype=dtype, backend=backend)
+    names = ("qweight", "wscales", "smooth_factor", "proj_down", "proj_up", "bias")
+    before = {n: getattr(layer, n) for n in names}
+    expected = {n: np.array(v.astype(mx.float32) if v.dtype != mx.int8 else v) for n, v in before.items()}
+    x = np.random.default_rng(35).standard_normal((4, w.in_features)).astype(np.float32)
+    out = layer(mx.array(x).astype(act_dtype))
+    assert out.dtype == act_dtype
+    tol = 2e-3 if backend == "dense" and dtype == act_dtype == mx.float32 else 2e-2
+    assert _rel_err(np.array(out.astype(mx.float32)), _reference(w, x, 0.0)) < tol
+    for n in names:  # released or not, every parameter evaluates to the exact checkpoint values and dtype
+        v = getattr(layer, n)
+        assert v.dtype == before[n].dtype and v.shape == before[n].shape, n
+        np.testing.assert_array_equal(np.array(v.astype(mx.float32) if v.dtype != mx.int8 else v), expected[n])
+    if dtype == mx.bfloat16:  # the low-rank cache keeps bf16 checkpoint values exactly: the copies are released
+        assert layer.proj_down is not before["proj_down"]
+        # proj_up's kernel copy is fp16 for float32 activations: released only when every value is exact in fp16
+        # (these random values include fp16 subnormals, so it is kept)
+        released_up = layer.proj_up is not before["proj_up"]
+        assert released_up == (backend == "dense" or act_dtype == mx.bfloat16)
+
+
 @needs_nax
 def test_backend_switch_after_release_and_non_invertible_kept():
     w = _weights(seed=32)
@@ -297,6 +332,26 @@ def test_awq_adanorm_layout_restores_original_order():
     assert _rel_err(np.array(layer(mx.array(x))), x.astype(np.float64) @ dense.T + bias) < 2e-3
 
 
+@pytest.mark.parametrize("splits", [1, 6])
+def test_awq_checkpoint_arrays_released_as_exact_lazy_repack(splits):
+    codes, scale, zero, bias, dense = _awq_case(n=384, seed=44)
+    tensors = {
+        k: v.astype(mx.bfloat16) if k != "qweight" else v for k, v in _awq_tensors(codes, scale, zero, bias).items()
+    }
+    layer = AWQW4A16Linear(256, 384, adanorm_splits=splits, dtype=mx.bfloat16)
+    layer.load_weights(list(tensors.items()))
+    before = {n: getattr(layer, n) for n in ("qweight", "wscales", "wzeros")}
+    x = mx.array(np.random.default_rng(45).standard_normal((2, 256)).astype(np.float32)).astype(mx.bfloat16)
+    out = np.array(layer(x).astype(mx.float32))
+    cache = layer._cache
+    for n, original in before.items():
+        v = getattr(layer, n)
+        assert v is not original and v.dtype == original.dtype and v.shape == original.shape, n
+        np.testing.assert_array_equal(np.array(v.astype(mx.float32)), np.array(original.astype(mx.float32)))
+    np.testing.assert_array_equal(np.array(layer(x).astype(mx.float32)), out)
+    assert layer._cache is cache  # no rebuild after release
+
+
 def test_patch_transformer_loads_awq_with_adanorm_splits():
     codes, scale, zero, bias, dense = _awq_case(n=512, k=256, seed=44)
     ckpt = {f"layers.0.{k}": v for k, v in _awq_tensors(codes, scale, zero, bias).items()}
@@ -306,3 +361,87 @@ def test_patch_transformer_loads_awq_with_adanorm_splits():
     x = np.random.default_rng(45).standard_normal((2, 256)).astype(np.float32)
     out = np.array(model.layers[0](mx.array(x).astype(mx.bfloat16)).astype(mx.float32))
     assert _rel_err(out, x.astype(np.float64) @ dense.T + bias) < 2e-2
+
+
+# ---------------------------------------------------------------------------
+# GPU layout conversion: bit-identical to the NumPy references in packing.py
+# ---------------------------------------------------------------------------
+
+
+def _np(a):
+    return np.array(a.astype(mx.float32)) if a.dtype in (mx.bfloat16, mx.float16) else np.array(a)
+
+
+@pytest.mark.parametrize("backend", ["dense", "int8", "int4"])  # conversion only: runs on any GPU
+@pytest.mark.parametrize(("dtype", "act_dtype"), [(mx.bfloat16, mx.bfloat16), (mx.bfloat16, mx.float32)])
+@pytest.mark.parametrize("tiny_group", [False, True])
+def test_svdq_cache_conversion_matches_numpy_reference(backend, dtype, act_dtype, tiny_group):
+    w = _weights(seed=50)
+    w.wscale = np.random.default_rng(3).uniform(0.01, 0.02, size=w.wscale.shape).astype(np.float32)  # invertible
+    if tiny_group:
+        w.wscale[:, 0] = 1e-5  # makes the int8 copy non-invertible
+    layer = _layer(w, dtype=dtype, backend=backend)
+    ckpt = {
+        n: np.array(getattr(layer, n).astype(mx.float32))
+        for n in ("wscales", "smooth_factor", "proj_down", "proj_up", "bias")
+    }
+    ref = unpack_svdq_int4(qweight=np.array(layer.qweight), **ckpt)
+    cache = layer._build_cache(backend, act_dtype)
+    rank_pad = -ref.down.shape[0] % 32
+    np.testing.assert_array_equal(_np(cache["inv_smooth"]), 1.0 / ref.smooth)
+    np.testing.assert_array_equal(_np(cache["bias"]), ref.bias)
+    np.testing.assert_array_equal(_np(cache["down_t"]), np.pad(ref.down, ((0, rank_pad), (0, 0))).T)
+    if backend == "dense":
+        u = (ref.q.astype(np.int64) + 8).reshape(ref.q.shape[0], -1, 8)
+        packed = (u << (4 * np.arange(8))).sum(-1).astype(np.uint32)
+        np.testing.assert_array_equal(np.array(cache["qw"]), packed)
+        np.testing.assert_array_equal(
+            _np(cache["qscales"]), np.array(mx.array(ref.wscale).astype(act_dtype).astype(mx.float32))
+        )
+        return
+    layout = to_kernel_layout(ref)
+    np.testing.assert_array_equal(np.array(cache["wsc"]), layout["wsc"])
+    np.testing.assert_array_equal(np.array(cache["wr"]), layout["wr"])
+    np.testing.assert_array_equal(
+        np.array(cache[{"int8": "w8", "int4": "w4"}[backend]]), layout[{"int8": "w8", "int4": "w4"}[backend]]
+    )
+    if backend == "int8":
+        recovered = np.rint(
+            layout["w8"].astype(np.float32).reshape(*ref.q.shape[:1], -1, 64)
+            / layout["wr"].T[..., None].astype(np.float32)
+        )
+        assert cache["q_invertible"] == bool(np.array_equal(recovered.reshape(ref.q.shape), ref.q)) == (not tiny_group)
+
+
+def test_kernel_w8_rounds_half_to_even_like_numpy():
+    wr = np.array([[0.5, 1.5, 2.5, 0.25]], dtype=np.float16).repeat(64, axis=1)[:, : 64 * 4]
+    wr = np.ascontiguousarray(np.array([0.5, 1.5, 2.5, 0.25], dtype=np.float16)[None, :])  # (N=1, G=4)
+    q = np.tile(np.arange(-8, 8, dtype=np.int32), 16)[None, :]  # (1, 256): every int4 value in every group
+    ref = np.clip(np.rint(q.astype(np.float32).reshape(1, 4, 64) * wr.astype(np.float32)[..., None]), -127, 127)
+    np.testing.assert_array_equal(
+        np.array(mx_layout.kernel_w8(mx.array(q), mx.array(wr))), ref.astype(np.int8).reshape(1, 256)
+    )
+
+
+@pytest.mark.parametrize("splits", [1, 3, 6])
+def test_awq_cache_conversion_matches_numpy_reference(splits):
+    codes, scale, zero, bias, _ = _awq_case(n=384, seed=51)
+    tensors = {
+        k: v.astype(mx.bfloat16) if k != "qweight" else v for k, v in _awq_tensors(codes, scale, zero, bias).items()
+    }
+    layer = AWQW4A16Linear(256, 384, adanorm_splits=splits, dtype=mx.bfloat16)
+    layer.load_weights(list(tensors.items()))
+    ref_codes, ref_scale, ref_zero, ref_bias = undo_adanorm_layout(
+        unpack_awq_w4(np.array(layer.qweight), 384),
+        np.array(layer.wscales.astype(mx.float32)).T,
+        np.array(layer.wzeros.astype(mx.float32)).T,
+        np.array(layer.bias.astype(mx.float32)),
+        splits,
+    )
+    cache = layer._cache_for(mx.bfloat16)
+    np.testing.assert_array_equal(np.array(mx_layout.unpack_awq_codes(tensors["qweight"], 384)).shape, (384, 256))
+    u = ref_codes.astype(np.int64).reshape(384, -1, 8)
+    np.testing.assert_array_equal(np.array(cache["wq"]), (u << (4 * np.arange(8))).sum(-1).astype(np.uint32))
+    np.testing.assert_array_equal(_np(cache["scales"]), ref_scale)
+    np.testing.assert_array_equal(_np(cache["biases"]), ref_zero)
+    np.testing.assert_array_equal(np.array(cache["bias"]), ref_bias)

@@ -240,6 +240,33 @@ def test_awq_linear_on_mps():
     ref = x.double() @ dense.double().t() + module.bias.cpu().double()
     out = module(x.to("mps"))
     assert _rel(out, ref) < 1e-2
+    assert module._nunchaku_lite_mps_meta["backend"] == "awq_int4pack"  # weights stay 4-bit
+    assert "_nl_mps_weight" not in dict(module.named_buffers())
+
+
+@requires_mps
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_awq_int4pack_matches_dense_fallback(monkeypatch, dtype):
+    g = torch.Generator().manual_seed(18)
+    n, k = 384, 256
+    codes = torch.randint(0, 16, (n, k), generator=g, dtype=torch.int32)
+    module = AWQW4A16Linear(k, n, bias=False, group_size=64, torch_dtype=dtype, device="cpu")
+    module.qweight.data = _pack_awq_g64(codes)
+    module.wscales.data = (torch.rand(k // 64, n, generator=g) * 0.02 + 0.001).to(dtype)
+    module.wzeros.data = (-7 * module.wscales.data.float() + torch.randn(k // 64, n, generator=g) * 1e-3).to(dtype)
+    module = module.to("mps")
+    dense = mps_ops.dequantize_awq_g64_int32(module.qweight.cpu(), module.wscales.cpu(), module.wzeros.cpu())
+    for m in (1, 2, 37):
+        x = torch.randn(m, k, generator=g).to(dtype)
+        ref = x.double() @ dense.double().t()
+        assert _rel(module(x.to("mps")), ref) < (1e-5 if dtype == torch.float32 else 1e-2), m
+    assert module._nunchaku_lite_mps_meta["backend"] == "awq_int4pack"
+
+    monkeypatch.setattr(mps_ops, "_build_awq_int4pack", lambda module, dtype: None)  # e.g. older torch
+    module._nunchaku_lite_mps_key = None
+    x = torch.randn(2, k, generator=g).to(dtype)
+    assert _rel(module(x.to("mps")), x.double() @ dense.double().t()) < (1e-5 if dtype == torch.float32 else 1e-2)
+    assert module._nunchaku_lite_mps_meta["backend"] == "awq_dense"
 
 
 @requires_mps
