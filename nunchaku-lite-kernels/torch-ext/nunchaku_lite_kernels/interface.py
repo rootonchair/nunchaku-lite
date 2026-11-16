@@ -108,6 +108,26 @@ def _fake_fused_cross_head_qk_norm_rope(
     return [torch.empty_like(q), torch.empty_like(k)]
 
 
+@torch.library.register_fake(add_op_namespace_prefix("svdq_quantize_act_int8"))
+def _fake_svdq_quantize_act_int8(x, inv_smooth, shift: float):
+    return x.new_empty(x.shape, dtype=torch.int8), x.new_empty(x.shape[:1], dtype=torch.float32)
+
+
+@torch.library.register_fake(add_op_namespace_prefix("svdq_gemm_w8a8"))
+def _fake_svdq_gemm_w8a8(a, w8, ascale, wsc, lact, lup, bias):
+    return lact.new_empty((a.shape[0], w8.shape[0]))
+
+
+@torch.library.register_fake(add_op_namespace_prefix("svdq_gemm_w4a8"))
+def _fake_svdq_gemm_w4a8(a, w4, wr, ascale, wsc, lact, lup, bias):
+    return lact.new_empty((a.shape[0], w4.shape[0]))
+
+
+@torch.library.register_fake(add_op_namespace_prefix("svdq_qk_norm_rope_"))
+def _fake_svdq_qk_norm_rope_(qkv, norm_q, norm_k, rope, eps_q: float, eps_k: float, heads: int, seq_len: int) -> None:
+    return None
+
+
 def _get_ops():
     try:
         _ = ops.gemm_w4a4
@@ -125,6 +145,11 @@ fused_affine_modulate = ops.fused_affine_modulate
 fused_cross_head_qk_norm_rope = ops.fused_cross_head_qk_norm_rope
 gemv_awq = ops.gemv_awq
 attention_fp16 = ops.attention_fp16
+# MPS (Metal) SVDQ ops; implemented for the MPS device only.
+svdq_quantize_act_int8 = ops.svdq_quantize_act_int8
+svdq_gemm_w8a8 = ops.svdq_gemm_w8a8
+svdq_gemm_w4a8 = ops.svdq_gemm_w4a8
+svdq_qk_norm_rope_ = ops.svdq_qk_norm_rope_
 
 
 def _ceil_divide(a: int, b: int) -> int:
@@ -291,5 +316,9 @@ __all__ = [
     "ops",
     "quantize_w4a4_act_fuse_lora",
     "svdq_gemm_w4a4_cuda",
+    "svdq_gemm_w4a8",
+    "svdq_gemm_w8a8",
+    "svdq_qk_norm_rope_",
+    "svdq_quantize_act_int8",
     "svdq_quantize_w4a4_act_fuse_lora_cuda",
 ]

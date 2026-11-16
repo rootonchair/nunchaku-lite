@@ -1,4 +1,8 @@
-"""Runtime manifest parsing for Nunchaku Lite checkpoint metadata."""
+"""Runtime manifest parsing for Nunchaku Lite checkpoint metadata.
+
+Shared with the MLX runtime (:mod:`nunchaku_lite.mlx`), which must import without torch: keep this module free
+of torch and diffusers imports (``tests/test_torch_free_imports.py``).
+"""
 
 from __future__ import annotations
 

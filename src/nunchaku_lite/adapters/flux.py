@@ -53,10 +53,11 @@ def rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
 
     if dim % 2 != 0:
         raise ValueError("Rotary dimension must be even.")
-    scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
+    freqs_dtype = torch.float32 if pos.device.type == "mps" else torch.float64  # MPS has no float64
+    scale = torch.arange(0, dim, 2, dtype=freqs_dtype, device=pos.device) / dim
     omega = 1.0 / (theta**scale)
     batch_size, seq_len = pos.shape
-    out = torch.einsum("...n,d->...nd", pos, omega)
+    out = torch.einsum("...n,d->...nd", pos.to(freqs_dtype), omega)
     out = torch.stack([torch.sin(out), torch.cos(out)], dim=-1)
     return out.view(batch_size, seq_len, dim // 2, 1, 2).float()
 

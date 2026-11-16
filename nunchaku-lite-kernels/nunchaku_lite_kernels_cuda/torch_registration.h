@@ -5,8 +5,15 @@
 
 #include <torch/library.h>
 
+// Metal (MPS) builds compile only the SVDQ MPS kernels; CUDA builds compile the CUDA kernels.
+#if defined(METAL_KERNEL) || defined(NUNCHAKU_LITE_REGISTER_MPS_DISPATCH)
+#define NUNCHAKU_LITE_METAL_BUILD 1
+#include "../nunchaku_lite_kernels_metal/svdq_metal.h"
+#else
 #include "ops_lite.h"
+#endif
 
+#ifndef NUNCHAKU_LITE_METAL_BUILD
 namespace {
 
 using OptionalTensor = std::optional<torch::Tensor>;
@@ -148,8 +155,9 @@ std::vector<torch::Tensor> dispatch_fused_cross_head_qk_norm_rope(torch::Tensor 
 }
 
 } // namespace
+#endif // NUNCHAKU_LITE_METAL_BUILD
 
-#if defined(CUDA_KERNEL) || defined(ROCM_KERNEL)
+#if defined(CUDA_KERNEL) || defined(ROCM_KERNEL) || defined(METAL_KERNEL)
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 #else
 TORCH_LIBRARY(nunchaku_lite_kernels, ops) {
@@ -180,6 +188,14 @@ TORCH_LIBRARY(nunchaku_lite_kernels, ops) {
             "Tensor? k_weight, Tensor? q_cos, Tensor? q_sin, Tensor? k_cos, "
             "Tensor? k_sin, int q_heads, int k_heads, int head_dim, float eps, "
             "bool interleaved) -> Tensor[]");
+    // SVDQ W8A8 / W4A8 ops (MPS backend; Neural Accelerator int8 matmul on M5-class GPUs).
+    ops.def("svdq_quantize_act_int8(Tensor x, Tensor inv_smooth, float shift) -> (Tensor, Tensor)");
+    ops.def("svdq_gemm_w8a8(Tensor a, Tensor w8, Tensor ascale, Tensor wsc, Tensor lact, "
+            "Tensor lup, Tensor? bias) -> Tensor");
+    ops.def("svdq_gemm_w4a8(Tensor a, Tensor w4, Tensor wr, Tensor ascale, Tensor wsc, "
+            "Tensor lact, Tensor lup, Tensor? bias) -> Tensor");
+    ops.def("svdq_qk_norm_rope_(Tensor(a!) qkv, Tensor? norm_q, Tensor? norm_k, Tensor? rope, "
+            "float eps_q, float eps_k, int heads, int seq_len) -> ()");
 
 #if defined(NUNCHAKU_LITE_REGISTER_CUDA_DISPATCH) || defined(CUDA_KERNEL) || defined(ROCM_KERNEL)
     ops.impl("gemm_w4a4", torch::kCUDA, &dispatch_gemm_w4a4);
@@ -191,5 +207,12 @@ TORCH_LIBRARY(nunchaku_lite_kernels, ops) {
     ops.impl("gemv_awq", torch::kCUDA, &dispatch_gemv_awq);
     ops.impl("attention_fp16", torch::kCUDA, &dispatch_attention_fp16);
     ops.impl("fused_cross_head_qk_norm_rope", torch::kCUDA, &dispatch_fused_cross_head_qk_norm_rope);
+#endif
+
+#ifdef NUNCHAKU_LITE_METAL_BUILD
+    ops.impl("svdq_quantize_act_int8", torch::kMPS, &nunchaku_lite::metal::svdq_quantize_act_int8);
+    ops.impl("svdq_gemm_w8a8", torch::kMPS, &nunchaku_lite::metal::svdq_gemm_w8a8);
+    ops.impl("svdq_gemm_w4a8", torch::kMPS, &nunchaku_lite::metal::svdq_gemm_w4a8);
+    ops.impl("svdq_qk_norm_rope_", torch::kMPS, &nunchaku_lite::metal::svdq_qk_norm_rope_);
 #endif
 }

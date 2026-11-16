@@ -71,6 +71,37 @@ current porting backlog for `nunchaku_lite`:
 - [ ] Remove monkey-patched transformer forward overrides in favor of module
   wrappers or inherited transformer implementations.
 
+## Apple Silicon / MLX Backlog
+
+`nunchaku_lite.mlx` (`pip install "nunchaku-lite[mlx]"`) provides an MLX `SVDQW4A4Linear` and `patch_transformer` (same API as `nunchaku_lite`) with fused W8A8/W4A8 Metal
+kernels for M5-class Neural Accelerators, plus a portable W4A16 fallback.
+
+- [x] Unpack Nunchaku INT4 SVDQ layouts (weights, scales, smooth, bias,
+  low-rank) to logical tensors.
+- [x] Fused int8 Neural Accelerator GEMM with scale, bias, and low-rank
+  epilogue (`w8a8`, `w4a8`).
+- [x] Fused per-token int8 activation quantization kernel.
+- [x] PyTorch MPS ops in `nunchaku-lite-kernels` (`svdq_quantize_act_int8`,
+  `svdq_gemm_w8a8`, `svdq_gemm_w4a8`), built locally on macOS via `setup.py`.
+- [ ] Hub (kernel-builder) Metal build: add a `cpp-metal` kernel section to
+  `build.toml` and verify with Nix on a Mac.
+- [x] Wire the MPS ops into `nunchaku_lite`: SVDQ / AWQ modules and the fused
+  GELU-MLP and QKV-norm-RoPE ops dispatch to `nunchaku_lite.ops.mps` on MPS
+  tensors (verified end to end with FLUX.2 Klein 4B).
+- [x] Fused Metal QK RMSNorm + RoPE op (`svdq_qk_norm_rope_`).
+- [ ] Verify FLUX.1, Qwen-Image, Z-Image, and runtime LoRA on MPS.
+- [ ] Faster attention on MPS (about half of each FLUX.2 step after quantization).
+- [ ] Quantized T5 (TinyChat AWQ g128) on MPS.
+- [ ] NVFP4 checkpoint support.
+- [ ] Fuse activation quantization into the producing GEMM's epilogue (e.g. fc1+GELU
+  -> int8 for fc2) to remove the quantize stage and the inter-kernel bubble (~10% per
+  layer). Fusing only `x @ down` into the quantizer was tried and gave no gain.
+- [x] MLX `load_nunchaku_pipeline` on mflux with a `flux2` adapter (FLUX.2 Klein,
+  verified end to end); AWQ W4A16 layers and lazy `qweight` release on MLX.
+- [ ] MLX adapters for FLUX.1, Qwen-Image, Z-Image.
+- [x] Low-rank branch as a second Neural Accelerator matmul in the GEMM epilogue.
+- [ ] End-to-end image benchmarks.
+
 ## Runtime Manifest Adapter Backlog
 
 The generic `manifest` adapter currently covers checkpoint-driven linear

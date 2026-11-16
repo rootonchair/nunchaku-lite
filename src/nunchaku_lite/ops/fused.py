@@ -23,6 +23,10 @@ def fused_gelu_mlp(x: torch.Tensor, fc1: SVDQW4A4Linear, fc2: SVDQW4A4Linear, pa
         MLP output with shape ``(batch, sequence, fc2.out_features)``.
     """
 
+    if x.device.type == "mps":
+        from .mps import gelu_mlp_mps
+
+        return gelu_mlp_mps(x, fc1, fc2)
     batch_size, seq_len, channels = x.shape
     x = x.view(batch_size * seq_len, channels)
     quantized_x, ascales, lora_act = fc1.quantize(x)
@@ -85,6 +89,24 @@ def fused_qkv_norm_rotary(
         populated ``(query, key, value)`` tuple.
     """
 
+    if x.device.type == "mps":
+        if isinstance(output, tuple):
+            raise NotImplementedError("Packed Q/K/V attention outputs are CUDA-only; use the dense output path on MPS.")
+        from .mps import qkv_norm_rotary_mps
+
+        qkv = qkv_norm_rotary_mps(
+            x,
+            proj,
+            _rms_norm_weight(norm_q),
+            _rms_norm_weight(norm_k),
+            rotary_emb,
+            eps_q=_rms_norm_eps(norm_q),
+            eps_k=_rms_norm_eps(norm_k),
+        )
+        if output is not None:
+            output.view_as(qkv).copy_(qkv)
+            return output.view(qkv.shape)
+        return qkv
     batch_size, seq_len, channels = x.shape
     x = x.view(batch_size * seq_len, channels)
     quantized_x, ascales, lora_act = proj.quantize(x)

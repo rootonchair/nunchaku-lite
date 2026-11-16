@@ -143,6 +143,8 @@ class SVDQW4A4Linear(nn.Module):
             self.wcscales = None
 
         self.act_unsigned = act_unsigned
+        # Quantized-kernel backend on Apple silicon ("auto", "int8", "int4", "dense"); set by patch_transformer.
+        self.backend = "auto"
 
     @classmethod
     def from_linear(cls, linear: nn.Linear, **kwargs):
@@ -230,6 +232,11 @@ class SVDQW4A4Linear(nn.Module):
         )
         return output
 
+    def _apply(self, fn, recurse=True):
+        from .ops.mps import preserve_cache_across_move
+
+        return preserve_cache_across_move(self, lambda: super(SVDQW4A4Linear, self)._apply(fn, recurse))
+
     def forward(self, x: torch.Tensor, output: torch.Tensor | None = None) -> torch.Tensor:
         """Apply the quantized projection to a batched sequence tensor.
 
@@ -241,6 +248,10 @@ class SVDQW4A4Linear(nn.Module):
             Output tensor with shape ``(batch, sequence, out_features)``.
         """
 
+        if x.device.type == "mps":
+            from .ops.mps import svdq_linear_mps
+
+            return svdq_linear_mps(self, x)
         batch_size, seq_len, channels = x.shape
         x = x.reshape(batch_size * seq_len, channels)
         if output is None:
@@ -354,6 +365,11 @@ class AWQW4A16Linear(nn.Module):
             device=device,
         )
 
+    def _apply(self, fn, recurse=True):
+        from .ops.mps import preserve_cache_across_move
+
+        return preserve_cache_across_move(self, lambda: super(AWQW4A16Linear, self)._apply(fn, recurse))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the AWQ projection using native AWQ kernels.
 
@@ -373,6 +389,10 @@ class AWQW4A16Linear(nn.Module):
         x_flat = x.reshape(-1, self.in_features).contiguous()
         if x_flat.shape[0] == 0:
             output = x.new_empty(output_shape)
+        elif x.device.type == "mps":
+            from .ops.mps import awq_linear_mps
+
+            output = awq_linear_mps(self, x_flat).reshape(output_shape)
         else:
             if self._use_gemm(x_flat.shape[0]):
                 output = awq_gemm_w4a16_g64_int32(

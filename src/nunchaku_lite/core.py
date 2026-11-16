@@ -29,6 +29,7 @@ class PatchOptions:
             match.
         adapter_options: Adapter-specific options, such as rank overrides or
             model-family toggles.
+        backend: Quantized-kernel backend for SVDQ layers (Apple silicon).
     """
 
     precision: str
@@ -36,6 +37,7 @@ class PatchOptions:
     device: str | torch.device | None = None
     strict: bool = True
     adapter_options: dict[str, Any] = field(default_factory=dict)
+    backend: str = "auto"
 
 
 class TransformerAdapter(Protocol):
@@ -129,6 +131,7 @@ def patch_transformer(
     device: str | torch.device | None = None,
     strict: bool = True,
     adapter_options: dict[str, Any] | None = None,
+    backend: str = "auto",
 ) -> torch.nn.Module:
     """Patch a Diffusers transformer in place with a Nunchaku Lite checkpoint.
 
@@ -147,6 +150,14 @@ def patch_transformer(
         device: Optional device to move the patched transformer to.
         strict: Whether ``load_state_dict`` should enforce exact key matching.
         adapter_options: Optional adapter-specific patch settings.
+        backend: Quantized-kernel backend for SVDQ layers, following the
+            Diffusers ``AutoRoundConfig(backend=...)`` convention. On Apple
+            silicon (MPS): ``"auto"`` (``int8`` when it fits comfortably in GPU
+            memory, else ``int4``; ``dense`` without Neural Accelerators),
+            ``"int8"`` (fastest), ``"int4"`` (4-bit weights in memory), or
+            ``"dense"`` (exact fallback). CUDA has a single kernel and accepts
+            only ``"auto"``. This is unrelated to the attention backend
+            (``model.set_attention_backend``).
 
     Returns:
         The same ``transformer`` object after mutation and checkpoint loading.
@@ -166,6 +177,7 @@ def patch_transformer(
         strict=strict,
         adapter_options=adapter_options,
         assign=False,
+        backend=backend,
     )
 
 
@@ -182,6 +194,7 @@ def load_nunchaku_pipeline(
     strict: bool = True,
     adapter_options: dict[str, Any] | None = None,
     quantized_encoder_checkpoints: dict[str, str | Path] | None = None,
+    backend: str = "auto",
     **pipeline_kwargs,
 ):
     """Load a Diffusers pipeline with its Nunchaku component installed up front.
@@ -209,6 +222,8 @@ def load_nunchaku_pipeline(
         quantized_encoder_checkpoints: Optional mapping from Diffusers pipeline
             component name to quantized encoder checkpoint. This currently
             supports T5-compatible Nunchaku checkpoints.
+        backend: Quantized-kernel backend for SVDQ layers (``"auto"``,
+            ``"int8"``, ``"int4"``, ``"dense"``); see :func:`patch_transformer`.
         **pipeline_kwargs: Additional keyword arguments forwarded to
             ``pipeline_cls.from_pretrained``.
 
@@ -252,6 +267,7 @@ def load_nunchaku_pipeline(
         strict=strict,
         adapter_options=adapter_options,
         pipeline_kwargs=pipeline_kwargs,
+        backend=backend,
     )
 
     pipe = pipeline_cls.from_pretrained(
@@ -336,7 +352,16 @@ def _patch_component(
     strict: bool,
     adapter_options: dict[str, Any] | None,
     assign: bool,
+    backend: str = "auto",
 ) -> torch.nn.Module:
+    from .ops.mps import configure_backend, validate_backend
+
+    backend = validate_backend(backend)
+    if backend != "auto" and device is not None and torch.device(device).type == "cuda":
+        raise ValueError(
+            f"backend={backend!r} selects an Apple-silicon (MPS) kernel; CUDA has a single SVDQ kernel. "
+            'Use backend="auto" on CUDA.'
+        )
     _ensure_builtin_adapters()
 
     existing_target = getattr(transformer, "_nunchaku_lite_target", None)
@@ -357,6 +382,7 @@ def _patch_component(
         device=device,
         strict=strict,
         adapter_options=adapter_options or {},
+        backend=backend,
     )
 
     maybe_state_dict = adapter.patch(transformer, state_dict, quantization_config, options)
@@ -369,6 +395,7 @@ def _patch_component(
     _materialize_known_meta_tensors(transformer)
     if device is not None:
         transformer.to(device)
+    configure_backend(transformer, backend)
 
     transformer._nunchaku_lite_patched = True
     transformer._nunchaku_lite_target = adapter.target
@@ -475,6 +502,7 @@ def _load_nunchaku_component_from_config(
     strict: bool,
     adapter_options: dict[str, Any] | None,
     pipeline_kwargs: dict[str, Any],
+    backend: str = "auto",
 ) -> torch.nn.Module:
     if not hasattr(component_cls, "load_config") or not hasattr(component_cls, "from_config"):
         raise TypeError(f"{component_cls.__module__}.{component_cls.__name__} must support load_config/from_config.")
@@ -498,6 +526,7 @@ def _load_nunchaku_component_from_config(
         strict=strict,
         adapter_options=adapter_options,
         assign=True,
+        backend=backend,
     )
 
 

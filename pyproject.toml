@@ -7,7 +7,7 @@ requires = [
 
 [project]
 name = "nunchaku_lite"
-description = "Lite plugin runtime for applying Nunchaku v2 quantized transformer weights to Diffusers pipelines."
+description = "Lite plugin runtime for applying Nunchaku v2 quantized transformer weights to Diffusers (PyTorch) and mflux (MLX) pipelines."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -21,15 +21,25 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
+  "huggingface-hub>=0.34",
+  "packaging>=23",
+]
+
+[project.optional-dependencies]
+# PyTorch runtime (CUDA / Apple MPS): nunchaku_lite.load_nunchaku_pipeline, patch_transformer, ...
+torch = [
   "accelerate>=0.31",
   "diffusers>=0.36",
-  "huggingface-hub>=0.34",
   "kernels>=0.14,<0.15",
-  "packaging>=23",
   "peft",
   "safetensors",
   "torch>=2.7",
   "transformers>=4.41.2",
+]
+# MLX runtime (Apple silicon): nunchaku_lite.mlx. Pipelines come from mflux (pip install mflux).
+mlx = [
+  "mlx>=0.30",
+  "numpy",
 ]
 
 [tool.black]

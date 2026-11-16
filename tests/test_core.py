@@ -383,3 +383,38 @@ def test_coerce_state_dict_for_assign_matches_module_float_dtypes():
 
     assert state["scale"].dtype == torch.bfloat16
     assert state["quantized"].dtype == torch.int8
+
+
+def test_patch_transformer_forwards_backend(tmp_path, monkeypatch):
+    from nunchaku_lite import patch_transformer
+
+    _install_fake_adapter(monkeypatch)
+    transformer = patch_transformer(
+        FakePipelineComponent(), _fake_checkpoint(tmp_path), target=FakeAdapter.target, backend="int4"
+    )
+    assert transformer.patch_context.options.backend == "int4"
+    assert transformer._nunchaku_lite_backend == "int4"
+
+
+def test_patch_transformer_rejects_unknown_backend(tmp_path, monkeypatch):
+    from nunchaku_lite import patch_transformer
+
+    _install_fake_adapter(monkeypatch)
+    with pytest.raises(ValueError, match="backend must be one of"):
+        patch_transformer(
+            FakePipelineComponent(), _fake_checkpoint(tmp_path), target=FakeAdapter.target, backend="w8a8"
+        )
+
+
+def test_patch_transformer_rejects_mps_backend_on_cuda(tmp_path, monkeypatch):
+    from nunchaku_lite import patch_transformer
+
+    _install_fake_adapter(monkeypatch)
+    with pytest.raises(ValueError, match="CUDA has a single SVDQ kernel"):
+        patch_transformer(
+            FakePipelineComponent(),
+            _fake_checkpoint(tmp_path),
+            target=FakeAdapter.target,
+            device="cuda",
+            backend="int4",
+        )
