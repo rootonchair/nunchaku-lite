@@ -490,6 +490,13 @@ def svdq_linear_mps(module, x: torch.Tensor, act_shift: float | None = None) -> 
             :data:`GELU_SHIFT` for ``act_unsigned`` projections, else ``0``.
     """
 
+    if getattr(module, "input_rotation", None) is not None:
+        # The packed weight is Q(R @ blockdiag(T)); the MPS kernels apply no activation rotation, so running
+        # it here would silently produce wrong outputs.
+        raise NotImplementedError(
+            f"Input-rotated SVDQ layers ({module.input_rotation}) are not supported on MPS yet; "
+            "use an unrotated checkpoint."
+        )
     if act_shift is None:
         act_shift = GELU_SHIFT if module.act_unsigned else 0.0
     lead = x.shape[:-1]

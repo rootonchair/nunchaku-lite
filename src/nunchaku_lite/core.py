@@ -397,6 +397,13 @@ def _patch_component(
         if rank:
             quantization_config = {**quantization_config, "rank": int(rank)}
     adapter = _select_adapter_for_checkpoint(transformer, target, runtime_manifest)
+    if runtime_manifest is not None and runtime_manifest.rotated_targets and adapter.target != "manifest":
+        # Model-specific adapters rename modules and fuse MLPs, so they cannot honour per-target
+        # rotations; loading through them would silently drop the rotation and give wrong outputs.
+        raise ValueError(
+            f"Checkpoint declares online activation rotation on {len(runtime_manifest.rotated_targets)} targets, "
+            f"which only target='manifest' (or 'auto') supports; got target={adapter.target!r}."
+        )
     normalized_precision = _normalize_precision(precision, device, checkpoint, runtime_manifest)
     _validate_quantization_compatibility(quantization_config, normalized_precision, device, checkpoint)
     options = PatchOptions(
