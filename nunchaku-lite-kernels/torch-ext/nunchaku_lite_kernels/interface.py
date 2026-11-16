@@ -167,6 +167,7 @@ ops = _get_ops()
 
 gemm_w4a4 = ops.gemm_w4a4
 quantize_w4a4_act_fuse_lora = ops.quantize_w4a4_act_fuse_lora
+quantize_w4a4_act_hadamard_fuse_lora = ops.quantize_w4a4_act_hadamard_fuse_lora
 fused_rms_norm_modulate = ops.fused_rms_norm_modulate
 fused_affine_modulate = ops.fused_affine_modulate
 fused_cross_head_qk_norm_rope = ops.fused_cross_head_qk_norm_rope
@@ -387,10 +388,12 @@ __all__ = [
     "ops",
     "qk_norm_rope_mps_",
     "quantize_w4a4_act_fuse_lora",
+    "quantize_w4a4_act_hadamard_fuse_lora",
     "svdq_gemm_w4a4_cuda",
     "svdq_gemm_w4a8",
     "svdq_gemm_w8a8",
     "svdq_qk_norm_rope_",
     "svdq_quantize_act_int8",
     "svdq_quantize_w4a4_act_fuse_lora_cuda",
+    "svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda",
 ]

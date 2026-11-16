@@ -125,3 +125,14 @@ def test_awq_gemm_w4a16_g64_int32_matches_dequantized_reference():
     expected = torch.matmul(x.float(), weight.t()).to(dtype)
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_hadamard_quantize_op_is_exported_from_package():
+    assert "svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda" in nunchaku_lite_kernels.__all__
+    assert "quantize_w4a4_act_hadamard_fuse_lora" in nunchaku_lite_kernels.__all__
+    from nunchaku_lite_kernels import (  # noqa: F401
+        quantize_w4a4_act_hadamard_fuse_lora,
+        svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda,
+    )
+
+    assert hasattr(ops, "quantize_w4a4_act_hadamard_fuse_lora")
