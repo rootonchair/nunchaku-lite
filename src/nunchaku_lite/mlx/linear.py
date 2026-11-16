@@ -29,8 +29,8 @@ import mlx.core as mx
 import numpy as np
 from mlx import nn
 
-from .kernels import TILE_M, has_neural_accelerators, svdq_gemm_w4a8, svdq_gemm_w8a8, svdq_quantize_act_int8
 from . import mx_layout as mxl
+from .kernels import TILE_M, has_neural_accelerators, svdq_gemm_w4a8, svdq_gemm_w8a8, svdq_quantize_act_int8
 from .packing import _LR_PACK, _LR_PERM
 
 __all__ = ["BACKENDS", "GELU_SHIFT", "AWQW4A16Linear", "SVDQW4A4Linear", "resolve_backend"]

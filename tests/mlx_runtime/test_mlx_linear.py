@@ -9,10 +9,10 @@ from nunchaku_lite.mlx import (
     SVDQLogicalWeights,
     SVDQW4A4Linear,
     has_neural_accelerators,
+    mx_layout,
     pack_svdq_int4,
     patch_transformer,
 )
-from nunchaku_lite.mlx import mx_layout
 from nunchaku_lite.mlx.packing import (
     pack_awq_w4,
     to_kernel_layout,
@@ -334,7 +334,7 @@ def test_awq_adanorm_layout_restores_original_order(splits):
 
 @pytest.mark.parametrize("splits", [1, 6])
 def test_awq_checkpoint_arrays_released_as_exact_lazy_repack(splits):
-    codes, scale, zero, bias, dense = _awq_case(n=384, seed=44)
+    codes, scale, zero, bias, _ = _awq_case(n=384, seed=44)
     tensors = {
         k: v.astype(mx.bfloat16) if k != "qweight" else v for k, v in _awq_tensors(codes, scale, zero, bias).items()
     }

@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from mlx import nn
 
+from nunchaku_lite.manifest import parse_runtime_manifest
 from nunchaku_lite.mlx import (
     AWQW4A16Linear,
     PrefixMap,
@@ -21,7 +22,6 @@ from nunchaku_lite.mlx import (
 )
 from nunchaku_lite.mlx.manifest import SplitLinearInput, SplitLinearOutput
 from nunchaku_lite.mlx.packing import pack_awq_w4
-from nunchaku_lite.manifest import parse_runtime_manifest
 from nunchaku_lite.mlx.pipeline import _FLUX1_RENAMES, _FLUX2_RENAMES, flux1_key_map, flux2_key_map
 
 D, HEAD_DIM, MLP = 256, 128, 128
@@ -575,7 +575,6 @@ def test_patch_transformer_uses_manifest_and_key_map(tmp_path):
 
 
 def test_manifest_errors(tmp_path):
-    _, state, manifest = _lite_flux2_checkpoint()
     with pytest.raises(ValueError, match="requires a checkpoint with quantization_config.runtime_manifest"):
         load_nunchaku_pipeline("p", pipeline_cls=FakeFlux2Pipeline, checkpoint={}, target="manifest")
     fp4 = _manifest([_target("transformer_blocks.0.attn.to_q", precision="fp4")], precision="fp4")
