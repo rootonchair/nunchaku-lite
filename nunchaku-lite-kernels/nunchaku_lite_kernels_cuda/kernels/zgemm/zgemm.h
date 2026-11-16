@@ -41,8 +41,19 @@ void quantize_w4a4_act_fuse_lora(Tensor input,
                                  Tensor lora_act_out,
                                  Tensor smooth = {},
                                  bool fuse_glu = false,
-                                 bool fp4      = false,
-                                 bool hadamard = false);
+                                 bool fp4      = false);
+// Same as quantize_w4a4_act_fuse_lora, but rotates each 64-channel block of the smoothed
+// activations by the orthonormal Sylvester Hadamard matrix H64/8 before quantizing. The
+// low-rank branch still consumes the unrotated input. The weight must be packed as
+// Q(R @ blockdiag(H64/8)) to match.
+void quantize_w4a4_act_hadamard_fuse_lora(Tensor input,
+                                          Tensor output,
+                                          Tensor oscales,
+                                          Tensor lora_down,
+                                          Tensor lora_act_out,
+                                          Tensor smooth = {},
+                                          bool fuse_glu = false,
+                                          bool fp4      = false);
 void quantize_w4a4_act(Tensor input, Tensor output, Tensor oscales);
 void quantize_w4a4_wgt(Tensor input, Tensor output, Tensor oscales);
 

@@ -104,8 +104,7 @@ inline void quantize_w4a4_act_fuse_lora(std::optional<torch::Tensor> input,
                                         std::optional<torch::Tensor> lora_act_out,
                                         std::optional<torch::Tensor> smooth,
                                         bool fuse_glu,
-                                        bool fp4,
-                                        bool hadamard = false) {
+                                        bool fp4) {
     TorchOpContext ctx;
     nunchaku::kernels::quantize_w4a4_act_fuse_lora(as_tensor(input),
                                                    as_tensor(output),
@@ -114,8 +113,26 @@ inline void quantize_w4a4_act_fuse_lora(std::optional<torch::Tensor> input,
                                                    as_tensor(lora_act_out),
                                                    as_tensor(smooth),
                                                    fuse_glu,
-                                                   fp4,
-                                                   hadamard);
+                                                   fp4);
+}
+
+inline void quantize_w4a4_act_hadamard_fuse_lora(std::optional<torch::Tensor> input,
+                                                 std::optional<torch::Tensor> output,
+                                                 std::optional<torch::Tensor> oscales,
+                                                 std::optional<torch::Tensor> lora_down,
+                                                 std::optional<torch::Tensor> lora_act_out,
+                                                 std::optional<torch::Tensor> smooth,
+                                                 bool fuse_glu,
+                                                 bool fp4) {
+    TorchOpContext ctx;
+    nunchaku::kernels::quantize_w4a4_act_hadamard_fuse_lora(as_tensor(input),
+                                                            as_tensor(output),
+                                                            as_tensor(oscales),
+                                                            as_tensor(lora_down),
+                                                            as_tensor(lora_act_out),
+                                                            as_tensor(smooth),
+                                                            fuse_glu,
+                                                            fp4);
 }
 
 inline torch::Tensor gemv_awq(torch::Tensor in_feats,

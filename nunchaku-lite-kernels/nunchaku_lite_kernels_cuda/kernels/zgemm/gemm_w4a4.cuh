@@ -994,6 +994,10 @@ public:
                     }
 
                     if constexpr (USE_HADAMARD) {
+                        // The bit -> register mapping below hard-codes a 64-channel group made of
+                        // 4 packs of 16 channels (tmp[0..3]); any other tiling needs a new mapping.
+                        static_assert(NUM_PACKS == 4 && INSN_N == 16,
+                                      "Hadamard64 FWHT assumes 64-channel groups of 4 x 16-channel packs");
                         // In-register 64-point Walsh-Hadamard transform along the channel
                         // dimension of this 64-channel x 16-token tile (Sylvester order,
                         // normalized by 1/8 => orthonormal H64 per 64-channel block; the

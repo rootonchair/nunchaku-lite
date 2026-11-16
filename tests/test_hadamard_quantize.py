@@ -1,0 +1,175 @@
+import pytest
+import torch
+
+from nunchaku_lite.ops import quantize as quantize_mod
+from nunchaku_lite.ops.quantize import (
+    hadamard_matrix,
+    hadamard_rotate,
+    svdq_quantize_w4a4_act_fuse_lora_cuda,
+    svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda,
+)
+
+
+def _has_native_hadamard_op() -> bool:
+    try:
+        from nunchaku_lite.ops.backend import get_ops
+
+        return hasattr(get_ops(), "quantize_w4a4_act_hadamard_fuse_lora")
+    except Exception:  # noqa: BLE001 - feature probe: any failure means "unavailable", so skip
+        return False
+
+
+requires_native_hadamard = pytest.mark.skipif(
+    not torch.cuda.is_available() or not _has_native_hadamard_op(),
+    reason="needs CUDA and a kernel build with quantize_w4a4_act_hadamard_fuse_lora",
+)
+
+
+# --- reference matrix (CPU) -------------------------------------------------------------
+
+
+def test_hadamard_matrix_is_orthonormal_symmetric_sylvester():
+    h = hadamard_matrix(64, dtype=torch.float64)
+    assert torch.allclose(h @ h.T, torch.eye(64, dtype=torch.float64))
+    assert torch.equal(h, h.T)
+    h2 = torch.tensor([[1.0, 1.0], [1.0, -1.0]], dtype=torch.float64)
+    sylvester = h2
+    for _ in range(5):
+        sylvester = torch.kron(sylvester, h2)
+    assert torch.equal(h, sylvester / 8)
+    # Sylvester order has one all-ones column (the kernel's FWHT relies on this exact order).
+    assert torch.equal((h * 8).sum(dim=0)[0], torch.tensor(64.0, dtype=torch.float64))
+
+
+def test_hadamard_matrix_rejects_non_power_of_two():
+    with pytest.raises(ValueError, match="power of two"):
+        hadamard_matrix(48)
+
+
+def test_hadamard_rotate_is_blockwise_and_self_inverse():
+    x = torch.randn(5, 192, dtype=torch.float64)
+    y = hadamard_rotate(x)
+    assert torch.allclose(hadamard_rotate(y), x)
+    h = hadamard_matrix(64, dtype=torch.float64)
+    assert torch.allclose(y[:, 64:128], x[:, 64:128] @ h)
+    # Rotating both operands of a GEMM leaves the product unchanged (the export contract).
+    w = torch.randn(7, 192, dtype=torch.float64)
+    assert torch.allclose(hadamard_rotate(x) @ hadamard_rotate(w).T, x @ w.T)
+
+
+def test_hadamard_rotate_rejects_partial_block():
+    with pytest.raises(ValueError, match="multiple of block size"):
+        hadamard_rotate(torch.randn(2, 100))
+
+
+# --- Python wrapper with a fake backend (CPU) -------------------------------------------
+
+
+class _RecordingOps:
+    def __init__(self):
+        self.calls = []
+
+    def quantize_w4a4_act_fuse_lora(self, *args):
+        self.calls.append(("plain", args))
+
+    def quantize_w4a4_act_hadamard_fuse_lora(self, *args):
+        self.calls.append(("hadamard", args))
+
+
+def test_hadamard_wrapper_calls_hadamard_op_with_allocated_buffers(monkeypatch):
+    ops = _RecordingOps()
+    monkeypatch.setattr(quantize_mod, "get_ops", lambda: ops)
+    x = torch.randn(300, 128)
+    lora_down = torch.zeros(128, 16)
+    smooth = torch.ones(128)
+
+    out, oscales, lora_act = svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda(x, lora_down=lora_down, smooth=smooth)
+
+    assert [name for name, _ in ops.calls] == ["hadamard"]
+    args = ops.calls[0][1]
+    assert args[0] is x and args[3] is lora_down and args[5] is smooth
+    assert args[1] is out and args[2] is oscales and args[4] is lora_act
+    assert args[6:] == (False, False)
+    assert out.shape == (512, 64) and out.dtype == torch.uint8
+    assert oscales.shape == (2, 512)
+    assert lora_act.shape == (512, 16) and lora_act.dtype == torch.float32
+
+
+def test_plain_wrapper_keeps_original_op_and_signature(monkeypatch):
+    ops = _RecordingOps()
+    monkeypatch.setattr(quantize_mod, "get_ops", lambda: ops)
+    svdq_quantize_w4a4_act_fuse_lora_cuda(torch.randn(8, 64), lora_down=torch.zeros(64, 16))
+    assert [name for name, _ in ops.calls] == ["plain"]
+    assert len(ops.calls[0][1]) == 8  # input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4
+
+
+def test_hadamard_wrapper_reports_old_backend(monkeypatch):
+    class OldOps:
+        def quantize_w4a4_act_fuse_lora(self, *args):
+            raise AssertionError("must not fall back to the unrotated op")
+
+    monkeypatch.setattr(quantize_mod, "get_ops", lambda: OldOps())
+    with pytest.raises(NotImplementedError, match="quantize_w4a4_act_hadamard_fuse_lora"):
+        svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda(torch.randn(8, 64), lora_down=torch.zeros(64, 16))
+
+
+def test_hadamard_wrapper_rejects_channels_not_multiple_of_64(monkeypatch):
+    monkeypatch.setattr(quantize_mod, "get_ops", lambda: _RecordingOps())
+    with pytest.raises(ValueError, match="divisible by 64"):
+        svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda(torch.randn(8, 48), lora_down=torch.zeros(48, 16))
+
+
+# --- native kernel (CUDA) ----------------------------------------------------------------
+
+
+@requires_native_hadamard
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("tokens,channels", [(256, 3072), (300, 1024)])
+def test_native_hadamard_op_matches_plain_op_on_prerotated_input(dtype, tokens, channels):
+    # With a uniform smooth factor (layout-independent), rotating inside the kernel must
+    # equal feeding the plain op an input rotated in PyTorch. Small differences come only
+    # from fp16/bf16 rounding of the in-register FWHT vs the fp32 reference.
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    x = torch.randn(tokens, channels, device=device, dtype=torch.float32)
+    x[:, 7] *= 30  # a channel outlier, so rotation actually changes the scales
+    smooth = torch.full((channels,), 2.0, device=device, dtype=dtype)
+    lora_down = torch.zeros(channels, 16, device=device, dtype=dtype)
+
+    q_h, s_h, _ = svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda(x.to(dtype), lora_down=lora_down, smooth=smooth)
+    x_rot = hadamard_rotate(x).to(dtype)
+    q_r, s_r, _ = svdq_quantize_w4a4_act_fuse_lora_cuda(x_rot, lora_down=lora_down, smooth=smooth)
+    q_n, s_n, _ = svdq_quantize_w4a4_act_fuse_lora_cuda(x.to(dtype), lora_down=lora_down, smooth=smooth)
+
+    torch.testing.assert_close(s_h.float(), s_r.float(), rtol=2e-2, atol=1e-3)
+    assert (q_h == q_r).float().mean().item() > 0.97
+    # Control: the rotation really did something (otherwise this test would be vacuous).
+    assert not torch.allclose(s_h.float(), s_n.float(), rtol=2e-2, atol=1e-3)
+
+
+@requires_native_hadamard
+def test_native_hadamard_op_lora_branch_sees_unrotated_input():
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    x = torch.randn(256, 1024, device=device, dtype=torch.float16)
+    smooth = torch.ones(1024, device=device, dtype=torch.float16)
+    lora_down = torch.randn(1024, 16, device=device, dtype=torch.float16) * 0.05
+    _, _, lora_h = svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda(x, lora_down=lora_down, smooth=smooth)
+    _, _, lora_n = svdq_quantize_w4a4_act_fuse_lora_cuda(x, lora_down=lora_down, smooth=smooth)
+    torch.testing.assert_close(lora_h, lora_n)
+
+
+@requires_native_hadamard
+def test_native_hadamard_op_compiles_fullgraph():
+    device = torch.device("cuda")
+    x = torch.randn(256, 1024, device=device, dtype=torch.bfloat16)
+    smooth = torch.ones(1024, device=device, dtype=torch.bfloat16)
+    lora_down = torch.zeros(1024, 16, device=device, dtype=torch.bfloat16)
+
+    def fn(inp):
+        return svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda(inp, lora_down=lora_down, smooth=smooth)
+
+    eager = fn(x)
+    compiled = torch.compile(fn, fullgraph=True)(x)
+    for a, b in zip(eager, compiled):
+        assert torch.equal(a, b)

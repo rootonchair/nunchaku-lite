@@ -3,13 +3,21 @@
 from .attention import attention_fp16_cuda
 from .gemm import awq_gemm_w4a16_g64_int32, awq_gemm_w4a16_g128_int16, svdq_gemm_w4a4_cuda
 from .gemv import awq_gemv_w4a16_cuda
-from .quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
+from .quantize import (
+    hadamard_matrix,
+    hadamard_rotate,
+    svdq_quantize_w4a4_act_fuse_lora_cuda,
+    svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda,
+)
 
 __all__ = [
     "attention_fp16_cuda",
     "awq_gemm_w4a16_g64_int32",
     "awq_gemm_w4a16_g128_int16",
     "awq_gemv_w4a16_cuda",
+    "hadamard_matrix",
+    "hadamard_rotate",
     "svdq_gemm_w4a4_cuda",
     "svdq_quantize_w4a4_act_fuse_lora_cuda",
+    "svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda",
 ]
