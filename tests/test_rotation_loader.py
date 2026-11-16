@@ -302,3 +302,26 @@ def test_mps_path_refuses_rotated_layer():
     with pytest.raises(NotImplementedError, match="not supported on MPS"):
         svdq_linear_mps(layer, torch.zeros(4, 128))
 
+
+@pytest.mark.parametrize("with_manifest", [False, True])
+def test_rotation_tensor_without_rotation_metadata_is_refused(tmp_path, monkeypatch, with_manifest):
+    from nunchaku_lite import core
+
+    class FakeAdapter:
+        target = "rotation_fake_nomanifest"
+
+        def matches(self, transformer):
+            return False
+
+        def patch(self, transformer, checkpoint_state, quantization_config, options):
+            raise AssertionError("must refuse before patching")
+
+    state = {k: v.contiguous() for k, v in TinyModel().state_dict().items()}
+    state["proj.input_transform"] = hadamard_matrix(64)
+    quantization_config = {"runtime_manifest": _manifest(format_version=1, rotation=None)} if with_manifest else {}
+    path = tmp_path / "stray.safetensors"
+    save_file(state, path, metadata={"quantization_config": json.dumps(quantization_config)})
+    monkeypatch.setitem(core._ADAPTERS, FakeAdapter.target, FakeAdapter())
+    target = "manifest" if with_manifest else FakeAdapter.target
+    with pytest.raises(ValueError, match="activation-rotation tensors"):
+        patch_transformer(TinyModel(), path, target=target, torch_dtype=torch.bfloat16, device="cpu", strict=False)

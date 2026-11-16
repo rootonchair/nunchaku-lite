@@ -12,6 +12,7 @@ from typing import Any, Protocol
 import torch
 
 from .manifest import RuntimeManifest, parse_runtime_manifest, with_target_list_manifest
+from .rotation import INPUT_TRANSFORM_SUFFIX
 from .utils import fetch_or_download, get_precision, load_state_dict_in_safetensors
 
 
@@ -397,6 +398,14 @@ def _patch_component(
         if rank:
             quantization_config = {**quantization_config, "rank": int(rank)}
     adapter = _select_adapter_for_checkpoint(transformer, target, runtime_manifest)
+    rotation_tensors = [key for key in state_dict if key.endswith(INPUT_TRANSFORM_SUFFIX)]
+    if rotation_tensors and (runtime_manifest is None or not runtime_manifest.rotated_targets):
+        # Without rotation metadata the transform tensors would be dropped as unexpected keys
+        # (or ignored with strict=False), silently loading an unrotated runtime for rotated weights.
+        raise ValueError(
+            f"Checkpoint contains {len(rotation_tensors)} activation-rotation tensors (e.g. {rotation_tensors[0]!r}) "
+            "but no runtime_manifest declaring op_options.rotation; it cannot be loaded correctly."
+        )
     if runtime_manifest is not None and runtime_manifest.rotated_targets and adapter.target != "manifest":
         # Model-specific adapters rename modules and fuse MLPs, so they cannot honour per-target
         # rotations; loading through them would silently drop the rotation and give wrong outputs.
