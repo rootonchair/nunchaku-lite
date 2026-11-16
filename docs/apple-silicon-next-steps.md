@@ -112,9 +112,24 @@ the two-step warmup went from 87 s to 23 s.
 
 ### 3. Distribution
 
-6. **Hub build for Metal.** Add a `cpp-metal` section to `build.toml` and verify it
-   with kernel-builder, which needs Nix on a Mac. Without it, Mac users must build
-   the kernels locally while CUDA users get prebuilt ones.
+6. **Hub build for Metal.** `build.toml` now declares the `metal` backend and a
+   `cpp-metal` kernel (version 3), and kernel-builder builds all six Metal variants
+   (`torch210`-`torch215-metal-aarch64-darwin`). Each passes kernel-builder's checks
+   (macOS 15 ABI, loading with `get_kernel`), and the `torch213` and `torch215`
+   builds pass `nunchaku-lite-kernels/tests/test_metal_kernels.py` (plus
+   `tests/test_mps_backend.py` on 2.13) when loaded through `kernels.get_local_kernel`.
+   Notes for building:
+   - The C++ headers are `.hpp`: kernel-builder treats `.h` files in a Metal kernel
+     as shader sources. The shaders are compiled at runtime from source strings.
+   - The MPS registration uses `at::kMPS`, and the Metal 4 language version is set by
+     raw value, so the code compiles with the macOS 15 SDK as well as 26.
+   - Building on macOS needs the Determinate Nix installer, `sandbox = relaxed` and
+     the `huggingface.cachix.org` cache in `/etc/nix/nix.custom.conf`, and Xcode's
+     Metal toolchain component (`xcodebuild -downloadComponent MetalToolchain`);
+     without it the configure step fails silently.
+   Remaining: rebuild and test the CUDA variants on a GPU, publish as `v3` (leaves
+   `v2` untouched for released versions), and set `HF_KERNEL_VERSION = 3` in
+   `src/nunchaku_lite/ops/backend.py` in the same release.
 7. **Release the torch/mlx extras split.** `nunchaku_lite.mlx` now lives in the
    main package. A bare `pip install nunchaku-lite` no longer installs torch;
    CUDA users need `nunchaku-lite[torch]`. Call this out in the release notes.

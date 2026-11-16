@@ -4,7 +4,7 @@
 // Kept as a string so the same sources work with setup.py and kernel-builder builds.
 namespace nunchaku_lite::metal {
 
-static const char* kSvdqMetalSource = R"METAL(// Generated from nunchaku-lite-mlx/nunchaku_lite_mlx/kernels.py. Keep the two in sync.
+static const char* kSvdqMetalSource = R"METAL(// Generated from src/nunchaku_lite/mlx/kernels.py. Keep the two in sync.
 //
 // SVDQ W8A8 / W4A8 kernels for Apple-silicon GPUs with Neural Accelerators (M5 class).
 // The int32 accumulator runs through the whole K dimension inside mpp::tensor_ops::matmul2d;

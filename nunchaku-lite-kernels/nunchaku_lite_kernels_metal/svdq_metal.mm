@@ -12,9 +12,9 @@
 #include <ATen/mps/MPSStream.h>
 #include <c10/util/Exception.h>
 
-#include "svdq_metal.h"
-#include "qk_norm_rope_shaders.h"
-#include "svdq_shaders.h"
+#include "svdq_metal.hpp"
+#include "qk_norm_rope_shaders.hpp"
+#include "svdq_shaders.hpp"
 
 namespace nunchaku_lite::metal {
 namespace {
@@ -32,7 +32,9 @@ id<MTLLibrary> library() {
         id<MTLDevice> device = at::mps::MPSDevice::getInstance()->device();
         MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
         if (@available(macOS 26.0, *)) {
-            options.languageVersion = MTLLanguageVersion4_0;
+            // MTLLanguageVersion4_0 ((4 << 16) + 0) as a raw value: the enum constant exists only in the
+            // macOS 26 SDK, and kernel-builder currently builds with Xcode 16 (macOS 15 SDK).
+            options.languageVersion = static_cast<MTLLanguageVersion>((4 << 16) + 0);
         }
         NSError *error = nil;
         const std::string source = std::string(kSvdqMetalSource) + kQkNormRopeMetalSource;

@@ -8,7 +8,7 @@
 // Metal (MPS) builds compile only the SVDQ MPS kernels; CUDA builds compile the CUDA kernels.
 #if defined(METAL_KERNEL) || defined(NUNCHAKU_LITE_REGISTER_MPS_DISPATCH)
 #define NUNCHAKU_LITE_METAL_BUILD 1
-#include "../nunchaku_lite_kernels_metal/svdq_metal.h"
+#include "../nunchaku_lite_kernels_metal/svdq_metal.hpp"
 #else
 #include "ops_lite.h"
 #endif
@@ -210,9 +210,9 @@ TORCH_LIBRARY(nunchaku_lite_kernels, ops) {
 #endif
 
 #ifdef NUNCHAKU_LITE_METAL_BUILD
-    ops.impl("svdq_quantize_act_int8", torch::kMPS, &nunchaku_lite::metal::svdq_quantize_act_int8);
-    ops.impl("svdq_gemm_w8a8", torch::kMPS, &nunchaku_lite::metal::svdq_gemm_w8a8);
-    ops.impl("svdq_gemm_w4a8", torch::kMPS, &nunchaku_lite::metal::svdq_gemm_w4a8);
-    ops.impl("svdq_qk_norm_rope_", torch::kMPS, &nunchaku_lite::metal::svdq_qk_norm_rope_);
+    ops.impl("svdq_quantize_act_int8", at::kMPS, &nunchaku_lite::metal::svdq_quantize_act_int8);
+    ops.impl("svdq_gemm_w8a8", at::kMPS, &nunchaku_lite::metal::svdq_gemm_w8a8);
+    ops.impl("svdq_gemm_w4a8", at::kMPS, &nunchaku_lite::metal::svdq_gemm_w4a8);
+    ops.impl("svdq_qk_norm_rope_", at::kMPS, &nunchaku_lite::metal::svdq_qk_norm_rope_);
 #endif
 }
