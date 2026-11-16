@@ -20,6 +20,7 @@ from torch import nn
 from ..core import PatchOptions, register_adapter
 from ..linear import AWQW4A16Linear, SVDQW4A4Linear
 from ..ops.fused import fused_gelu_mlp
+from ..rotation import FUSED_MLP_FC2_ATTR
 from .common import (
     SVDQPatchContext,
     build_svdq_context,
@@ -115,6 +116,7 @@ class NunchakuQwenFeedForward(FeedForward):
         self.net = _patch_linear(ff.net, SVDQW4A4Linear, **linear_kwargs)
         if len(self.net) > 2 and isinstance(self.net[2], SVDQW4A4Linear):
             self.net[2].act_unsigned = self.net[2].precision != "nvfp4"
+            setattr(self.net[2], FUSED_MLP_FC2_ATTR, True)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run the quantized feed-forward block.

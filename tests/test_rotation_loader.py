@@ -1,19 +1,28 @@
 import copy
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
+from diffusers import Flux2Transformer2DModel
 from safetensors.torch import save_file
 from torch import nn
 
 from nunchaku_lite import linear as linear_mod
 from nunchaku_lite import patch_transformer
+from nunchaku_lite.adapters.flux2 import Flux2Adapter
 from nunchaku_lite.adapters.manifest import ManifestAdapter
 from nunchaku_lite.linear import SVDQW4A4Linear
 from nunchaku_lite.manifest import parse_runtime_manifest
 from nunchaku_lite.ops.fused import fused_gelu_mlp
 from nunchaku_lite.ops.quantize import hadamard_matrix
-from nunchaku_lite.rotation import HADAMARD64, resolve_input_rotation
+from nunchaku_lite.rotation import (
+    FUSED_MLP_FC2_ATTR,
+    HADAMARD64,
+    bind_input_rotations,
+    parse_rotation_declaration,
+    resolve_input_rotation,
+)
 
 ROTATION = {"type": "block_matrix", "block_size": 64, "shared": True, "generator": "hadamard"}
 
@@ -325,3 +334,142 @@ def test_rotation_tensor_without_rotation_metadata_is_refused(tmp_path, monkeypa
     target = "manifest" if with_manifest else FakeAdapter.target
     with pytest.raises(ValueError, match="activation-rotation tensors"):
         patch_transformer(TinyModel(), path, target=target, torch_dtype=torch.bfloat16, device="cpu", strict=False)
+
+
+# --- model-specific adapters (quantization_config.input_rotation) -----------------------
+
+DECLARATION = {"format_version": 2, **ROTATION}
+
+
+def _tiny_flux2():
+    return Flux2Transformer2DModel(
+        in_channels=16,
+        num_layers=1,
+        num_single_layers=1,
+        attention_head_dim=32,
+        num_attention_heads=2,
+        joint_attention_dim=64,
+        guidance_embeds=False,
+        axes_dims_rope=(8, 8, 8, 8),
+        timestep_guidance_channels=32,
+    )
+
+
+def _flux2_checkpoint(tmp_path, transforms, quantization_config):
+    source = _tiny_flux2()
+    options = SimpleNamespace(
+        precision="int4", torch_dtype=torch.bfloat16, device=None, strict=True, adapter_options={}
+    )
+    Flux2Adapter().patch(source, {}, {"rank": 16}, options)
+    state = {k: v.contiguous() for k, v in source.state_dict().items()}
+    state.update(transforms)
+    path = tmp_path / "flux2-rotated.safetensors"
+    save_file(state, path, metadata={"quantization_config": json.dumps({"rank": 16, **quantization_config})})
+    return path
+
+
+def test_rotation_declaration_parses_and_validates():
+    assert parse_rotation_declaration({}) is None
+    assert parse_rotation_declaration({"input_rotation": DECLARATION}) == ROTATION
+    with pytest.raises(ValueError, match="format_version"):
+        parse_rotation_declaration({"input_rotation": {**DECLARATION, "format_version": 1}})
+    with pytest.raises(ValueError, match="re-export"):
+        parse_rotation_declaration({"input_rotation": {"format_version": 2, "type": "hadamard", "block_size": 64}})
+
+
+@pytest.mark.parametrize(
+    "transform_key",
+    [
+        "transformer_blocks.0.attn.to_qkv.input_transform",  # lite module name
+        "transformer_blocks.0.qkv_proj.input_transform",  # original nunchaku export name
+    ],
+)
+def test_flux2_adapter_binds_declared_rotation_per_layer(tmp_path, transform_key):
+    path = _flux2_checkpoint(
+        tmp_path,
+        {
+            transform_key: hadamard_matrix(64),
+            "single_transformer_blocks.0.attn.mlp_fc2.input_transform": hadamard_matrix(64),
+        },
+        {"input_rotation": DECLARATION},
+    )
+    transformer = _tiny_flux2()
+    patch_transformer(transformer, path, target="flux2", precision="int4", torch_dtype=torch.bfloat16)
+
+    assert transformer.transformer_blocks[0].attn.to_qkv.input_rotation == HADAMARD64
+    assert transformer.single_transformer_blocks[0].attn.mlp_fc2.input_rotation == HADAMARD64
+    assert transformer.single_transformer_blocks[0].attn.qkv_proj.input_rotation is None
+    assert transformer.transformer_blocks[0].ff.linear_in.input_rotation is None
+    assert not transformer._nunchaku_lite_incompatible_keys.unexpected_keys
+
+
+def test_flux2_rotation_tensors_without_declaration_are_refused(tmp_path):
+    path = _flux2_checkpoint(tmp_path, {"transformer_blocks.0.attn.to_qkv.input_transform": hadamard_matrix(64)}, {})
+    with pytest.raises(ValueError, match="no rotation metadata"):
+        patch_transformer(_tiny_flux2(), path, target="flux2", precision="int4", strict=False)
+
+
+def test_declaration_without_tensors_is_refused(tmp_path):
+    path = _flux2_checkpoint(tmp_path, {}, {"input_rotation": DECLARATION})
+    with pytest.raises(ValueError, match="no input_transform tensors"):
+        patch_transformer(_tiny_flux2(), path, target="flux2", precision="int4")
+
+
+def test_adapter_without_rotation_support_is_refused(tmp_path, monkeypatch):
+    from nunchaku_lite import core
+
+    monkeypatch.setattr(Flux2Adapter, "supports_input_rotation", False)
+    path = _flux2_checkpoint(
+        tmp_path,
+        {"transformer_blocks.0.attn.to_qkv.input_transform": hadamard_matrix(64)},
+        {"input_rotation": DECLARATION},
+    )
+    assert core._ADAPTERS["flux2"].supports_input_rotation is False
+    with pytest.raises(ValueError, match="does not support"):
+        patch_transformer(_tiny_flux2(), path, target="flux2", precision="int4")
+
+
+class _BindModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = SVDQW4A4Linear(128, 128, rank=16)
+        self.dense = nn.Linear(128, 128)
+
+
+def test_bind_input_rotations_validates_each_layer():
+    model = _BindModel()
+    state = {"a.input_transform": hadamard_matrix(64), "a.qweight": torch.zeros(1)}
+    assert bind_input_rotations(model, state, ROTATION) == ["a"]
+    assert model.a.input_rotation == HADAMARD64 and list(state) == ["a.qweight"]
+
+    with pytest.raises(ValueError, match="does not belong"):
+        bind_input_rotations(_BindModel(), {"missing.input_transform": hadamard_matrix(64)}, ROTATION)
+    with pytest.raises(ValueError, match="not an SVDQ"):
+        bind_input_rotations(_BindModel(), {"dense.input_transform": hadamard_matrix(64)}, ROTATION)
+
+    unsigned = _BindModel()
+    unsigned.a.act_unsigned = True
+    with pytest.raises(ValueError, match="unsigned or fused-MLP"):
+        bind_input_rotations(unsigned, {"a.input_transform": hadamard_matrix(64)}, ROTATION)
+
+    fused = _BindModel()
+    setattr(fused.a, FUSED_MLP_FC2_ATTR, True)
+    with pytest.raises(ValueError, match="unsigned or fused-MLP"):
+        bind_input_rotations(fused, {"a.input_transform": hadamard_matrix(64)}, ROTATION)
+
+    fp4 = _BindModel()
+    fp4.a = SVDQW4A4Linear(128, 128, rank=16, precision="nvfp4")
+    with pytest.raises(ValueError, match="allow_fp4_rotation"):
+        bind_input_rotations(fp4, {"a.input_transform": hadamard_matrix(64)}, ROTATION)
+    assert bind_input_rotations(fp4, {"a.input_transform": hadamard_matrix(64)}, ROTATION, allow_fp4=True) == ["a"]
+
+
+def test_fused_adapters_mark_their_fused_fc2():
+    from diffusers.models.attention import FeedForward
+
+    from nunchaku_lite.adapters.common import SVDQPatchContext
+    from nunchaku_lite.adapters.ltx2 import _patch_ltx2_feed_forward
+
+    context = SVDQPatchContext(precision="int4", rank=16, torch_dtype=torch.bfloat16)
+    ff = _patch_ltx2_feed_forward(FeedForward(64, activation_fn="gelu-approximate"), context)
+    assert getattr(ff.net[2], FUSED_MLP_FC2_ATTR, False)

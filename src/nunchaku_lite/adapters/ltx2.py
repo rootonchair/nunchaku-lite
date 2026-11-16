@@ -23,6 +23,7 @@ from ..ops.fused import (
     fused_gelu_mlp,
     fused_rms_norm_modulate,
 )
+from ..rotation import FUSED_MLP_FC2_ATTR
 from .attention_dispatch import dispatch_lite_attention_fn
 from .common import (
     SVDQPatchContext,
@@ -41,6 +42,7 @@ def _patch_ltx2_feed_forward(ff: FeedForward, context: SVDQPatchContext) -> Feed
     )
     if len(ff.net) > 2 and isinstance(ff.net[2], SVDQW4A4Linear):
         ff.net[2].act_unsigned = False
+        setattr(ff.net[2], FUSED_MLP_FC2_ATTR, True)
     ff._nunchaku_lite_ltx2_original_forward = ff.forward
     ff.forward = types.MethodType(_ltx2_feed_forward, ff)
     return ff
