@@ -10,7 +10,13 @@ from nunchaku_lite.adapters.flux2 import (
     MPSFusedFlux2ParallelSelfAttnProcessor,
     install_mps_fused_attention,
 )
-from nunchaku_lite.ops.mps_fused import fused_qk_norm_rope_available, qk_norm_rope_mps
+from nunchaku_lite.ops.mps_fused import (
+    attention_mps,
+    attention_mps_available,
+    attention_supported,
+    fused_qk_norm_rope_available,
+    qk_norm_rope_mps,
+)
 
 needs_mps = pytest.mark.skipif(not fused_qk_norm_rope_available(), reason="requires MPS with torch.mps.compile_shader")
 DIM, HEADS = 256, 2
@@ -91,3 +97,44 @@ def test_qk_norm_rope_rejects_mismatched_tables():
     cos, sin = _tables(5, "mps")
     with pytest.raises(ValueError):
         qk_norm_rope_mps(x, x, x, None, None, cos, sin, 1, eps_q=1e-6, eps_k=1e-6)
+
+
+needs_nax = pytest.mark.skipif(not attention_mps_available(), reason="requires an M5-class GPU (Neural Accelerators)")
+
+
+@needs_nax
+@pytest.mark.parametrize(
+    "batch,q_len,k_len,heads,kv_heads,dim,dtype",
+    [
+        (1, 4608, 4608, 24, 24, 128, torch.bfloat16),  # FLUX.2-klein 1024², aligned
+        (2, 1000, 777, 8, 2, 64, torch.float16),  # unaligned lengths, grouped-query heads
+        (1, 300, 300, 4, 4, 96, torch.bfloat16),
+    ],
+)
+def test_attention_mps_matches_float32_reference(batch, q_len, k_len, heads, kv_heads, dim, dtype):
+    torch.manual_seed(0)
+    q = torch.randn(batch, q_len, heads, dim, device="mps", dtype=dtype) * 2
+    k = torch.randn(batch, k_len, kv_heads, dim, device="mps", dtype=dtype) * 2
+    v = torch.randn(batch, k_len, kv_heads, dim, device="mps", dtype=dtype)
+    assert attention_supported(q, k, v)
+    out = attention_mps(q, k, v)
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        *(t.transpose(1, 2).float() for t in (q, k, v)), enable_gqa=True
+    ).transpose(1, 2)
+    assert out.shape == q.shape and out.dtype == dtype and out.is_contiguous()
+    tol = (1e-2 if dtype == torch.bfloat16 else 2e-3) * ref.abs().max().item()
+    torch.testing.assert_close(out.float(), ref, rtol=0, atol=tol)
+
+
+@needs_nax
+def test_attention_mps_reads_strided_views():
+    torch.manual_seed(0)
+    qkv = torch.randn(1, 200, 3, 4, 128, device="mps", dtype=torch.float16)  # (B, L, 3, H, D): q/k/v interleaved
+    q, k, v = qkv.unbind(2)
+    ref = torch.nn.functional.scaled_dot_product_attention(*(t.transpose(1, 2).float() for t in (q, k, v)))
+    torch.testing.assert_close(attention_mps(q, k, v).float(), ref.transpose(1, 2), rtol=0, atol=2e-3)
+
+
+def test_attention_supported_rejects_unsupported_inputs():
+    q = torch.zeros(1, 8, 2, 128)
+    assert not attention_supported(q, q, q)  # CPU

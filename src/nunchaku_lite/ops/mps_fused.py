@@ -1,17 +1,28 @@
-"""Fused attention prologue for PyTorch MPS: per-head q/k RMSNorm + RoPE, compiled at runtime.
+"""Fused attention kernels for PyTorch MPS, compiled at runtime with ``torch.mps.compile_shader``.
 
-Diffusers runs the FLUX.2 q/k norm and rotary embedding as a chain of float32 elementwise ops plus concatenations;
-on MPS that costs about a sixth of a FLUX.2-klein denoising step. :func:`qk_norm_rope_mps` does it in one Metal
-pass. The kernel is compiled with ``torch.mps.compile_shader``, so it needs no ``nunchaku_lite_kernels`` build.
+* :func:`qk_norm_rope_mps`: per-head q/k RMSNorm + RoPE in one pass. Diffusers runs the FLUX.2 version as a chain
+  of float32 elementwise ops plus concatenations, about a sixth of a FLUX.2-klein denoising step on MPS.
+* :func:`attention_mps`: MLX's Neural Accelerator flash attention (vendored in :mod:`._mlx_steel_attention`) on
+  M5-class GPUs. PyTorch's own MPS attention runs at about a quarter of its speed, with about 3x the error.
+
+Neither needs a ``nunchaku_lite_kernels`` build.
 """
 
 from __future__ import annotations
 
 import functools
+import re
+import struct
 
 import torch
 
-__all__ = ["fused_qk_norm_rope_available", "qk_norm_rope_mps"]
+__all__ = [
+    "attention_mps",
+    "attention_mps_available",
+    "attention_supported",
+    "fused_qk_norm_rope_available",
+    "qk_norm_rope_mps",
+]
 
 # One simdgroup per (token, head): 32 lanes x 4 channels of a 128-wide head. Text rows (if any) come first, then
 # image rows. q, k and v each have their own source pointer (they may alias one fused projection buffer), so
@@ -179,3 +190,116 @@ def qk_norm_rope_mps(
         group_size=(32 * group, 1, 1),
     )
     return tuple(out)
+
+
+# ---------------------------------------------------------------------------
+# Flash attention on the Neural Accelerators (MLX's steel NAX kernel)
+# ---------------------------------------------------------------------------
+
+_ATTN_BQ, _ATTN_BK, _ATTN_WM = 64, 32, 4  # MLX's NAX tile for head dims 64-128 (query block, key block, simdgroups)
+_ATTN_HEAD_DIMS = (64, 96, 128)
+_ATTN_TYPES = {torch.float16: "half", torch.bfloat16: "bfloat"}
+
+
+@functools.cache
+def _attention_library(align_q: bool, align_k: bool):
+    """Compile the kernel for one (query, key) alignment. MLX selects these features with Metal function
+    constants, which ``compile_shader`` cannot set, so they become compile-time constants here."""
+
+    from ._mlx_steel_attention import SOURCE
+
+    consts = {
+        "align_Q": align_q,
+        "align_K": align_k,
+        "has_mask": False,
+        "do_causal": False,
+        "has_sinks": False,
+        "save_lse": False,
+    }
+    source = SOURCE
+    for name, value in consts.items():
+        source, n = re.subn(
+            rf"constant bool {name} \[\[function_constant\(\d+\)\]\];",
+            f"constant constexpr bool {name} = {str(value).lower()};",
+            source,
+        )
+        if n != 1:
+            raise RuntimeError(f"Vendored MLX attention source has no function constant {name!r}.")
+    source = re.sub(r", function_constant\(\w+\)\]\]", "]]", source)
+    for t in _ATTN_TYPES.values():
+        for d in _ATTN_HEAD_DIMS:
+            source += (
+                f'instantiate_kernel("attention_{t}_{d}", attention_nax, {t}, {_ATTN_BQ}, {_ATTN_BK}, {d}, {d}, '
+                f"{_ATTN_WM}, 1, {t}, float)\n"
+            )
+    return torch.mps.compile_shader(source)
+
+
+@functools.cache
+def attention_mps_available() -> bool:
+    """Whether :func:`attention_mps` can run: an M5-class GPU and a PyTorch with ``torch.mps.compile_shader``."""
+
+    from .mps import has_neural_accelerators
+
+    if not (torch.backends.mps.is_available() and hasattr(torch.mps, "compile_shader") and has_neural_accelerators()):
+        return False
+    try:
+        _attention_library(True, True)
+    except Exception:  # noqa: BLE001 - any compile failure means: use PyTorch's attention
+        return False
+    return True
+
+
+def attention_supported(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> bool:
+    """Whether :func:`attention_mps` handles these ``(B, L, H, D)`` tensors (no mask, no dropout)."""
+
+    return (
+        query.device.type == "mps"
+        and query.dtype in _ATTN_TYPES
+        and query.dtype == key.dtype == value.dtype
+        and query.ndim == key.ndim == value.ndim == 4
+        and query.shape[-1] in _ATTN_HEAD_DIMS
+        and key.shape[-1] == value.shape[-1] == query.shape[-1]
+        and key.shape[:3] == value.shape[:3]
+        and query.shape[0] == key.shape[0]
+        and query.shape[2] % key.shape[2] == 0
+        and query.stride(-1) == key.stride(-1) == value.stride(-1) == 1
+        and attention_mps_available()
+    )
+
+
+def attention_mps(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, scale: float | None = None
+) -> torch.Tensor:
+    """Softmax attention over ``(B, L, H, D)`` tensors (Diffusers' layout), returning ``(B, Lq, H, D)``.
+
+    Any strides with a contiguous head dim are read in place; grouped-query attention (fewer key/value heads) is
+    supported. Call :func:`attention_supported` first.
+    """
+
+    batch, q_len, heads, dim = query.shape
+    k_len, kv_heads = key.shape[1], key.shape[2]
+    scale = dim**-0.5 if scale is None else float(scale)
+    out = torch.empty_like(query, memory_format=torch.contiguous_format)
+    bq, bk = _ATTN_BQ, _ATTN_BK
+    nq, nk, nq_full, nk_full = -(-q_len // bq), -(-k_len // bk), q_len // bq, k_len // bk
+
+    def strides(t):  # (B, L, H, D) -> the kernel's (B, H, L) strides
+        return t.stride(0), t.stride(2), t.stride(1)
+
+    params = struct.pack(
+        "<6if7i12q",
+        batch, heads, dim, q_len, k_len, heads // kv_heads, scale, nq, nk, nq_full, nk_full,
+        q_len - nq_full * bq, k_len - nk_full * bk, k_len - q_len,
+        *strides(query), *strides(key), *strides(value), *strides(out),
+    )  # fmt: skip
+    params = torch.frombuffer(bytearray(params), dtype=torch.uint8).to(query.device)
+    unused = torch.empty(16, dtype=torch.uint8, device=query.device)  # mask / sinks / lse slots (disabled)
+    kernel = getattr(
+        _attention_library(q_len % bq == 0, k_len % bk == 0), f"attention_{_ATTN_TYPES[query.dtype]}_{dim}"
+    )
+    kernel(
+        query, key, value, out, params, unused, unused, unused, unused,
+        threads=(nq * 32, heads * _ATTN_WM, batch), group_size=(32, _ATTN_WM, 1),
+    )  # fmt: skip
+    return out

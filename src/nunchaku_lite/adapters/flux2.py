@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 from diffusers.models.attention import AttentionModuleMixin
-from diffusers.models.attention_dispatch import dispatch_attention_fn
+from diffusers.models.attention_dispatch import AttentionBackendName, _AttentionBackendRegistry, dispatch_attention_fn
 from diffusers.models.embeddings import apply_rotary_emb
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.transformers.transformer_flux2 import (
@@ -22,7 +22,7 @@ from torch import nn
 from ..checkpoint_keys import convert_flux2_state_dict, flux2_state_dict_needs_conversion
 from ..core import PatchOptions, register_adapter
 from ..ops.fused import fused_qkv_norm_rotary
-from ..ops.mps_fused import fused_qk_norm_rope_available, qk_norm_rope_mps
+from ..ops.mps_fused import attention_mps, attention_supported, fused_qk_norm_rope_available, qk_norm_rope_mps
 from .common import (
     SVDQPatchContext,
     build_svdq_context,
@@ -437,6 +437,22 @@ def _fusable(attn, hidden_states, attention_mask, image_rotary_emb, norms) -> bo
     return fused_qk_norm_rope_available()
 
 
+def _mps_attention(processor, query, key, value):
+    """Neural Accelerator flash attention when Diffusers would use its native backend, else Diffusers' dispatch."""
+
+    backend = processor._attention_backend or _AttentionBackendRegistry.get_active_backend()[0]
+    if (
+        backend == AttentionBackendName.NATIVE
+        and processor._parallel_config is None
+        and attention_supported(query, key, value)
+    ):
+        return attention_mps(query, key, value)
+    return dispatch_attention_fn(
+        query, key, value, attn_mask=None, backend=processor._attention_backend,
+        parallel_config=processor._parallel_config,
+    )  # fmt: skip
+
+
 class MPSFusedFlux2AttnProcessor(Flux2AttnProcessor):
     """Diffusers ``Flux2AttnProcessor`` with the fused MPS prologue (joint text + image attention)."""
 
@@ -457,9 +473,7 @@ class MPSFusedFlux2AttnProcessor(Flux2AttnProcessor):
             text_q_weight=attn.norm_added_q.weight if joint else None,
             text_k_weight=attn.norm_added_k.weight if joint else None,
         )  # fmt: skip
-        hidden_states = dispatch_attention_fn(
-            query, key, value, attn_mask=None, backend=self._attention_backend, parallel_config=self._parallel_config
-        )
+        hidden_states = _mps_attention(self, query, key, value)
         hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
@@ -490,9 +504,7 @@ class MPSFusedFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
             attn.norm_q.weight, attn.norm_k.weight, cos, sin, attn.heads,
             eps_q=_eps(attn.norm_q, proj.dtype), eps_k=_eps(attn.norm_k, proj.dtype),
         )  # fmt: skip
-        hidden_states = dispatch_attention_fn(
-            query, key, value, attn_mask=None, backend=self._attention_backend, parallel_config=self._parallel_config
-        )
+        hidden_states = _mps_attention(self, query, key, value)
         hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
         mlp_hidden_states = attn.mlp_act_fn(proj[..., 3 * inner :])
         return attn.to_out(torch.cat([hidden_states, mlp_hidden_states], dim=-1))
