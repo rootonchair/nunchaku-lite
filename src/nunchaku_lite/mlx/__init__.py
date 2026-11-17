@@ -1,6 +1,6 @@
 """MLX / Apple-silicon runtime for Nunchaku SVDQ checkpoints (mirrors the ``nunchaku_lite`` API)."""
 
-from .kernels import has_neural_accelerators, svdq_gemm_w4a8, svdq_gemm_w8a8, svdq_quantize_act_int8
+from .kernels import has_neural_accelerators, qk_norm_rope, svdq_gemm_w4a8, svdq_gemm_w8a8, svdq_quantize_act_int8
 from .keymap import PrefixMap
 from .linear import BACKENDS, GELU_SHIFT, AWQW4A16Linear, SVDQW4A4Linear, resolve_backend
 from .manifest import apply_runtime_manifest, parse_runtime_manifest
@@ -23,6 +23,7 @@ __all__ = [
     "pack_svdq_int4",
     "parse_runtime_manifest",
     "patch_transformer",
+    "qk_norm_rope",
     "register_adapter",
     "resolve_backend",
     "svdq_gemm_w4a8",

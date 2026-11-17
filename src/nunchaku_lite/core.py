@@ -341,6 +341,17 @@ def _load_quantized_encoder_component(
         ) from exc
 
 
+def _install_mps_fused_attention(transformer: torch.nn.Module) -> None:
+    """On Apple silicon, route stock FLUX.2 attention processors through the fused MPS q/k norm + RoPE kernel
+    (they fall back to the stock processor per call when it does not apply)."""
+
+    if not torch.backends.mps.is_available():
+        return
+    from .adapters.flux2 import install_mps_fused_attention
+
+    install_mps_fused_attention(transformer)
+
+
 def _patch_component(
     transformer: torch.nn.Module,
     checkpoint: str | Path,
@@ -396,6 +407,7 @@ def _patch_component(
     if device is not None:
         transformer.to(device)
     configure_backend(transformer, backend)
+    _install_mps_fused_attention(transformer)
 
     transformer._nunchaku_lite_patched = True
     transformer._nunchaku_lite_target = adapter.target

@@ -42,6 +42,7 @@ __all__ = [
     "TILE_M",
     "default_tile",
     "has_neural_accelerators",
+    "qk_norm_rope",
     "svdq_gemm_w4a8",
     "svdq_gemm_w8a8",
     "svdq_quantize_act_int8",
@@ -239,6 +240,36 @@ _SRC_QUANT = r"""
     }
 """
 
+# Attention prologue for FLUX.2-style blocks: per-head RMSNorm of q and k, interleaved-pair RoPE, and the
+# (tokens, heads * 128) -> (1, heads, tokens, 128) layout change, in one pass over q/k/v. One simdgroup per
+# (token, head): 32 lanes x 4 channels. Text rows (if any) come first, then image rows (joint attention).
+_SRC_QK_NORM_ROPE = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const uint head = threadgroup_position_in_grid.x * (threads_per_threadgroup.x / 32) + simdgroup_index_in_threadgroup;
+    const uint row = threadgroup_position_in_grid.y;
+    const int Lt = dims[0], L = dims[1], st_t = dims[2], st_i = dims[3], qo = dims[4], ko = dims[5], vo = dims[6];
+    const float eps = epsb[0];
+    const bool txt = int(row) < Lt;
+    const device T* src = txt ? xt + (size_t)row * st_t : xi + (size_t)(row - Lt) * st_i;
+    const device float* wq = txt ? wqt : wqi;
+    const device float* wk = txt ? wkt : wki;
+    const uint c = head * 128 + lane * 4;
+    const size_t o = ((size_t)head * L + row) * 128 + lane * 4;
+    const float2 cs = *(const device float2*)(cosb + (size_t)row * 64 + lane * 2);
+    const float2 sn = *(const device float2*)(sinb + (size_t)row * 64 + lane * 2);
+    float4 q = float4(*(const device vec<T, 4>*)(src + qo + c));
+    float4 k = float4(*(const device vec<T, 4>*)(src + ko + c));
+    q *= rsqrt(simd_sum(dot(q, q)) / 128.f + eps) * *(const device float4*)(wq + lane * 4);
+    k *= rsqrt(simd_sum(dot(k, k)) / 128.f + eps) * *(const device float4*)(wk + lane * 4);
+    const float4 qr = float4(q.x * cs.x - q.y * sn.x, q.y * cs.x + q.x * sn.x,
+                             q.z * cs.y - q.w * sn.y, q.w * cs.y + q.z * sn.y);
+    const float4 kr = float4(k.x * cs.x - k.y * sn.x, k.y * cs.x + k.x * sn.x,
+                             k.z * cs.y - k.w * sn.y, k.w * cs.y + k.z * sn.y);
+    *(device vec<T, 4>*)(q_out + o) = vec<T, 4>(qr);
+    *(device vec<T, 4>*)(k_out + o) = vec<T, 4>(kr);
+    *(device vec<T, 4>*)(v_out + o) = *(const device vec<T, 4>*)(src + vo + c);
+"""
+
 _OUT_TYPES = {mx.float16: "half", mx.bfloat16: "bfloat", mx.float32: "float"}
 
 
@@ -274,6 +305,88 @@ def svdq_quantize_act_int8(x: mx.array, inv_smooth: mx.array, shift: mx.array) -
         threadgroup=(256, 1, 1),
         output_shapes=[(m, k), (m,)],
         output_dtypes=[mx.int8, mx.float32],
+    )
+
+
+@functools.cache
+def _qk_norm_rope_kernel():
+    return mx.fast.metal_kernel(
+        name="nunchaku_lite_qk_norm_rope",
+        input_names=["xt", "xi", "wqt", "wkt", "wqi", "wki", "cosb", "sinb", "epsb", "dims"],
+        output_names=["q_out", "k_out", "v_out"],
+        source=_SRC_QK_NORM_ROPE,
+    )
+
+
+def qk_norm_rope(
+    x: mx.array,
+    offsets: tuple[int, int, int],
+    q_weight: mx.array,
+    k_weight: mx.array,
+    cos: mx.array,
+    sin: mx.array,
+    heads: int,
+    *,
+    eps: float = 1e-5,
+    text: mx.array | None = None,
+    text_q_weight: mx.array | None = None,
+    text_k_weight: mx.array | None = None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Fused attention prologue: q/k RMSNorm, RoPE and head-major layout (head dim 128).
+
+    Reads q, k and v straight from a projection output (no slicing copies) and returns ``(1, heads, L, 128)``
+    tensors ready for ``mx.fast.scaled_dot_product_attention``. Norm and rotation run in float32; the result is
+    rounded once to ``x.dtype``.
+
+    Args:
+        x: Image-token rows ``(Li, C)`` holding q, k and v at column ``offsets`` (each ``heads * 128`` wide).
+        offsets: Column offsets of q, k and v in ``x`` (and in ``text``).
+        q_weight, k_weight: RMSNorm weights ``(128,)`` for the image rows.
+        cos, sin: Rotary tables ``(L, 64)`` for all ``L = Lt + Li`` rows (text first); pair ``i`` is channels
+            ``2i, 2i + 1``.
+        heads: Number of attention heads.
+        eps: RMSNorm epsilon.
+        text: Optional text-token rows ``(Lt, C')``, same offsets, placed before the image rows.
+        text_q_weight, text_k_weight: RMSNorm weights for the text rows.
+    """
+
+    li, st_i = x.shape
+    if text is None:
+        text, text_q_weight, text_k_weight, lt, st_t = x, q_weight, k_weight, 0, st_i
+    else:
+        lt, st_t = text.shape
+    total = lt + li
+    width = heads * 128
+    if text.dtype != x.dtype or x.dtype not in _OUT_TYPES:
+        raise ValueError(f"Unsupported activation dtypes {text.dtype} / {x.dtype}.")
+    if max(offsets) + width > min(st_i, st_t) or min(offsets) < 0 or any(o % 4 for o in offsets):
+        raise ValueError(f"q/k/v offsets {offsets} do not fit rows of width {min(st_i, st_t)} (heads={heads}).")
+    if cos.shape != (total, 64) or sin.shape != (total, 64):
+        raise ValueError(f"Rotary tables must be ({total}, 64), got {cos.shape} and {sin.shape}.")
+    group = next(g for g in (8, 4, 2, 1) if heads % g == 0)
+    f32 = lambda t: t.astype(mx.float32)
+    dims = mx.array([lt, total, st_t, st_i, *offsets], dtype=mx.int32)
+    shape = (1, heads, total, 128)
+    return tuple(
+        _qk_norm_rope_kernel()(
+            inputs=[
+                text,
+                x,
+                f32(text_q_weight),
+                f32(text_k_weight),
+                f32(q_weight),
+                f32(k_weight),
+                f32(cos),
+                f32(sin),
+                mx.array([eps], dtype=mx.float32),
+                dims,
+            ],
+            template=[("T", x.dtype)],
+            grid=(heads * 32, total, 1),
+            threadgroup=(32 * group, 1, 1),
+            output_shapes=[shape] * 3,
+            output_dtypes=[x.dtype] * 3,
+        )
     )
 
 
@@ -320,7 +433,7 @@ def default_tile(kind: str, m: int, n: int, k: int) -> tuple[int, int, int, int,
     if m % TILE_M:
         return (64, 64, 4, 64, 4)
     if k >= 8192 and n % 128 == 0:
-        return (TILE_M, 128, 8, 64, 1 if kind == "w8" else 4)
+        return (TILE_M, 128, 8, 32, 2) if kind == "w8" else (TILE_M, 128, 8, 64, 4)
     return (TILE_M, 64, 4, 64, 8 if kind == "w8" else 4)
 
 

@@ -20,6 +20,7 @@ import mlx.core as mx
 from mlx import nn
 
 from ..checkpoint_keys import convert_flux2_state_dict
+from .flux2_attention import install_fused_attention
 from .keymap import PrefixMap
 from .linear import AWQW4A16Linear, SVDQW4A4Linear, resolve_backend
 from .manifest import RuntimeManifest, apply_runtime_manifest, parse_runtime_manifest
@@ -343,6 +344,8 @@ class Flux2Adapter:
             )
         if rebuilt:
             _require_complete(pipeline.transformer, loaded)
+        if mx.metal.is_available():
+            install_fused_attention(pipeline.transformer)  # q/k norm + RoPE in one kernel (Metal GPUs)
 
     def _patch_nunchaku(self, transformer, state, key_map, backend: str, strict: bool) -> set[str]:
         used: set[str] = set()
