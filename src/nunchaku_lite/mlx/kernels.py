@@ -38,6 +38,8 @@ import re
 
 import mlx.core as mx
 
+from ..shaders import QK_NORM_ROPE, QK_NORM_ROPE_INPUTS, QK_NORM_ROPE_OUTPUTS
+
 __all__ = [
     "TILE_M",
     "default_tile",
@@ -240,36 +242,6 @@ _SRC_QUANT = r"""
     }
 """
 
-# Attention prologue for FLUX.2-style blocks: per-head RMSNorm of q and k, interleaved-pair RoPE, and the
-# (tokens, heads * 128) -> (1, heads, tokens, 128) layout change, in one pass over q/k/v. One simdgroup per
-# (token, head): 32 lanes x 4 channels. Text rows (if any) come first, then image rows (joint attention).
-_SRC_QK_NORM_ROPE = r"""
-    const uint lane = thread_index_in_simdgroup;
-    const uint head = threadgroup_position_in_grid.x * (threads_per_threadgroup.x / 32) + simdgroup_index_in_threadgroup;
-    const uint row = threadgroup_position_in_grid.y;
-    const int Lt = dims[0], L = dims[1], st_t = dims[2], st_i = dims[3], qo = dims[4], ko = dims[5], vo = dims[6];
-    const float eps = epsb[0];
-    const bool txt = int(row) < Lt;
-    const device T* src = txt ? xt + (size_t)row * st_t : xi + (size_t)(row - Lt) * st_i;
-    const device float* wq = txt ? wqt : wqi;
-    const device float* wk = txt ? wkt : wki;
-    const uint c = head * 128 + lane * 4;
-    const size_t o = ((size_t)head * L + row) * 128 + lane * 4;
-    const float2 cs = *(const device float2*)(cosb + (size_t)row * 64 + lane * 2);
-    const float2 sn = *(const device float2*)(sinb + (size_t)row * 64 + lane * 2);
-    float4 q = float4(*(const device vec<T, 4>*)(src + qo + c));
-    float4 k = float4(*(const device vec<T, 4>*)(src + ko + c));
-    q *= rsqrt(simd_sum(dot(q, q)) / 128.f + eps) * *(const device float4*)(wq + lane * 4);
-    k *= rsqrt(simd_sum(dot(k, k)) / 128.f + eps) * *(const device float4*)(wk + lane * 4);
-    const float4 qr = float4(q.x * cs.x - q.y * sn.x, q.y * cs.x + q.x * sn.x,
-                             q.z * cs.y - q.w * sn.y, q.w * cs.y + q.z * sn.y);
-    const float4 kr = float4(k.x * cs.x - k.y * sn.x, k.y * cs.x + k.x * sn.x,
-                             k.z * cs.y - k.w * sn.y, k.w * cs.y + k.z * sn.y);
-    *(device vec<T, 4>*)(q_out + o) = vec<T, 4>(qr);
-    *(device vec<T, 4>*)(k_out + o) = vec<T, 4>(kr);
-    *(device vec<T, 4>*)(v_out + o) = *(const device vec<T, 4>*)(src + vo + c);
-"""
-
 _OUT_TYPES = {mx.float16: "half", mx.bfloat16: "bfloat", mx.float32: "float"}
 
 
@@ -312,9 +284,9 @@ def svdq_quantize_act_int8(x: mx.array, inv_smooth: mx.array, shift: mx.array) -
 def _qk_norm_rope_kernel():
     return mx.fast.metal_kernel(
         name="nunchaku_lite_qk_norm_rope",
-        input_names=["xt", "xi", "wqt", "wkt", "wqi", "wki", "cosb", "sinb", "epsb", "dims"],
-        output_names=["q_out", "k_out", "v_out"],
-        source=_SRC_QK_NORM_ROPE,
+        input_names=list(QK_NORM_ROPE_INPUTS),
+        output_names=list(QK_NORM_ROPE_OUTPUTS),
+        source=QK_NORM_ROPE,
     )
 
 
@@ -365,21 +337,15 @@ def qk_norm_rope(
         raise ValueError(f"Rotary tables must be ({total}, 64), got {cos.shape} and {sin.shape}.")
     group = next(g for g in (8, 4, 2, 1) if heads % g == 0)
     f32 = lambda t: t.astype(mx.float32)
-    dims = mx.array([lt, total, st_t, st_i, *offsets], dtype=mx.int32)
+    # head-major (1, heads, total, 128) outputs; MLX rotary tables hold one value per pair
+    dims = mx.array([lt, st_t, st_i, *offsets, total, 64, 1, total * 128, 128, 1], dtype=mx.int32)
     shape = (1, heads, total, 128)
     return tuple(
         _qk_norm_rope_kernel()(
             inputs=[
-                text,
-                x,
-                f32(text_q_weight),
-                f32(text_k_weight),
-                f32(q_weight),
-                f32(k_weight),
-                f32(cos),
-                f32(sin),
-                mx.array([eps], dtype=mx.float32),
-                dims,
+                text, text, text, x, x, x,
+                f32(text_q_weight), f32(text_k_weight), f32(q_weight), f32(k_weight),
+                f32(cos), f32(sin), mx.array([eps, eps], dtype=mx.float32), dims,
             ],
             template=[("T", x.dtype)],
             grid=(heads * 32, total, 1),
@@ -387,7 +353,7 @@ def qk_norm_rope(
             output_shapes=[shape] * 3,
             output_dtypes=[x.dtype] * 3,
         )
-    )
+    )  # fmt: skip
 
 
 _INPUTS = ["a", "b", "wr", "ascale", "wsc", "lact", "lup", "bias", "dims"]

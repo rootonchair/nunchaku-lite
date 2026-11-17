@@ -88,9 +88,12 @@ kernels for M5-class Neural Accelerators, plus a portable W4A16 fallback.
 - [x] Wire the MPS ops into `nunchaku_lite`: SVDQ / AWQ modules and the fused
   GELU-MLP and QKV-norm-RoPE ops dispatch to `nunchaku_lite.ops.mps` on MPS
   tensors (verified end to end with FLUX.2 Klein 4B).
-- [x] Fused Metal QK RMSNorm + RoPE op (`svdq_qk_norm_rope_`).
+- [x] Fused Metal QK RMSNorm + RoPE op. Now one kernel body shared by MLX and MPS
+  (`nunchaku_lite/shaders.py`), compiled at runtime on MPS; the Hub op `svdq_qk_norm_rope_` is no longer
+  called (kept in the Hub build for compatibility).
 - [ ] Verify FLUX.1, Qwen-Image, Z-Image, and runtime LoRA on MPS.
-- [ ] Faster attention on MPS (about half of each FLUX.2 step after quantization).
+- [x] Faster attention on MPS: MLX's Neural Accelerator flash attention (M5), plus fused FLUX.2
+  q/k norm + RoPE on MLX and MPS.
 - [ ] Quantized T5 (TinyChat AWQ g128) on MPS.
 - [ ] NVFP4 checkpoint support.
 - [ ] Fuse activation quantization into the producing GEMM's epilogue (e.g. fc1+GELU

@@ -142,13 +142,15 @@ On an M5 MacBook Pro (FLUX.2 Klein 4B, 4 steps, denoising only):
 | Transformer | Weights | Live GPU memory (1024px) | Step 512px | Step 1024px |
 | --- | --- | --- | --- | --- |
 | Dense BF16 | 7.75 GB | 8.1 GB | 1.20 s | 4.96 s |
-| INT4, `int8` backend (default) | 4.57 GB | 5.6 GB | 0.74 s (1.63x) | 3.52 s (1.41x) |
-| INT4, `int4` backend | 2.67 GB | 4.4 GB | 0.83 s (1.45x) | 3.76 s (1.32x) |
+| INT4, `int8` backend (default) | 4.57 GB | 5.6 GB | 0.62 s (1.94x) | 2.27 s (2.19x) |
+| INT4, `int4` backend | 2.67 GB | 4.4 GB | 0.70 s (1.71x) | 2.50 s (1.98x) |
 
 The packed checkpoint `qweight` is released after conversion whenever the
 kernel copy reproduces it exactly (117 of 120 layers for `int8`, all layers for
 `int4`); `state_dict()` re-packs it and `load_state_dict()` restores it.
-Attention is unchanged and is about half of each step.
+On M5-class GPUs the patched transformer's attention also runs on the Neural Accelerators (MLX's flash
+attention kernel, compiled at runtime) instead of PyTorch's MPS attention, and FLUX.2's q/k norm + RoPE is
+one fused kernel; the dense BF16 row uses stock Diffusers.
 
 There is also an MLX runtime, `nunchaku_lite.mlx` (`pip install "nunchaku-lite[mlx]" mflux`),
 which loads the same checkpoints into [mflux](https://github.com/filipstrand/mflux)

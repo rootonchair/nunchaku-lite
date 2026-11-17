@@ -20,6 +20,7 @@ from torch.nn import GELU as TorchGELU
 from ..core import PatchOptions, register_adapter
 from ..linear import DenseRuntimeLoraLinear, SVDQW4A4Linear
 from ..ops.fused import fused_gelu_mlp, fused_qkv_norm_rotary
+from .attention_dispatch import dispatch_lite_attention_fn
 from .common import (
     SVDQPatchContext,
     build_svdq_context,
@@ -427,7 +428,9 @@ class NunchakuFluxAttnProcessor(nn.Module):
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
         ip_query = ip_query.transpose(1, 2)
-        output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0)
+        output = dispatch_lite_attention_fn(
+            query, key, value, attn_mask=attention_mask, query_layout="bhsd", output_layout="bhsd"
+        )
         output = output.transpose(1, 2).reshape(hidden_states.shape[0], -1, attn.heads * attn.head_dim)
         output = output.to(query.dtype)
 

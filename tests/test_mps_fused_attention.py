@@ -8,17 +8,17 @@ from diffusers.models.transformers import transformer_flux2 as flux2
 from nunchaku_lite.adapters.flux2 import (
     MPSFusedFlux2AttnProcessor,
     MPSFusedFlux2ParallelSelfAttnProcessor,
-    install_mps_fused_attention,
+    install_mps_flux2_processors,
 )
-from nunchaku_lite.ops.mps_fused import (
+from nunchaku_lite.ops.mps import (
     attention_mps,
     attention_mps_available,
-    attention_supported,
-    fused_qk_norm_rope_available,
+    attention_mps_supported,
     qk_norm_rope_mps,
+    qk_norm_rope_mps_available,
 )
 
-needs_mps = pytest.mark.skipif(not fused_qk_norm_rope_available(), reason="requires MPS with torch.mps.compile_shader")
+needs_mps = pytest.mark.skipif(not qk_norm_rope_mps_available(), reason="requires MPS with torch.mps.compile_shader")
 DIM, HEADS = 256, 2
 
 
@@ -53,8 +53,8 @@ def test_install_swaps_stock_processors_and_falls_back_off_mps():
     joint, single = _modules("cpu", torch.float32)
     ref = _run(joint, single, "cpu", torch.float32)
     root = torch.nn.ModuleList([joint, single])
-    assert install_mps_fused_attention(root) == 2
-    assert install_mps_fused_attention(root) == 0  # already swapped
+    assert install_mps_flux2_processors(root) == 2
+    assert install_mps_flux2_processors(root) == 0  # already swapped
     assert isinstance(joint.processor, MPSFusedFlux2AttnProcessor)
     assert isinstance(single.processor, MPSFusedFlux2ParallelSelfAttnProcessor)
     for got, exp in zip(_run(joint, single, "cpu", torch.float32), ref):
@@ -66,7 +66,7 @@ def test_install_swaps_stock_processors_and_falls_back_off_mps():
 def test_fused_processors_match_stock_on_mps(dtype):
     joint, single = _modules("mps", dtype)
     ref = _run(joint, single, "mps", dtype)
-    install_mps_fused_attention(torch.nn.ModuleList([joint, single]))
+    install_mps_flux2_processors(torch.nn.ModuleList([joint, single]))
     for got, exp in zip(_run(joint, single, "mps", dtype), ref):
         tol = (3e-2 if dtype == torch.bfloat16 else 5e-3) * exp.float().abs().max().item()
         torch.testing.assert_close(got.float(), exp.float(), rtol=0, atol=tol)
@@ -116,7 +116,7 @@ def test_attention_mps_matches_float32_reference(batch, q_len, k_len, heads, kv_
     q = torch.randn(batch, q_len, heads, dim, device="mps", dtype=dtype) * 2
     k = torch.randn(batch, k_len, kv_heads, dim, device="mps", dtype=dtype) * 2
     v = torch.randn(batch, k_len, kv_heads, dim, device="mps", dtype=dtype)
-    assert attention_supported(q, k, v)
+    assert attention_mps_supported(q, k, v)
     out = attention_mps(q, k, v)
     ref = torch.nn.functional.scaled_dot_product_attention(
         *(t.transpose(1, 2).float() for t in (q, k, v)), enable_gqa=True
@@ -137,4 +137,94 @@ def test_attention_mps_reads_strided_views():
 
 def test_attention_supported_rejects_unsupported_inputs():
     q = torch.zeros(1, 8, 2, 128)
-    assert not attention_supported(q, q, q)  # CPU
+    assert not attention_mps_supported(q, q, q)  # CPU
+
+
+class _Attend(torch.nn.Module):
+    """Stand-in transformer: attention through Diffusers' dispatch and through the adapters' lite dispatch."""
+
+    def forward(self, q, k, v, mask=None, fail=False):
+        from diffusers.models.attention_dispatch import dispatch_attention_fn
+
+        from nunchaku_lite.adapters.attention_dispatch import dispatch_lite_attention_fn
+
+        if fail:
+            raise RuntimeError("boom")
+        a = dispatch_attention_fn(q, k, v, attn_mask=mask)
+        b = dispatch_lite_attention_fn(
+            *(t.transpose(1, 2) for t in (q, k, v)), attn_mask=mask, query_layout="bhsd", output_layout="bhsd"
+        ).transpose(1, 2)
+        return a, b
+
+
+def test_mps_attention_scope_resets_and_is_noop_off_mps():
+    from nunchaku_lite.adapters import attention_dispatch as ad
+
+    module = _Attend()
+    q = torch.randn(1, 6, 2, 64)
+    expected = module(q, q, q)
+    assert ad.install_mps_attention(module)
+    assert not ad.install_mps_attention(module)  # idempotent
+    for got, exp in zip(module(q, q, q), expected):
+        torch.testing.assert_close(got, exp)  # CPU tensors: PyTorch's attention, unchanged
+    with pytest.raises(RuntimeError):
+        module(q, q, q, fail=True)
+    assert not ad._MPS_ATTENTION.get()  # reset by the always-called forward hook
+
+
+@needs_nax
+def test_mps_attention_only_inside_patched_forward(monkeypatch):
+    from diffusers.models.attention_dispatch import dispatch_attention_fn
+
+    from nunchaku_lite.adapters import attention_dispatch as ad
+
+    calls = []
+    real = ad.attention_mps
+    monkeypatch.setattr(ad, "attention_mps", lambda *a, **k: calls.append(1) or real(*a, **k))
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(1, 130, 4, 128, device="mps", dtype=torch.bfloat16) for _ in range(3))
+    mask = torch.ones(1, 130, dtype=torch.bool, device="mps")
+    mask[:, 100:] = False
+    module = _Attend()
+    ad.install_mps_attention(module)
+
+    dispatch_attention_fn(q, k, v)
+    assert calls == []  # outside a patched forward: PyTorch's attention
+
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        *(t.transpose(1, 2).float() for t in (q, k, v)), attn_mask=mask[:, None, None, :]
+    ).transpose(1, 2)
+    for got in module(q, k, v, mask):
+        torch.testing.assert_close(got.float(), ref, rtol=0, atol=1e-2 * ref.abs().max().item())
+    assert len(calls) == 2
+
+
+@needs_mps
+def test_qkv_norm_rotary_in_place_matches_fallback(monkeypatch):
+    """The Nunchaku processors' path: shared kernel in place on the dense qkv (batch 2) vs the PyTorch fallback."""
+    import torch.nn.functional as F
+
+    from nunchaku_lite.adapters.common import pack_rotemb
+    from nunchaku_lite.ops import mps as mps_ops
+
+    torch.manual_seed(0)
+    batch, seq, heads = 2, 40, 2
+    qkv = (torch.randn(batch, seq, 3 * heads * 128) * 3).to("mps", torch.bfloat16)
+    monkeypatch.setattr(mps_ops, "svdq_linear_mps", lambda proj, x: qkv.clone())
+    wq, wk = torch.rand(128, device="mps") + 0.5, torch.rand(128, device="mps") + 0.5
+    angles = torch.randn(seq, 64)
+    rotemb = torch.stack([angles.sin(), angles.cos()], dim=-1).unsqueeze(0).unsqueeze(-2)
+    packed = pack_rotemb(F.pad(rotemb, (0, 0, 0, 0, 0, 0, 0, 256 - seq))).to("mps")
+    x = torch.zeros(batch, seq, 8, device="mps", dtype=torch.bfloat16)
+    fused = mps_ops.qkv_norm_rotary_mps(x, None, wq, wk, packed, eps_q=1e-6, eps_k=1e-5)
+    monkeypatch.setattr(mps_ops, "qk_norm_rope_mps_available", lambda: False)
+    ref = mps_ops.qkv_norm_rotary_mps(x, None, wq, wk, packed, eps_q=1e-6, eps_k=1e-5)
+    torch.testing.assert_close(fused.float(), ref.float(), rtol=0, atol=2e-2 * ref.float().abs().max().item())
+
+
+def test_shared_shader_sources_import_no_framework():
+    import subprocess
+    import sys
+
+    code = "import sys, nunchaku_lite.shaders; assert 'torch' not in sys.modules and 'mlx' not in sys.modules"
+    subprocess.run([sys.executable, "-c", code], check=True)

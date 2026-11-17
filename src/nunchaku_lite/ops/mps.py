@@ -34,13 +34,25 @@ stored per layer as ``SVDQW4A4Linear.backend``):
     a few percent slower, identical output).
 ``dense``
     Dequantized fallback (exact W4A16 math); any Apple GPU.
+
+Two kernels are compiled at runtime with ``torch.mps.compile_shader`` instead (no ``nunchaku_lite_kernels``
+build needed):
+
+* q/k RMSNorm + RoPE (:func:`qk_norm_rope_mps` for Diffusers' FLUX.2 processors, and in place on the dense qkv in
+  :func:`qkv_norm_rotary_mps` for the Nunchaku processors). Its body is shared with the MLX runtime
+  (:data:`nunchaku_lite.shaders.QK_NORM_ROPE`).
+* :func:`attention_mps`: MLX's Neural Accelerator flash attention (vendored in :mod:`._mlx_steel_attention`),
+  about 3.7x faster than PyTorch's MPS attention on M5-class GPUs, with lower error.
 """
 
 from __future__ import annotations
 
 import functools
+import re
+import struct
 import subprocess
 import warnings
+import weakref
 
 import torch
 import torch.nn.functional as F
@@ -516,13 +528,11 @@ def unpack_rotemb(packed: torch.Tensor) -> torch.Tensor:
     return r
 
 
-def _fused_qk_norm_rope_op():
-    """Return the in-place Metal QK-norm/RoPE op, or ``None`` when the kernels build predates it."""
+def _packed_rope_tables(rotary_emb: torch.Tensor, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(cos, sin)`` float32 ``(seq_len, D // 2)`` tables (one value per pair) from a packed rotary embedding."""
 
-    try:
-        return getattr(_kernel_ops(), "svdq_qk_norm_rope_", None)
-    except (ImportError, RuntimeError, AttributeError):
-        return None
+    table = unpack_rotemb(rotary_emb)[0, :seq_len].float()
+    return table[..., 1].contiguous(), table[..., 0].contiguous()
 
 
 def _rms_norm_heads(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.Tensor:
@@ -564,20 +574,26 @@ def qkv_norm_rotary_mps(
     if norm_q_weight is None and norm_k_weight is None and rotary_emb is None:
         return qkv
     heads = qkv.shape[-1] // (3 * head_dim)
-    fused = _fused_qk_norm_rope_op() if head_dim == 128 and qkv.dtype in (torch.float16, torch.bfloat16) else None
-    if fused is not None:
-        rope = None if rotary_emb is None else unpack_rotemb(rotary_emb).float().contiguous()
+    if (
+        head_dim == 128
+        and qkv.dtype in (torch.float16, torch.bfloat16)
+        and norm_q_weight is not None
+        and norm_k_weight is not None
+        and rotary_emb is not None
+        and rotary_emb.shape[0] == 1
+        and qk_norm_rope_mps_available()
+    ):
+        # in place on the dense qkv rows; packed tables hold (sin, cos) once per pair
         qkv2 = qkv.reshape(batch * seq_len, -1).contiguous()
-        fused(
-            qkv2,
-            None if norm_q_weight is None else norm_q_weight.to(qkv.dtype).contiguous(),
-            None if norm_k_weight is None else norm_k_weight.to(qkv.dtype).contiguous(),
-            rope,
-            float(eps_q),
-            float(eps_k),
-            heads,
-            seq_len,
-        )
+        width = heads * head_dim
+        parts = (qkv2[:, :width], qkv2[:, width : 2 * width], qkv2[:, 2 * width :])
+        cos, sin = _derived(rotary_emb, f"packed_rope:{seq_len}", lambda r: _packed_rope_tables(r, seq_len))
+        device = qkv.device
+        _launch_qk_norm_rope(
+            parts, None, parts, (_f32(norm_q_weight, device), _f32(norm_k_weight, device)) * 2,
+            cos, sin, (eps_q, eps_k), heads,
+            rot_rows=seq_len, cs_pair=1, out_strides=(head_dim, qkv2.stride(0)),
+        )  # fmt: skip
         return qkv2.view(batch, seq_len, -1)
     q, k, v = qkv.chunk(3, dim=-1)
     q = q.reshape(batch, seq_len, -1, head_dim)
@@ -679,3 +695,307 @@ def awq_linear_mps(module, x: torch.Tensor) -> torch.Tensor:
         return torch.ops.aten._weight_int4pack_mm(x, _cached(module, "w4"), 64, _cached(module, "scales_and_zeros"))
     weight = _cached(module, "weight")
     return F.linear(x, weight.to(x.dtype))
+
+
+# ---------------------------------------------------------------------------
+# Runtime-compiled kernels (torch.mps.compile_shader): FLUX.2 q/k norm + RoPE
+# ---------------------------------------------------------------------------
+
+# The kernel body is shared with the MLX runtime (:data:`nunchaku_lite.shaders.QK_NORM_ROPE`).
+_QK_TYPES = {torch.float16: "half", torch.bfloat16: "bfloat", torch.float32: "float"}
+_QK_FLOAT_INPUTS = frozenset({"wqt", "wkt", "wqi", "wki", "cosb", "sinb", "epsb"})
+
+
+@functools.cache
+def _qk_norm_rope_library():
+    from ..shaders import QK_NORM_ROPE, QK_NORM_ROPE_INPUTS, QK_NORM_ROPE_OUTPUTS, mps_library_source
+
+    inputs = {n: "float" if n in _QK_FLOAT_INPUTS else "int" if n == "dims" else "T" for n in QK_NORM_ROPE_INPUTS}
+    types = {t: t for t in _QK_TYPES.values()}
+    return torch.mps.compile_shader(
+        mps_library_source("qk_norm_rope", QK_NORM_ROPE, inputs, QK_NORM_ROPE_OUTPUTS, types)
+    )
+
+
+@functools.cache
+def qk_norm_rope_mps_available() -> bool:
+    """Whether the runtime-compiled q/k norm + RoPE kernel builds on this machine."""
+
+    if not (torch.backends.mps.is_available() and hasattr(torch.mps, "compile_shader")):
+        return False
+    try:
+        _qk_norm_rope_library()
+    except Exception:  # noqa: BLE001 - any compile failure means: use the unfused path
+        return False
+    return True
+
+
+def _rows(t: torch.Tensor) -> torch.Tensor:
+    """A ``(..., L, C)`` projection output (or a column slice of one) as a 2-D view with a contiguous last dim."""
+
+    t2 = t.reshape(-1, t.shape[-1]) if t.is_contiguous() else t.flatten(0, -2)
+    return t2 if t2.stride(-1) == 1 else t2.contiguous()
+
+
+@functools.lru_cache(maxsize=256)
+def _device_constant(values: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
+    """A small read-only kernel argument (dims, eps, unit norm weight), uploaded once per distinct value."""
+
+    return torch.tensor(values, dtype=dtype, device=device)
+
+
+_DERIVED: dict[tuple[int, str], tuple[weakref.ref, int, object]] = {}
+
+
+def _derived(t: torch.Tensor, key: str, build):
+    """``build(t)``, cached while ``t`` is alive and unmodified (weights, per-step rotary tables)."""
+
+    entry = _DERIVED.get((id(t), key))
+    if entry is not None and entry[0]() is t and entry[1] == t._version:
+        return entry[2]
+    value = build(t)
+    cache_key = (id(t), key)
+    _DERIVED[cache_key] = (weakref.ref(t, lambda _ref: _DERIVED.pop(cache_key, None)), t._version, value)
+    return value
+
+
+def _f32(t: torch.Tensor | None, device, n: int = 128) -> torch.Tensor:
+    if t is None:
+        return _device_constant((1.0,) * n, torch.float32, str(device))
+    if t.dtype == torch.float32 and t.is_contiguous() and t.device == device:
+        return t
+    return _derived(t, f"f32:{device}", lambda w: w.to(device=device, dtype=torch.float32).contiguous())
+
+
+def _launch_qk_norm_rope(
+    image: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    text: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    eps: tuple[float, float],
+    heads: int,
+    *,
+    rot_rows: int,
+    cs_pair: int,
+    out_strides: tuple[int, int],
+) -> None:
+    """Run the shared kernel. Sources and outputs are 2-D row views (outputs may alias sources)."""
+
+    device = image[0].device
+    txt = text if text is not None else image
+    lt = text[0].shape[0] if text is not None else 0
+    total = lt + image[0].shape[0]
+    copy_v = int(outputs[2].data_ptr() != image[2].data_ptr())
+    dims = (lt, txt[0].stride(0), image[0].stride(0), 0, 0, 0, rot_rows, cos.stride(0), cs_pair, *out_strides, copy_v)
+    group = next(g for g in (8, 4, 2, 1) if heads % g == 0)
+    kernel = getattr(_qk_norm_rope_library(), f"qk_norm_rope_{_QK_TYPES[image[0].dtype]}")
+    kernel(
+        *txt, *image, *weights, cos, sin,
+        _device_constant(tuple(map(float, eps)), torch.float32, str(device)),
+        _device_constant(dims, torch.int32, str(device)),
+        *outputs, threads=(heads * 32, total, 1), group_size=(32 * group, 1, 1),
+    )  # fmt: skip
+
+
+def qk_norm_rope_mps(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_weight: torch.Tensor | None,
+    k_weight: torch.Tensor | None,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    heads: int,
+    eps_q: float,
+    eps_k: float,
+    text: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    text_q_weight: torch.Tensor | None = None,
+    text_k_weight: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """q/k RMSNorm + RoPE for FLUX.2-style attention (head dim 128, batch 1) on MPS.
+
+    Args:
+        q, k, v: Image-token projections ``(1, Li, heads * 128)``. They may be column slices of one fused
+            projection output; they must share the row stride.
+        q_weight, k_weight: RMSNorm weights ``(128,)`` (``None``: no affine weight).
+        cos, sin: Diffusers rotary tables ``(Lt + Li, 128)`` (each pair's value repeated), text rows first.
+        heads: Number of attention heads.
+        eps_q, eps_k: RMSNorm epsilons.
+        text: Optional text-token ``(q, k, v)`` placed before the image rows (joint attention).
+        text_q_weight, text_k_weight: RMSNorm weights for the text rows.
+
+    Returns:
+        ``(q, k, v)`` of shape ``(1, Lt + Li, heads, 128)`` in the projections' dtype.
+    """
+
+    dtype, width = q.dtype, heads * 128
+    groups = [tuple(_rows(t) for t in g) for g in ((q, k, v), text) if g is not None]
+    for group in groups:
+        if len({t.stride(0) for t in group}) != 1 or any(t.shape[-1] != width or t.dtype != dtype for t in group):
+            raise ValueError("q, k and v must share dtype, width heads * 128 and row stride.")
+    image, txt = groups[0], (groups[1] if text is not None else None)
+    total = image[0].shape[0] + (txt[0].shape[0] if txt is not None else 0)
+    if cos.shape != (total, 128) or sin.shape != (total, 128):
+        raise ValueError(f"Rotary tables must be ({total}, 128), got {tuple(cos.shape)} and {tuple(sin.shape)}.")
+    device = q.device
+    wq, wk = _f32(q_weight, device), _f32(k_weight, device)
+    wqt, wkt = (_f32(text_q_weight, device), _f32(text_k_weight, device)) if text is not None else (wq, wk)
+    out = tuple(torch.empty((1, total, heads, 128), dtype=dtype, device=device) for _ in range(3))
+    _launch_qk_norm_rope(
+        image, txt, tuple(o.view(total, width) for o in out), (wqt, wkt, wq, wk),
+        _f32(cos, device, total), _f32(sin, device, total), (eps_q, eps_k), heads,
+        rot_rows=total, cs_pair=2, out_strides=(128, width),
+    )  # fmt: skip
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Runtime-compiled kernels: flash attention on the Neural Accelerators (MLX's steel NAX kernel)
+# ---------------------------------------------------------------------------
+
+_ATTN_BQ, _ATTN_BK, _ATTN_WM = 64, 32, 4  # MLX's NAX tile for head dims 64-128 (query block, key block, simdgroups)
+_ATTN_HEAD_DIMS = (64, 96, 128)
+_ATTN_TYPES = {torch.float16: "half", torch.bfloat16: "bfloat"}
+
+
+@functools.cache
+def _attention_library(align_q: bool, align_k: bool, has_mask: bool):
+    """Compile the kernel for one (query alignment, key alignment, mask) combination. MLX selects these features
+    with Metal function constants, which ``compile_shader`` cannot set, so they become compile-time constants."""
+
+    from ._mlx_steel_attention import SOURCE
+
+    consts = {
+        "align_Q": align_q,
+        "align_K": align_k,
+        "has_mask": has_mask,
+        "do_causal": False,
+        "has_sinks": False,
+        "save_lse": False,
+    }
+    source = SOURCE
+    for name, value in consts.items():
+        source, n = re.subn(
+            rf"constant bool {name} \[\[function_constant\(\d+\)\]\];",
+            f"constant constexpr bool {name} = {str(value).lower()};",
+            source,
+        )
+        if n != 1:
+            raise RuntimeError(f"Vendored MLX attention source has no function constant {name!r}.")
+    source = re.sub(r", function_constant\(\w+\)\]\]", "]]", source)
+    for t in _ATTN_TYPES.values():
+        for d in _ATTN_HEAD_DIMS:
+            for mask_name, mask_type in (("add", t), ("bool", "bool")):
+                source += (
+                    f'instantiate_kernel("attention_{t}_{d}_{mask_name}", attention_nax, {t}, {_ATTN_BQ}, '
+                    f"{_ATTN_BK}, {d}, {d}, {_ATTN_WM}, 1, {mask_type}, float)\n"
+                )
+    return torch.mps.compile_shader(source)
+
+
+@functools.cache
+def attention_mps_available() -> bool:
+    """Whether :func:`attention_mps` can run: an M5-class GPU and a PyTorch with ``torch.mps.compile_shader``."""
+
+    if not (torch.backends.mps.is_available() and hasattr(torch.mps, "compile_shader") and has_neural_accelerators()):
+        return False
+    try:
+        _attention_library(True, True, False)
+    except Exception:  # noqa: BLE001 - any compile failure means: use PyTorch's attention
+        return False
+    return True
+
+
+def _mask_4d(attn_mask: torch.Tensor, query: torch.Tensor, k_len: int) -> torch.Tensor | None:
+    """The mask as a ``(B, H, Lq, Lk)`` view with a contiguous key dim, or ``None`` if it cannot broadcast."""
+
+    if attn_mask.ndim == 2 and attn_mask.shape == (query.shape[0], k_len):  # Diffusers' (B, Lk) key padding mask
+        attn_mask = attn_mask[:, None, None, :]
+    while attn_mask.ndim < 4:
+        attn_mask = attn_mask.unsqueeze(0)
+    try:
+        attn_mask = attn_mask.expand(query.shape[0], query.shape[2], query.shape[1], k_len)
+    except RuntimeError:
+        return None
+    return attn_mask if attn_mask.stride(-1) == 1 else attn_mask.contiguous()
+
+
+def attention_mps_supported(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attn_mask: torch.Tensor | None = None
+) -> bool:
+    """Whether :func:`attention_mps` handles these ``(B, L, H, D)`` tensors and optional mask."""
+
+    if not (
+        query.device.type == "mps"
+        and query.dtype in _ATTN_TYPES
+        and query.dtype == key.dtype == value.dtype
+        and query.ndim == key.ndim == value.ndim == 4
+        and query.shape[-1] in _ATTN_HEAD_DIMS
+        and key.shape[-1] == value.shape[-1] == query.shape[-1]
+        and key.shape[:3] == value.shape[:3]
+        and query.shape[0] == key.shape[0]
+        and query.shape[2] % key.shape[2] == 0
+        and query.stride(-1) == key.stride(-1) == value.stride(-1) == 1
+    ):
+        return False
+    if attn_mask is not None and (
+        attn_mask.device != query.device
+        or not (attn_mask.dtype == torch.bool or attn_mask.is_floating_point())
+        or _mask_4d(attn_mask, query, key.shape[1]) is None
+    ):
+        return False
+    return attention_mps_available()
+
+
+def attention_mps(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Softmax attention over ``(B, L, H, D)`` tensors (Diffusers' layout), returning ``(B, Lq, H, D)``.
+
+    Any strides with a contiguous head dim are read in place; grouped-query attention (fewer key/value heads) is
+    supported. ``attn_mask`` follows ``F.scaled_dot_product_attention``: broadcastable to ``(B, H, Lq, Lk)`` (or
+    Diffusers' ``(B, Lk)``), bool (``True`` = attend) or additive float. Call :func:`attention_mps_supported` first.
+    """
+
+    batch, q_len, heads, dim = query.shape
+    k_len, kv_heads = key.shape[1], key.shape[2]
+    scale = dim**-0.5 if scale is None else float(scale)
+    out = torch.empty_like(query, memory_format=torch.contiguous_format)
+    bq, bk = _ATTN_BQ, _ATTN_BK
+    nq, nk, nq_full, nk_full = -(-q_len // bq), -(-k_len // bk), q_len // bq, k_len // bk
+
+    def strides(t):  # (B, L, H, D) -> the kernel's (B, H, L) strides
+        return t.stride(0), t.stride(2), t.stride(1)
+
+    params = struct.pack(
+        "<6if7i12q",
+        batch, heads, dim, q_len, k_len, heads // kv_heads, scale, nq, nk, nq_full, nk_full,
+        q_len - nq_full * bq, k_len - nk_full * bk, k_len - q_len,
+        *strides(query), *strides(key), *strides(value), *strides(out),
+    )  # fmt: skip
+    device = query.device
+    params = torch.frombuffer(bytearray(params), dtype=torch.uint8).to(device)
+    unused = torch.empty(16, dtype=torch.uint8, device=device)  # sinks / lse slots (disabled)
+    mask_kind = "add"
+    if attn_mask is None:
+        mask, mask_params = unused, unused
+    else:
+        mask = _mask_4d(attn_mask, query, k_len)
+        if mask.dtype == torch.bool:
+            mask_kind = "bool"
+        elif mask.dtype != query.dtype:
+            mask = mask.to(query.dtype)
+        mask_params = torch.tensor(mask.stride()[:3], dtype=torch.int64).view(torch.uint8).to(device)
+    library = _attention_library(q_len % bq == 0, k_len % bk == 0, attn_mask is not None)
+    kernel = getattr(library, f"attention_{_ATTN_TYPES[query.dtype]}_{dim}_{mask_kind}")
+    kernel(
+        query, key, value, out, params, mask_params, mask, unused, unused,
+        threads=(nq * 32, heads * _ATTN_WM, batch), group_size=(32, _ATTN_WM, 1),
+    )  # fmt: skip
+    return out
