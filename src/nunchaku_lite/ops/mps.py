@@ -147,14 +147,15 @@ def configure_backend(model: torch.nn.Module, choice: str = "auto") -> str:
 @functools.cache
 def mps_kernels_available() -> bool:
     """Whether the ``nunchaku_lite_kernels`` MPS ops load; ``"auto"`` falls back to ``"dense"`` (with a warning)
-    when they don't, e.g. after ``pip install nunchaku-lite[torch]`` without building the local kernels."""
+    when they don't, e.g. a PyTorch version without a prebuilt Hub build and no local kernels."""
 
     try:
         _kernel_ops()
     except Exception as exc:  # noqa: BLE001 - any load failure means the kernels are unusable
         warnings.warn(
-            f'backend="auto" uses the dense MPS fallback: the Metal kernels are unavailable ({exc}). Build them '
-            'with "pip install --no-build-isolation ./nunchaku-lite-kernels" for the faster int8/int4 backends.',
+            f'backend="auto" uses the dense MPS fallback: the Metal kernels are unavailable ({exc}). The Hub build '
+            'covers PyTorch 2.10-2.15; otherwise build them with "pip install --no-build-isolation '
+            './nunchaku-lite-kernels" for the faster int8/int4 backends.',
             stacklevel=3,
         )
         return False
@@ -167,8 +168,8 @@ def _kernel_ops():
     ops = get_ops()
     if not hasattr(ops, "svdq_gemm_w8a8"):
         raise RuntimeError(
-            "The installed nunchaku_lite_kernels package has no MPS ops. Build it on macOS with "
-            '"pip install --no-build-isolation ./nunchaku-lite-kernels", or pass backend="dense".'
+            "The loaded nunchaku_lite_kernels ops have no MPS ops (a CUDA-only local build?). Rebuild it on "
+            'macOS with "pip install --no-build-isolation ./nunchaku-lite-kernels", or pass backend="dense".'
         )
     return ops
 

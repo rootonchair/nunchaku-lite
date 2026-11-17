@@ -115,9 +115,10 @@ quantized to int8 per token after smoothing, and the matmul runs on the M5
 Neural Accelerators with the SVD low-rank branch, scales and bias fused into
 the kernel epilogue. Q/K RMSNorm and RoPE run in a fused Metal kernel.
 
-- Requires macOS 26+ and a PyTorch build with MPS. Build the kernels locally
-  (prebuilt Hub kernels are CUDA-only for now):
-  `pip install --no-build-isolation ./nunchaku-lite-kernels`
+- Requires macOS 26+ and a PyTorch build with MPS. With PyTorch 2.10 to 2.15 the
+  Metal kernels download from the Hugging Face Hub on first use (the `kernels`
+  dependency of `nunchaku-lite[torch]`). For other PyTorch versions, build them
+  locally: `pip install --no-build-isolation ./nunchaku-lite-kernels`
 - Choose the quantized-kernel backend with `backend=` on `load_nunchaku_pipeline`
   or `patch_transformer` (the same keyword Diffusers uses for kernel selection in
   `AutoRoundConfig`; unrelated to `set_attention_backend`). CUDA has a single
