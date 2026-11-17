@@ -131,9 +131,10 @@ the two-step warmup went from 87 s to 23 s.
    variants. Adding ops on a new backend is backward compatible, so the kernel
    version stays 2 and `HF_KERNEL_VERSION` is unchanged; the CUDA variants were
    not rebuilt (their kernels did not change).
-7. **Release the torch/mlx extras split.** `nunchaku_lite.mlx` now lives in the
-   main package. A bare `pip install nunchaku-lite` no longer installs torch;
-   CUDA users need `nunchaku-lite[torch]`. Call this out in the release notes.
+7. **Packaging.** `nunchaku_lite.mlx` lives in the main package. The base install
+   keeps the PyTorch dependencies (unchanged for CUDA users); the `mlx` extra adds
+   `mlx` and `numpy`. `nunchaku_lite/__init__.py` imports the PyTorch runtime lazily,
+   so `import nunchaku_lite.mlx` never loads torch.
 
 ### 4. Performance
 

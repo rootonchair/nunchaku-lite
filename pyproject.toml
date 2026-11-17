@@ -20,22 +20,23 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
 ]
+# The base install is the PyTorch runtime (CUDA / Apple MPS). The MLX runtime is the `mlx` extra; nunchaku_lite.mlx
+# itself imports without torch (nunchaku_lite/__init__.py is lazy), so `pip install --no-deps` + mlx also works.
 dependencies = [
-  "huggingface-hub>=0.34",
-  "packaging>=23",
-]
-
-[project.optional-dependencies]
-# PyTorch runtime (CUDA / Apple MPS): nunchaku_lite.load_nunchaku_pipeline, patch_transformer, ...
-torch = [
   "accelerate>=0.31",
   "diffusers>=0.36",
+  "huggingface-hub>=0.34",
   "kernels>=0.14,<0.15",
+  "packaging>=23",
   "peft",
   "safetensors",
   "torch>=2.7",
   "transformers>=4.41.2",
 ]
+
+[project.optional-dependencies]
+# Accepted for compatibility with instructions that use `nunchaku-lite[torch]`; the base install already has torch.
+torch = []
 # MLX runtime (Apple silicon): nunchaku_lite.mlx. Pipelines come from mflux (pip install mflux).
 mlx = [
   "mlx>=0.30",

@@ -63,8 +63,7 @@ jobs:
               import tomli as tomllib
 
           with open("pyproject.toml", "rb") as config:
-              project = tomllib.load(config)["project"]
-              dependencies = project["dependencies"] + project["optional-dependencies"]["torch"]
+              dependencies = tomllib.load(config)["project"]["dependencies"]
 
           for dependency in dependencies:
               if not dependency.startswith("torch"):
@@ -111,8 +110,7 @@ jobs:
               import tomli as tomllib
 
           with open("pyproject.toml", "rb") as config:
-              project = tomllib.load(config)["project"]
-              dependencies = project["dependencies"] + project["optional-dependencies"]["torch"]
+              dependencies = tomllib.load(config)["project"]["dependencies"]
 
           for dependency in dependencies:
               if not dependency.startswith("torch"):

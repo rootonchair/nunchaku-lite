@@ -31,3 +31,17 @@ def test_shared_modules_import_without_torch():
 def test_mlx_runtime_imports_without_torch():
     loaded = _modules_loaded_after("import nunchaku_lite.mlx, nunchaku_lite.mlx.pipeline")
     assert not _heavy(loaded)
+
+
+def test_package_attributes_resolve_lazily():
+    """``import nunchaku_lite`` exposes submodules and the public API as attributes, as the eager __init__ did."""
+
+    pytest.importorskip("torch")
+    pytest.importorskip("diffusers")
+    import nunchaku_lite
+
+    for name in ("core", "linear", "adapters", "ops", "text_encoders", "manifest"):
+        assert getattr(nunchaku_lite, name).__name__ == f"nunchaku_lite.{name}"
+    assert nunchaku_lite.load_nunchaku_pipeline is nunchaku_lite.core.load_nunchaku_pipeline
+    with pytest.raises(AttributeError):
+        nunchaku_lite.does_not_exist  # noqa: B018

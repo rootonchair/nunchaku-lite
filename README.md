@@ -117,7 +117,7 @@ the kernel epilogue. Q/K RMSNorm and RoPE run in a fused Metal kernel.
 
 - Requires macOS 26+ and a PyTorch build with MPS. With PyTorch 2.10 to 2.15 the
   Metal kernels download from the Hugging Face Hub on first use (the `kernels`
-  dependency of `nunchaku-lite[torch]`). For other PyTorch versions, build them
+  dependency of `nunchaku-lite`). For other PyTorch versions, build them
   locally: `pip install --no-build-isolation ./nunchaku-lite-kernels`
 - Choose the quantized-kernel backend with `backend=` on `load_nunchaku_pipeline`
   or `patch_transformer` (the same keyword Diffusers uses for kernel selection in
@@ -157,15 +157,16 @@ pipelines with the same `load_nunchaku_pipeline` interface. See
 
 ## Installation
 
-Install from source with the runtime you need:
+Install from source:
 
 ```bash
-pip install ".[torch]"   # PyTorch runtime (CUDA, Apple MPS) for Diffusers pipelines
-pip install ".[mlx]"     # MLX runtime (Apple silicon) for mflux pipelines; no torch needed
+pip install .          # PyTorch runtime (CUDA, Apple MPS) for Diffusers pipelines
+pip install ".[mlx]"   # adds the MLX runtime (Apple silicon) for mflux pipelines
 ```
 
-A bare `pip install .` installs neither runtime's dependencies. The PyTorch
-runtime uses Hugging Face prebuilt kernels by default.
+This installs the root Python runtime and uses Hugging Face prebuilt kernels by
+default. `nunchaku_lite.mlx` does not import torch, even though the base install
+includes it.
 
 To build and use the local CUDA kernels package:
 
@@ -183,7 +184,7 @@ Build and install a wheel:
 
 ```bash
 python setup.py bdist_wheel
-pip install "$(ls dist/nunchaku_lite-*.whl)[torch]"
+pip install dist/nunchaku_lite-*.whl
 ```
 
 By default, the local kernels package build uses `NUNCHAKU_INSTALL_MODE=FAST`
