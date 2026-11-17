@@ -389,9 +389,12 @@ def _patch_component(
     )
     quantization_config = with_target_list_manifest(quantization_config, state_dict.keys())
     runtime_manifest = parse_runtime_manifest(quantization_config)
-    rank = _infer_svdq_rank(state_dict) if runtime_manifest is None and "rank" not in quantization_config else None
-    if rank is not None:
-        quantization_config = {**quantization_config, "rank": rank}
+    if "rank" not in quantization_config:
+        # Family adapters read the top-level rank (also when target= names one for a manifest checkpoint).
+        rank = runtime_manifest.requirements.get("rank") if runtime_manifest is not None else None
+        rank = rank or _infer_svdq_rank(state_dict)
+        if rank:
+            quantization_config = {**quantization_config, "rank": int(rank)}
     adapter = _select_adapter_for_checkpoint(transformer, target, runtime_manifest)
     normalized_precision = _normalize_precision(precision, device, checkpoint, runtime_manifest)
     _validate_quantization_compatibility(quantization_config, normalized_precision, device, checkpoint)
@@ -596,6 +599,8 @@ def _sibling_quantization_config(checkpoint: str | os.PathLike) -> dict[str, Any
     """``quantization_config`` from the ``config.json`` next to a checkpoint file (Diffusers-format repos that keep it
     there instead of in the safetensors metadata); ``{}`` when there is none."""
 
+    from huggingface_hub.errors import EntryNotFoundError
+
     sibling = Path(checkpoint).parent / "config.json"
     try:
         if Path(checkpoint).exists():  # local file: never fall through to a Hub download
@@ -605,7 +610,13 @@ def _sibling_quantization_config(checkpoint: str | os.PathLike) -> dict[str, Any
         else:  # Hub reference ``org/repo/.../file.safetensors``
             config_path = fetch_or_download(sibling)
         value = json.loads(Path(config_path).read_text()).get("quantization_config")
-    except Exception:  # noqa: BLE001 - no readable config.json: no fallback metadata
+    except json.JSONDecodeError as exc:
+        warnings.warn(f"Ignoring malformed {sibling} ({exc}).", stacklevel=3)
+        return {}
+    except (EntryNotFoundError, FileNotFoundError, ValueError):  # no config.json (ValueError: not a Hub path)
+        return {}
+    except Exception as exc:  # noqa: BLE001 - e.g. network or auth errors: continue without, but say so
+        warnings.warn(f"Could not read {sibling} for checkpoint metadata ({exc}); continuing without it.", stacklevel=3)
         return {}
     return value if isinstance(value, dict) else {}
 
@@ -617,10 +628,14 @@ def _infer_svdq_rank(state_dict: dict[str, torch.Tensor]) -> int | None:
     ``transformer/config.json``; without it, a rank-64 checkpoint would be patched with the default rank 32.
     """
 
-    for key, value in state_dict.items():
-        if key.endswith(".proj_down") and value.ndim == 2:
-            return int(value.shape[1])
-    return None
+    ranks = {int(v.shape[1]) for k, v in state_dict.items() if k.endswith(".proj_down") and v.ndim == 2}
+    if not ranks:
+        return None
+    if len(ranks) > 1:
+        warnings.warn(
+            f"Checkpoint low-rank branches have mixed ranks {sorted(ranks)}; using {max(ranks)}.", stacklevel=3
+        )
+    return max(ranks)
 
 
 def _parse_json_metadata(metadata: dict[str, str] | None, key: str) -> dict[str, Any]:

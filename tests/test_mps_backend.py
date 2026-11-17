@@ -461,3 +461,24 @@ def test_configure_backend_sets_every_layer(monkeypatch):
     monkeypatch.setattr(torch.mps, "recommended_max_memory", lambda: estimate)  # exceeds half -> int4
     assert mps_ops.configure_backend(model) == "int4" and model[2].backend == "int4"
     assert mps_ops.configure_backend(model, "dense") == "dense"
+
+
+@requires_mps
+@pytest.mark.parametrize("backend", ["dense", "int8"])
+def test_cache_build_row_chunks_match_single_pass(monkeypatch, backend):
+    """Weight conversion in row chunks (bounded temporaries) gives the same cache as one pass, including the
+    exact-recovery decision; wr < 1 multipliers force the full per-chunk check."""
+    w = _logical(n=384, k=512, seed=21)
+    w["wscale"][:7] *= 1e-3  # tiny scales in a few rows: some group multipliers fall below 1
+    built = {}
+    for budget in (1 << 24, 128 * 512):  # one chunk / three chunks of 128 rows
+        orig = mps_ops._row_chunks
+        monkeypatch.setattr(mps_ops, "_row_chunks", lambda n, k, b=budget, f=orig: f(n, k, b))
+        assert len(mps_ops._row_chunks(384, 512)) == (1 if budget > 128 * 512 else 3)
+        m = _module(w, "mps", backend=backend)
+        tensors, meta = mps_ops._build_svdq_cache(m, backend, torch.bfloat16)
+        built[budget] = ({name: t.cpu() for name, t in tensors.items()}, meta)
+    (one, meta_one), (many, meta_many) = built.values()
+    assert meta_one == meta_many
+    for name in one:
+        torch.testing.assert_close(one[name], many[name], rtol=0, atol=0)

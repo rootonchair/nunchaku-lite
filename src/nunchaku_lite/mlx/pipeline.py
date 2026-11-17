@@ -12,6 +12,7 @@ adapter supplies the Diffusers -> mflux name map (derived from mflux's own weigh
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -130,18 +131,29 @@ def load_nunchaku_pipeline(
     adapter = _select_adapter(pipeline, target, manifest)
     loaded = adapter.patch(pipeline, state, manifest=manifest, backend=backend, strict=strict)
     if not load_base_transformer:
+        if loaded is None:
+            raise TypeError(
+                f"Adapter {adapter.target!r} did not return the dense parameter paths it loaded, so a transformer "
+                "built without base weights cannot be checked for completeness. Return them from patch() (see "
+                "PipelineAdapter), or pass load_base_transformer=True."
+            )
         _require_complete(pipeline.transformer, loaded, reason="the base transformer weights were not loaded")
     pipeline._nunchaku_lite_target = adapter.target
     pipeline._nunchaku_lite_runtime_manifest = manifest
     return pipeline
 
 
+_WEIGHT_LOADER_LOCK = threading.Lock()
+
+
 @contextmanager
 def _without_base_weights(component: str) -> Iterator[None]:
     """Build an mflux pipeline without downloading or loading one component's weights.
 
-    mflux reads every component through ``WeightLoader``; this drops ``component``'s download patterns and returns
-    no weights for it, so the module keeps its lazy initial parameters (never evaluated, so never allocated).
+    mflux reads every component through ``WeightLoader``; this drops the component's weight-file download patterns
+    (its configs are still fetched) and returns no weights for it, so the module keeps its lazy initial parameters
+    (never evaluated, so never allocated). The patch is process-wide while active, so concurrent pipeline builds
+    are serialized; it is a no-op when mflux is not installed.
     """
 
     try:
@@ -150,26 +162,49 @@ def _without_base_weights(component: str) -> Iterator[None]:
         yield
         return
 
-    original_load = WeightLoader.load
-    original_component = WeightLoader._load_component
+    def is_weight_pattern(pattern: str) -> bool:
+        return pattern.startswith(f"{component}/") and pattern.endswith((".safetensors", ".bin", ".pt", ".pth"))
 
-    def load(weight_definition, model_path=None, download_patterns=None):
-        patterns = download_patterns if download_patterns is not None else weight_definition.get_download_patterns()
-        patterns = [p for p in patterns if not p.startswith(f"{component}/")]
-        return original_load(weight_definition, model_path=model_path, download_patterns=patterns)
+    with _WEIGHT_LOADER_LOCK:
+        saved = {name: WeightLoader.__dict__[name] for name in ("load", "_load_component")}
+        original_load, original_component = WeightLoader.load, WeightLoader._load_component
 
-    def load_component(root_path, definition, *args, **kwargs):
-        if definition.name == component:
-            return {}, None, None
-        return original_component(root_path, definition, *args, **kwargs)
+        def load(weight_definition, *args, **kwargs):
+            positional = len(args) >= 2  # (model_path, download_patterns, ...)
+            patterns = args[1] if positional else kwargs.get("download_patterns")
+            if patterns is None:
+                patterns = weight_definition.get_download_patterns()
+            patterns = [p for p in patterns if not is_weight_pattern(p)]
+            if positional:
+                args = (args[0], patterns, *args[2:])
+            else:
+                kwargs["download_patterns"] = patterns
+            return original_load(weight_definition, *args, **kwargs)
 
-    WeightLoader.load = staticmethod(load)
-    WeightLoader._load_component = staticmethod(load_component)
-    try:
-        yield
-    finally:
-        WeightLoader.load = staticmethod(original_load)
-        WeightLoader._load_component = staticmethod(original_component)
+        def load_component(root_path, definition, *args, **kwargs):
+            if definition.name == component:
+                return {}, None, None
+            return original_component(root_path, definition, *args, **kwargs)
+
+        WeightLoader.load = staticmethod(load)
+        WeightLoader._load_component = staticmethod(load_component)
+        try:
+            yield
+        finally:
+            for name, value in saved.items():
+                setattr(WeightLoader, name, value)
+
+
+def _require_dense_base(pipeline: Any) -> None:
+    """Raise early for a quantized base transformer (``quantize=`` or a pre-quantized repo) in adapters that do not
+    rebuild one: dense checkpoint weights cannot be loaded into ``QuantizedLinear`` layers."""
+
+    if _is_quantized_base(pipeline.transformer):
+        raise ValueError(
+            f"The base pipeline's transformer ({type(pipeline.transformer).__name__}) is quantized (quantize= or a "
+            "pre-quantized repo); the Nunchaku checkpoint replaces it entirely, so build the base pipeline without "
+            "quantization."
+        )
 
 
 def _select_adapter(pipeline: Any, target: str, manifest: RuntimeManifest | None = None) -> PipelineAdapter:
@@ -258,7 +293,7 @@ class ManifestAdapter:
     def matches(self, pipeline: Any) -> bool:
         return False  # selected from checkpoint metadata, not the model type
 
-    def patch(self, pipeline: Any, state, *, manifest: RuntimeManifest | None, backend: str, strict: bool) -> None:
+    def patch(self, pipeline: Any, state, *, manifest: RuntimeManifest | None, backend: str, strict: bool) -> set[str]:
         if manifest is None:
             raise ValueError("target='manifest' requires quantization_config.runtime_manifest metadata.")
         return patch_from_manifest(pipeline.transformer, state, manifest, backend=backend, strict=strict)
@@ -556,6 +591,7 @@ class ZImageAdapter:
 
     def patch(self, pipeline: Any, state, *, manifest: RuntimeManifest | None, backend: str, strict: bool) -> set[str]:
         key_map = z_image_key_map()
+        _require_dense_base(pipeline)
         if manifest is not None:
             return patch_from_manifest(
                 pipeline.transformer, state, manifest, key_map=key_map, backend=backend, strict=strict
@@ -631,8 +667,9 @@ class QwenImageAdapter:
 
     Nunchaku stores Diffusers names with fused ``attn.to_qkv`` / ``attn.add_qkv_proj`` (served to mflux's separate
     projections from one matmul), GELU MLPs whose second layer takes the shifted, unsigned GELU output, and AWQ
-    W4A16 modulation layers (``img_mod.1`` / ``txt_mod.1``) whose six output chunks are interleaved; unlike FLUX.1
-    the ``+1`` of the scale chunks is added at runtime, not folded into the bias. Checkpoints with a runtime
+    W4A16 modulation layers (``img_mod.1`` / ``txt_mod.1``) in Nunchaku's AdaNorm layout: six interleaved output
+    chunks with ``+1`` folded into the scale chunks' bias, as for FLUX.1 (the PyTorch adapter runs them with
+    ``scale_shift=0``; mflux adds the ``1`` itself, so the layer undoes the fold). Checkpoints with a runtime
     manifest are patched from it with the same name map.
     """
 
@@ -643,6 +680,7 @@ class QwenImageAdapter:
 
     def patch(self, pipeline: Any, state, *, manifest: RuntimeManifest | None, backend: str, strict: bool) -> set[str]:
         key_map = qwen_image_key_map()
+        _require_dense_base(pipeline)
         if manifest is not None:
             return patch_from_manifest(
                 pipeline.transformer, state, manifest, key_map=key_map, backend=backend, strict=strict
@@ -675,9 +713,7 @@ class QwenImageAdapter:
                 setattr(
                     block,
                     f"{stream}_mod_linear",
-                    _awq_layer_from_state(
-                        state, take(f"{p}.{stream}_mod.1"), adanorm_splits=6, adanorm_folded_one=False
-                    ),
+                    _awq_layer_from_state(state, take(f"{p}.{stream}_mod.1"), adanorm_splits=6),
                 )
 
         loaded = load_dense_weights(transformer, [(key_map(k), v) for k, v in state.items() if k not in used], strict)

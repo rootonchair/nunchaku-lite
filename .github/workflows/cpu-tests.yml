@@ -123,9 +123,10 @@ jobs:
         run: pytest -q -m "not full_inference"
 
   macos-tests:
-    # Apple-silicon runner: the CPU tests on macOS plus the MLX tests. GitHub's runners have no M5-class GPU, so
-    # the int8/int4 Neural Accelerator kernels and the NAX attention tests skip themselves; MPS / Metal tests run
-    # only if the runner exposes a Metal device (printed below). Kernel numerics still need a local M5 check.
+    # Apple-silicon runner: the CPU tests on macOS plus the MLX / mflux adapter tests. GitHub's runners have no
+    # M5-class GPU, so the int8/int4 Neural Accelerator kernels and the NAX attention tests skip themselves; MPS
+    # and MLX tests run only if the runner exposes a Metal device (printed below), so this may be a smoke run.
+    # Kernel numerics still need a local M5 check.
     name: macOS Tests (Apple silicon)
     runs-on: macos-15
     needs: test-discovery
@@ -140,10 +141,10 @@ jobs:
           python-version: "3.13"
           cache: pip
 
-      - name: Install dependencies (PyTorch runtime + mlx extra)
+      - name: Install dependencies (PyTorch runtime, mlx extra, mflux for the MLX adapters)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ".[mlx]" pytest
+          python -m pip install ".[mlx]" mflux pytest
 
       - name: Report the Apple GPU features this runner exposes
         run: |

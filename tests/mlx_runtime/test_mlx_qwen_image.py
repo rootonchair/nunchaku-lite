@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from nunchaku_lite.mlx import SVDQLogicalWeights, load_nunchaku_pipeline, pack_svdq_int4
-from nunchaku_lite.mlx.packing import pack_awq_w4
+from nunchaku_lite.mlx.packing import adanorm_scale_chunks, pack_awq_w4
 
 pytest.importorskip("mflux")
 from mflux.models.qwen.model.qwen_transformer.qwen_transformer import QwenTransformer
@@ -96,7 +96,9 @@ def _checkpoint():
         ckpt[f"{p}.{stream}_mod.1.qweight"] = mx.array(pack_awq_w4(_interleave(codes)))
         ckpt[f"{p}.{stream}_mod.1.wscales"] = mx.array(_interleave(scale).T.copy()).astype(mx.bfloat16)
         ckpt[f"{p}.{stream}_mod.1.wzeros"] = mx.array(_interleave(zero).T.copy()).astype(mx.bfloat16)
-        ckpt[f"{p}.{stream}_mod.1.bias"] = mx.array(_interleave(bias)).astype(mx.bfloat16)
+        folded = bias.reshape(6, D).copy()
+        folded[adanorm_scale_chunks(6)] += 1  # Nunchaku folds +1 into the scale chunks (shift, scale, gate) x 2
+        ckpt[f"{p}.{stream}_mod.1.bias"] = mx.array(_interleave(folded.reshape(-1))).astype(mx.bfloat16)
     return ckpt, ws
 
 
@@ -113,7 +115,20 @@ def test_qwen_image_checkpoint_fills_a_transformer_built_without_weights():
     assert _rel(_run(attn.attn_to_out[0], x), _ref(ws["transformer_blocks.0.attn.to_out.0"], x)) < 2e-2
     assert block.img_ff.mlp_out.act_unsigned and not block.img_ff.mlp_in.act_unsigned
 
-    # modulation: logical nn.Linear order, bias without a folded +1 (mflux adds it in _modulate)
+    # modulation: logical nn.Linear order with the folded +1 removed (mflux adds 1 + scale in _modulate)
     dense, bias = ws["transformer_blocks.0.txt_mod.1"]
     expected = x.astype(np.float64) @ dense.T + bias
     assert _rel(_run(block.txt_mod_linear, x), expected) < 2e-2
+
+
+def test_quantized_base_transformer_raises_early():
+    from mlx import nn
+
+    class QuantizedBase(FakeQwenPipeline):
+        def __init__(self, model_path, **kwargs):
+            super().__init__(model_path)
+            nn.quantize(self.transformer, group_size=64, bits=4)
+
+    ckpt, _ = _checkpoint()
+    with pytest.raises(ValueError, match="quantized"):
+        load_nunchaku_pipeline("p", pipeline_cls=QuantizedBase, checkpoint=ckpt, backend="dense")

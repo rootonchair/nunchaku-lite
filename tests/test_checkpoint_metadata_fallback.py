@@ -2,6 +2,7 @@
 
 import json
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
@@ -40,3 +41,13 @@ def test_rank_is_inferred_from_proj_down():
     state = {"a.qweight": torch.zeros(8, 4, dtype=torch.int8), "a.proj_down": torch.zeros(3072, 64)}
     assert _infer_svdq_rank(state) == 64
     assert _infer_svdq_rank({"a.qweight": torch.zeros(8, 4, dtype=torch.int8)}) is None
+    with pytest.warns(UserWarning, match="mixed ranks"):
+        assert _infer_svdq_rank({**state, "b.proj_down": torch.zeros(3072, 32)}) == 64
+
+
+def test_malformed_sibling_config_warns(tmp_path):
+    ckpt = tmp_path / "model.safetensors"
+    save_file({"x": torch.zeros(1)}, ckpt)
+    (tmp_path / "config.json").write_text("{not json")
+    with pytest.warns(UserWarning, match="malformed"):
+        assert _sibling_quantization_config(ckpt) == {}

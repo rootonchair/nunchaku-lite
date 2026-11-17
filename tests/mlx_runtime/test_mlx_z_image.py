@@ -121,11 +121,12 @@ def test_incomplete_checkpoint_raises_without_base_weights():
 
 def test_without_base_weights_skips_one_component(monkeypatch):
     from mflux.models.common.weights.loading.weight_loader import WeightLoader
+    from mflux.models.z_image.weights.z_image_weight_definition import ZImageWeightDefinition
 
-    seen = {}
+    seen = []
 
     def fake_load(weight_definition, model_path=None, download_patterns=None):
-        seen["patterns"] = download_patterns
+        seen.append(download_patterns)
         return {c.name: WeightLoader._load_component(None, c)[0] for c in weight_definition.get_components()}
 
     def fake_component(root_path, definition, *args, **kwargs):
@@ -133,13 +134,43 @@ def test_without_base_weights_skips_one_component(monkeypatch):
 
     monkeypatch.setattr(WeightLoader, "load", staticmethod(fake_load))
     monkeypatch.setattr(WeightLoader, "_load_component", staticmethod(fake_component))
-    from mflux.models.z_image.weights.z_image_weight_definition import ZImageWeightDefinition
+    saved = dict(WeightLoader.__dict__)
 
     with _without_base_weights("transformer"):
         loaded = WeightLoader.load(ZImageWeightDefinition, model_path="x")
+        WeightLoader.load(ZImageWeightDefinition, "x", ["transformer/a.safetensors", "vae/b.safetensors"])  # positional
     assert loaded["transformer"] == {} and loaded["vae"] == {"loaded": "vae"}
-    assert seen["patterns"] and not any(p.startswith("transformer/") for p in seen["patterns"])
-    assert WeightLoader.load is not None and WeightLoader.load.__name__ == "fake_load"  # restored
+    assert "transformer/*.json" in seen[0] and "transformer/*.safetensors" not in seen[0]  # configs still fetched
+    assert seen[1] == ["vae/b.safetensors"]
+    assert WeightLoader.__dict__["load"] is saved["load"]  # the exact objects are restored
+
+    with pytest.raises(RuntimeError), _without_base_weights("transformer"):
+        raise RuntimeError("pipeline construction failed")
+    assert WeightLoader.__dict__["_load_component"] is saved["_load_component"]  # restored after an error
+
+
+def test_adapter_without_loaded_set_raises_clearly():
+    from nunchaku_lite.mlx.pipeline import _ADAPTERS, register_adapter
+
+    class OldAdapter:  # pre-load_base_transformer contract: patch() returned None
+        target = "old_style"
+
+        def matches(self, pipeline):
+            return False
+
+        def patch(self, pipeline, state, **kwargs):
+            return None
+
+    register_adapter(OldAdapter())
+    try:
+        ckpt, _ = _checkpoint()
+        with pytest.raises(TypeError, match="load_base_transformer=True"):
+            load_nunchaku_pipeline("p", pipeline_cls=FakeZImagePipeline, checkpoint=ckpt, target="old_style")
+        load_nunchaku_pipeline(
+            "p", pipeline_cls=FakeZImagePipeline, checkpoint=ckpt, target="old_style", load_base_transformer=True
+        )
+    finally:
+        _ADAPTERS.pop("old_style")
 
 
 def test_z_image_key_map_matches_fallback_renames():
