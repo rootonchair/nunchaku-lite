@@ -279,7 +279,9 @@ def test_original_nunchaku_flux2_keys_are_normalized_like_nunchaku_lite():
             ckpt[f"{prefix}.{name}"] = mx.array(v)
     for name in ("double_stream_modulation_img", "single_stream_modulation"):
         ckpt[f"{name}.linear.weight"] = mx.zeros(Flux2Transformer()[name].linear.weight.shape)
-    pipe = load_nunchaku_pipeline("p", pipeline_cls=FakeFlux2Pipeline, checkpoint=ckpt, backend="dense")
+    pipe = load_nunchaku_pipeline(  # partial checkpoint: the rest comes from the base transformer
+        "p", pipeline_cls=FakeFlux2Pipeline, checkpoint=ckpt, backend="dense", load_base_transformer=True
+    )
     attn = pipe.transformer.transformer_blocks[0].attn
     x = np.random.default_rng(3).standard_normal((4, D)).astype(np.float32)
     qkv = np.concatenate([_run(getattr(attn, n), x) for n in ("add_q_proj", "add_k_proj", "add_v_proj")], -1)

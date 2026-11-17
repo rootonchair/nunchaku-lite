@@ -143,6 +143,16 @@ def parse_runtime_manifest(
 _TARGET_LIST_OPS = ("svdq_w4a4", "awq_w4a16")
 
 
+def with_target_list_manifest(quantization_config: dict[str, Any], checkpoint_keys: Iterable[str]) -> dict[str, Any]:
+    """``quantization_config`` with a ``runtime_manifest`` built from its ``svdq_w4a4`` / ``awq_w4a16`` target lists
+    (checkpoints that predate the manifest); unchanged when it already has one or has no target lists."""
+
+    if "runtime_manifest" in quantization_config:
+        return quantization_config
+    raw = _manifest_from_target_lists(quantization_config, set(checkpoint_keys))
+    return quantization_config if raw is None else {**quantization_config, "runtime_manifest": raw}
+
+
 def _manifest_from_target_lists(quantization_config: dict[str, Any], keys: set[str]) -> dict[str, Any] | None:
     if quantization_config.get("quant_method") != "nunchaku_lite":
         return None

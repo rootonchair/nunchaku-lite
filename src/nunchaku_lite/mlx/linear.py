@@ -363,6 +363,8 @@ class AWQW4A16Linear(nn.Module):
             AdaNorm layout (output channels interleaved across chunks, ``+1`` folded into two chunks'
             bias), e.g. 6 for FLUX.1 ``norm1.linear`` and 3 for single-block ``norm.linear``. The layer
             then produces outputs in the original ``nn.Linear`` order.
+        adanorm_folded_one: Whether the checkpoint folded ``+1`` into the scale chunks' bias (FLUX.1). Qwen-Image
+            interleaves its modulation outputs the same way but adds ``1`` at runtime instead.
     """
 
     def __init__(
@@ -373,6 +375,7 @@ class AWQW4A16Linear(nn.Module):
         group_size: int = 64,
         adanorm_splits: int = 1,
         dtype=mx.bfloat16,
+        adanorm_folded_one: bool = True,
     ):
         super().__init__()
         if group_size != 64:
@@ -383,6 +386,7 @@ class AWQW4A16Linear(nn.Module):
         self.out_features = out_features
         self.group_size = group_size
         self.adanorm_splits = adanorm_splits
+        self.adanorm_folded_one = adanorm_folded_one
         self.qweight = mx.zeros((out_features // 4, in_features // 2), dtype=mx.int32)
         self.wscales = mx.zeros((in_features // group_size, out_features), dtype=dtype)
         self.wzeros = mx.zeros((in_features // group_size, out_features), dtype=dtype)
@@ -410,7 +414,8 @@ class AWQW4A16Linear(nn.Module):
         codes = mxl.undo_adanorm_channels(mxl.unpack_awq_codes(self.qweight, self.out_features), splits)  # (N, K)
         scale = mxl.undo_adanorm_channels(self.wscales.T.astype(mx.float32), splits)  # (N, G)
         zero = mxl.undo_adanorm_channels(self.wzeros.T.astype(mx.float32), splits)
-        bias = None if self.bias is None else mxl.undo_adanorm_bias(self.bias.astype(mx.float32), splits)
+        undo_bias = mxl.undo_adanorm_bias if self.adanorm_folded_one else mxl.undo_adanorm_channels
+        bias = None if self.bias is None else undo_bias(self.bias.astype(mx.float32), splits)
         cached = {
             "dtype": dtype,
             "wq": _pack_nibbles_u32(codes),

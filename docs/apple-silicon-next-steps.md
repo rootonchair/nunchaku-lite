@@ -2,7 +2,7 @@
 
 ## Current state
 
-All Apple-silicon work is uncommitted on `rootonchair/macos`:
+All Apple-silicon work is on `rootonchair/macos` (PR #14):
 
 - `nunchaku-lite-kernels`: Metal MPS ops for the W8A8/W4A8 SVDQ GEMM, int8
   activation quantization, and a fused QK RMSNorm + RoPE.
@@ -10,8 +10,10 @@ All Apple-silicon work is uncommitted on `rootonchair/macos`:
 - `nunchaku_lite.mlx` (the `mlx` extra): MLX layers, `patch_transformer`, AWQ W4A16, and
   `load_nunchaku_pipeline` on mflux.
 
-Both test suites pass. FLUX.2 Klein 4B is verified end to end on PyTorch MPS
-and on MLX.
+Both test suites pass. FLUX.2 Klein 4B/9B, FLUX.1-dev and Z-Image Turbo are
+verified end to end on PyTorch MPS; FLUX.2 Klein, FLUX.1-dev and Z-Image Turbo
+on MLX. Qwen-Image is not verified on either yet: its INT4 checkpoint plus the
+15 GB text encoder need about 27 GB of downloads.
 
 ## Model checks on PyTorch MPS (M5, 24 GB, 1024 px)
 
@@ -19,10 +21,20 @@ and on MLX.
 | --- | --- | --- | --- | --- | --- |
 | FLUX.1-dev | `nunchaku-tech/nunchaku-flux.1-dev` INT4 r32 | 20 | 8.5 s | 9.3 GB | correct |
 | FLUX.2 Klein 9B | `lite-infer/flux.2-klein-9b-nunchaku-lite-int4-r32` | 4 | 7.6 s (int8), 8.1 s (int4) | 11.5 GB (int8), 6.3 GB (int4) | correct |
+| FLUX.1-dev (Nunchaku Lite) | `lite-infer/flux.1-dev-nunchaku-lite-int4-r32` | 20 | 6.4 s (int4) | 13.4 GB | correct |
+| Z-Image Turbo | `nunchaku-tech/nunchaku-z-image-turbo` INT4 r128 | 8 | 4.35 s (int8) | 14.1 GB | correct |
 | FLUX.2 Klein 4B + LoRA | `lite-infer/flux.2-klein-4b-nunchaku-lite-int4-r32` + `Barath/flux2-klein-yarn-art-lora` | 4 | about 3.5 s | 7.8 GB with text encoder | LoRA applies and scales; unload restores the base image bit-exactly |
 
 Step times exclude the text encoder, which was freed after encoding: on 24 GB
-the 9B pipeline swaps with its 8B text encoder resident.
+the 9B pipeline swaps with its 8B text encoder resident. The FLUX.1 and Z-Image
+rows use the attention kernels and the AWQ release below; memory is the MPS
+driver's total after generation.
+
+The FLUX.1 Nunchaku Lite repo keeps its quantization settings only in
+`transformer/config.json` (no safetensors metadata, rank 64). The PyTorch loader
+now reads that file next to the checkpoint and builds a runtime manifest from
+its target lists, as the MLX loader already did; checkpoints with neither fall
+back to the rank of their `proj_down` tensors instead of the default 32.
 
 The checks found and fixed two bugs:
 
@@ -58,6 +70,11 @@ int4 kernel being 16% slower in isolation. `backend="auto"` picks int4 for the
 | FLUX.2 Klein 9B | `lite-infer/flux.2-klein-9b-nunchaku-lite-int4-r32` | 4.6-5.7 s (int8), 5.1-5.9 s (int4) | 16.4 GB (int8), 11.2 GB (int4) | 6.97 s, 10.3 GB | correct |
 | FLUX.2 Klein 4B | `lite-infer/flux.2-klein-4b-nunchaku-lite-int4-r32` | 2.69 s (int8), 2.87 s (int4) | 7.8 GB (int8), 5.9 GB (int4) | 3.25 s, 5.5 GB | correct |
 | FLUX.1-dev | `lite-infer/flux.1-dev-nunchaku-lite-int4-r32` | 7.45-7.9 s (int4, 20 steps) | 22.7 GB | 11.48 s, 21.8 GB | correct |
+| Z-Image Turbo | `nunchaku-tech/nunchaku-z-image-turbo` INT4 r128 | 3.86 s (8 steps, 37 s per image) | 12.4 GB | not measured | correct |
+
+Z-Image uses the bf16 `Tongyi-MAI/Z-Image-Turbo` repo for its text encoder and
+VAE; its 23 GB transformer is never downloaded (see `load_base_transformer` in
+`docs/mlx.md`). The mflux comparison would need that transformer.
 
 The FLUX.1-dev repo has no runtime manifest; the manifest is built from the
 target lists in its `config.json`. Its row uses 20 steps and guidance 3.5, with
@@ -86,29 +103,28 @@ the two-step warmup went from 87 s to 23 s.
 
 ### 1. Lock in what works
 
-1. **Commit and open a PR as three commits:** the Metal kernels, the PyTorch MPS
-   runtime, and the MLX package. Each can be reviewed on its own.
+1. **Merge PR #14.**
 2. **Add macOS CI.** All CI runs on Ubuntu today, so none of the MPS or MLX tests
    run. GitHub's macOS runners have no M5 GPUs. CI can cover packing, layout,
-   the `dense` fallback, and the fake-kernel tests. The int8 kernels still need
-   a local check on M5 hardware.
+   the `dense` fallback, the runtime-compiled attention fallback and the
+   fake-kernel tests. The int8 kernels still need a local check on M5 hardware.
 
 ### 2. Broaden model coverage (highest user value)
 
-3. **Verify Qwen-Image and Z-Image on MPS.** FLUX.1, FLUX.2 Klein 9B, and
-   runtime LoRA are now verified (see above).
-4. **Release the AWQ checkpoint copy on MPS.** AWQ layers now run PyTorch's
-   built-in 4-bit MPS matmul (`aten._weight_int4pack_mm`) instead of a dense
-   bf16 cache. On FLUX.1's 76 modulation layers that cut resident memory from
-   13.9 GB to 9.3 GB and the step from 8.9 s to 8.5 s; the op is about 3x
-   faster than the dense matmul and slightly more accurate (no custom kernel
-   was needed). The checkpoint `qweight` (1.6 GB) is still held next to the
-   op's packed copy; releasing it, as SVDQ layers do, needs a way to rebuild
-   it from that copy.
-5. **MLX adapters for the remaining families,** using mflux's Qwen-Image and
-   Z-Image models. FLUX.1 is done (`flux1`, lite checkpoints only). Manifest
-   checkpoints need only a name map, which `PrefixMap.from_mflux` derives from
-   mflux's weight mapping.
+3. **Verify Qwen-Image on MPS** (done for FLUX.1 and Z-Image, see above). Needs
+   about 27 GB of downloads: the INT4 checkpoint (11-12 GB) and the 15 GB
+   Qwen2.5-VL text encoder.
+4. **AWQ checkpoint copy released on MPS (done).** AWQ layers run PyTorch's 4-bit
+   MPS matmul (`aten._weight_int4pack_mm`). Its packed format is opaque, but the
+   op itself decodes it exactly (an identity matrix with scale 1 and zero 8 gives
+   back the 0-15 codes), so the checkpoint `qweight` is freed and re-packed
+   bit-exactly on `state_dict()`, also after CPU offload. FLUX.1-dev (Nunchaku
+   Lite): 15.4 -> 13.4 GB, same step time.
+5. **MLX adapters:** FLUX.1 and Z-Image are done (`z_image`, original Nunchaku
+   checkpoints, which store fused `to_qkv` and SwiGLU `net.0.proj`). The MLX
+   loader no longer loads the base transformer, so Qwen-Image (38 GB base
+   transformer) only needs its text encoder and VAE. A Qwen-Image adapter is
+   next, with the same download constraint as item 3.
 
 ### 3. Distribution
 
@@ -157,11 +173,22 @@ the two-step warmup went from 87 s to 23 s.
    on both runtimes (MLX `default_tile`, Hub `svdq_metal.mm`). With the attention
    ops, the new Hub build takes FLUX.2 Klein 4B int8 at 1024² from 2.21 to 2.10 s
    per step on MPS.
-10. **Quantize in the previous layer's epilogue.** Profiling estimated about 10%
-    per layer from removing the quantize stage and the GEMM wait it causes.
-11. **Load-time memory.** Weight conversion creates temporary float32 copies that
-    inflate PyTorch's allocator heaps. Converting in a lighter form would lower
-    peak memory.
+10. **Quantize in the previous layer's epilogue (measured, not pursued).** On
+    FLUX.2 Klein 4B shapes (MLX), activation quantization plus the low-rank down
+    projection cost 0.5-2.2 ms per linear: 4-20% of that linear, the most on the
+    long-K output projections. Removing both entirely would save about 70 ms of a
+    1.81 s step (under 4%). True epilogue fusion is not possible for most layers:
+    their inputs come from attention, SwiGLU or norms rather than a GEMM, and a
+    per-token scale needs the whole row, which spans threadgroups. Fusing the
+    low-rank down projection into the quantizer (CUDA's design) saves at most
+    ~14 ms per step, because that matmul already overlaps the other kernels.
+11. **Load-time memory (done on MPS).** `unpack_svdq_weight` now unpacks bytes
+    (int8 temporaries instead of an int32 per weight), int8 conversion runs in
+    row chunks of at most 64 MB of float32, and the exact-recovery check is
+    skipped when every group multiplier is >= 1 (`round(w8 / wr)` is then exact).
+    FLUX.2 Klein 9B int8: transient 1.7 -> 1.0 GB above steady state, cache build
+    18.4 -> 11.2 s; FLUX.1-dev int8: 23.8 -> 16.5 s. Same layers released (94 of
+    100 on Klein 4B int8).
 
 ### 5. Format and ecosystem
 
@@ -174,4 +201,5 @@ the two-step warmup went from 87 s to 23 s.
 
 ## Recommendation
 
-Do 1-2 now (commit, PR, macOS CI). Then 10 (epilogue quantization).
+Merge PR #14 and add macOS CI (1-2). Then Qwen-Image on MPS and MLX (3, 5) once
+there is disk space for its downloads.

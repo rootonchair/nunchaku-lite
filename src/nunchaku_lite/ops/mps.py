@@ -200,10 +200,11 @@ def unpack_svdq_weight(qweight: torch.Tensor) -> torch.Tensor:
     k = half_k * 2
     if n % 128 or k % 128:
         raise ValueError(f"qweight shape {tuple(qweight.shape)} is not a valid Nunchaku INT4 layout.")
-    words = qweight.contiguous().view(torch.int32).reshape(n // 128, k // 64, 1, 8, 8, 4, 2, 2, 1)
-    shifts = torch.arange(0, 32, 4, device=qweight.device, dtype=torch.int32)
-    nibbles = (words.unsqueeze(-1) >> shifts) & 0xF
-    signed = ((nibbles ^ 8) - 8).to(torch.int8)
+    # Each little-endian int32 word holds 8 nibbles at shifts 0, 4, ..., 28: byte i holds nibbles 2i (low) and
+    # 2i + 1 (high). Unpacking bytes keeps every temporary int8 (an int32 per weight would be 4x the memory).
+    b = qweight.contiguous().view(torch.uint8).reshape(n // 128, k // 64, 1, 8, 8, 4, 2, 2, 1, 4)
+    nibbles = torch.stack([b & 0xF, b >> 4], dim=-1).view(torch.int8).flatten(-2)
+    signed = (nibbles ^ 8) - 8
     return signed.permute(_W_PERM_INV).contiguous().reshape(n, k)
 
 
@@ -359,8 +360,11 @@ def _build_svdq_cache(module, backend: str, dtype: torch.dtype) -> tuple[dict, d
     if bias is not None:
         tensors["bias"] = bias.contiguous()
     if backend == "dense":
-        w = (q.float().view(n, k // 64, 64) * wscale[..., None]).view(n, k)
-        tensors["weight"] = (w / smooth).to(dtype)  # fold 1/smooth into the dense weight
+        weight = torch.empty(n, k, dtype=dtype, device=q.device)
+        for rows in _row_chunks(n, k):
+            w = (q[rows].float().view(-1, k // 64, 64) * wscale[rows, :, None]).view(-1, k)
+            weight[rows] = (w / smooth).to(dtype)  # fold 1/smooth into the dense weight
+        tensors["weight"] = weight
         if down.shape[0]:  # keep the SVD branch low-rank: two thin matmuls, not a dense (N, K) matrix
             tensors["down"] = down.to(dtype).contiguous()
             tensors["up"] = up.to(dtype).contiguous()
@@ -380,14 +384,29 @@ def _build_svdq_cache(module, backend: str, dtype: torch.dtype) -> tuple[dict, d
     tensors["wsc"] = wsc.float().contiguous()
     tensors["wr"] = wr.t().contiguous()  # (K / 64, N); also lets int8 recover q exactly
     if backend == "int8":
-        w8 = torch.round(q.float().view(n, k // 64, 64) * wr.float()[..., None]).clamp_(-127, 127)
-        tensors["w8"] = w8.to(torch.int8).view(n, k).contiguous()
-        invertible = bool(torch.equal(_q_from_w8(tensors["w8"], tensors["wr"]), q))
+        w8 = torch.empty(n, k, dtype=torch.int8, device=q.device)
+        for rows in _row_chunks(n, k):
+            chunk = torch.round(q[rows].float().view(-1, k // 64, 64) * wr[rows].float()[..., None]).clamp_(-127, 127)
+            w8[rows] = chunk.to(torch.int8).view(-1, k)
+        tensors["w8"] = w8
+        # q = round(w8 / wr) recovers q exactly when every multiplier wr >= 1 (the rounding error divided by wr
+        # stays below 0.5); only layers with smaller multipliers need the full check.
+        invertible = bool((wr >= 1).all()) or all(
+            torch.equal(_q_from_w8(w8[rows], tensors["wr"][:, rows]), q[rows]) for rows in _row_chunks(n, k)
+        )
     else:
         nib = (q & 0xF).to(torch.uint8).view(n, k // 2, 2)
         tensors["w4"] = (nib[..., 0] | (nib[..., 1] << 4)).contiguous()
         invertible = True
     return tensors, {"backend": backend, "lr_dtype": lr_dtype, "q_invertible": invertible}
+
+
+def _row_chunks(n: int, k: int, budget: int = 1 << 24):
+    """Row slices covering ``n`` rows of width ``k``, each at most ``budget`` elements (64 MB of float32), so
+    weight conversion never holds a full-size float32 copy of a layer."""
+
+    step = max(128, budget // k // 128 * 128)
+    return [slice(start, min(start + step, n)) for start in range(0, n, step)]
 
 
 def _q_from_w8(w8: torch.Tensor, wr_t: torch.Tensor) -> torch.Tensor:
@@ -420,8 +439,9 @@ def _state_dict_hook(module, state_dict, prefix, local_metadata):
 
 def _load_state_dict_pre_hook(module, state_dict, prefix, *args):
     if getattr(module, "_nunchaku_lite_qweight_released", False) and prefix + "qweight" in state_dict:
+        dtype = getattr(module, "_nunchaku_lite_qweight_dtype", torch.int8)
         module.qweight = torch.nn.Parameter(
-            torch.empty(module._nunchaku_lite_qweight_shape, dtype=torch.int8, device=module.wscales.device),
+            torch.empty(module._nunchaku_lite_qweight_shape, dtype=dtype, device=module.wscales.device),
             requires_grad=False,
         )
         module._nunchaku_lite_qweight_released = False
@@ -650,7 +670,44 @@ def dequantize_awq_g64_int32(qweight: torch.Tensor, wscales: torch.Tensor, wzero
     return (codes * scale + zeros).reshape(out_features, groups * 64)
 
 
+@torch.no_grad()
+def _awq_g64_pack(codes: torch.Tensor) -> torch.Tensor:
+    """Inverse of :func:`_awq_g64_codes`: unsigned codes ``(N, K)`` -> Nunchaku AWQ group-64 int32 ``qweight``."""
+
+    n, k = codes.shape
+    groups = k // 64
+    c = codes.to(device="cpu", dtype=torch.int64).view(n // 4, 4, groups, 64).permute(0, 2, 1, 3)
+    packed_index, nibble = _awq_g64_channel_maps(torch.device("cpu"))
+    # the 8 channels sharing a packed word occupy disjoint nibbles, so adding them is an OR
+    words = torch.zeros(n // 4, groups, 4, 8, dtype=torch.int64).index_add_(-1, packed_index, c << (4 * nibble))
+    words = torch.where(words >= 2**31, words - 2**32, words)  # reinterpret as signed int32
+    return words.to(torch.int32).view(n // 4, groups * 32)
+
+
 _INT4PACK_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
+def _awq_int4pack_codes(module) -> torch.Tensor:
+    """Unsigned codes ``(N, K)`` recovered exactly from the 4-bit matmul copy: ``I @ W`` with scale 1 and zero 8."""
+
+    # The packed layout is the MPS one even after the module moves to the CPU (offload), so decode on MPS.
+    w4 = _cached(module, "w4").to("mps")
+    k, n = module.in_features, module.out_features
+    ones = torch.ones(k // 64, n, device=w4.device)
+    unit = torch.stack([ones, 8 * ones], dim=-1).to(torch.bfloat16)
+    codes = torch.empty(n, k, dtype=torch.int32, device=w4.device)
+    for start in range(0, k, 2048):  # bounded temporaries for wide layers
+        rows = min(2048, k - start)
+        eye = torch.zeros(rows, k, dtype=torch.bfloat16, device=w4.device)
+        eye[:, start : start + rows].fill_diagonal_(1)
+        codes[:, start : start + rows] = torch.ops.aten._weight_int4pack_mm(eye, w4, 64, unit).t().round().int()
+    return codes.to(module.wscales.device)
+
+
+def _awq_codes(module) -> torch.Tensor:
+    if getattr(module, "_nunchaku_lite_qweight_released", False):
+        return _awq_int4pack_codes(module)
+    return _awq_g64_codes(module.qweight, module.out_features)
 
 
 @torch.no_grad()
@@ -666,7 +723,7 @@ def _build_awq_int4pack(module, dtype: torch.dtype) -> dict | None:
     if dtype not in _INT4PACK_DTYPES or not hasattr(torch.ops.aten, "_weight_int4pack_mm"):
         return None
     n = module.out_features
-    codes = _awq_g64_codes(module.qweight, n).view(n, -1, 2)
+    codes = _awq_codes(module).view(n, -1, 2)
     try:
         packed = torch.ops.aten._convert_weight_to_int4pack(((codes[..., 0] << 4) | codes[..., 1]).to(torch.uint8), 2)
     except RuntimeError:
@@ -676,10 +733,31 @@ def _build_awq_int4pack(module, dtype: torch.dtype) -> dict | None:
     return {"w4": packed, "scales_and_zeros": scales_and_zeros}
 
 
+def _awq_state_dict_hook(module, state_dict, prefix, local_metadata):
+    if getattr(module, "_nunchaku_lite_qweight_released", False):
+        state_dict[prefix + "qweight"] = _awq_g64_pack(_awq_int4pack_codes(module)).to(module.wscales.device)
+
+
+def _release_awq_qweight(module) -> None:
+    """Free the checkpoint ``qweight`` once the 4-bit matmul copy holds the same codes (1.6 GB on FLUX.1)."""
+
+    if not getattr(module, "_nunchaku_lite_mps_hooks", False):
+        module._register_state_dict_hook(_awq_state_dict_hook)
+        module._register_load_state_dict_pre_hook(_load_state_dict_pre_hook, with_module=True)
+        module._nunchaku_lite_mps_hooks = True
+    module._nunchaku_lite_qweight_shape = tuple(module.qweight.shape)
+    module._nunchaku_lite_qweight_dtype = module.qweight.dtype
+    module.qweight = torch.nn.Parameter(
+        torch.empty(0, dtype=module.qweight.dtype, device=module.qweight.device), requires_grad=False
+    )
+    module._nunchaku_lite_qweight_released = True
+
+
 def awq_linear_mps(module, x: torch.Tensor) -> torch.Tensor:
     """Apply an AWQ W4A16 projection on MPS.
 
-    Uses PyTorch's 4-bit MPS matmul when available (weights stay 4-bit), else a cached dequantized weight.
+    Uses PyTorch's 4-bit MPS matmul when available (weights stay 4-bit; the checkpoint ``qweight`` is then
+    released and re-packed on ``state_dict()``), else a cached dequantized weight.
     """
 
     if module.group_size != 64:
@@ -687,10 +765,20 @@ def awq_linear_mps(module, x: torch.Tensor) -> torch.Tensor:
 
     key = ("awq", x.dtype, *_tensor_states(module, _AWQ_KEY_TENSORS))
     if not _cache_valid(module, key):
+        released = getattr(module, "_nunchaku_lite_qweight_released", False)
         int4pack = _build_awq_int4pack(module, x.dtype)
         if int4pack is not None:
             _store_cache(module, key, int4pack, {"backend": "awq_int4pack"})
+            if not released:
+                _release_awq_qweight(module)
+                module._nunchaku_lite_mps_key = (*key[:2], ("released",), *key[3:])
         else:
+            if released:  # e.g. float64 activations: bring the packed weights back first
+                module.qweight = torch.nn.Parameter(
+                    _awq_g64_pack(_awq_int4pack_codes(module)).to(module.wscales.device), requires_grad=False
+                )
+                module._nunchaku_lite_qweight_released = False
+                key = ("awq", x.dtype, *_tensor_states(module, _AWQ_KEY_TENSORS))
             dense = dequantize_awq_g64_int32(module.qweight, module.wscales, module.wzeros).to(x.dtype)
             _store_cache(module, key, {"weight": dense}, {"backend": "awq_dense"})
     if module._nunchaku_lite_mps_meta["backend"] == "awq_int4pack":

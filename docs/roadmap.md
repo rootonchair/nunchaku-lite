@@ -91,17 +91,19 @@ kernels for M5-class Neural Accelerators, plus a portable W4A16 fallback.
 - [x] Fused Metal QK RMSNorm + RoPE op. Now one kernel body shared by MLX and MPS
   (`nunchaku_lite/shaders.py`), Hub op `qk_norm_rope_mps_` (compiled at runtime with older Hub builds); the
   earlier Hub op `svdq_qk_norm_rope_` is no longer called (kept for compatibility).
-- [ ] Verify FLUX.1, Qwen-Image, Z-Image, and runtime LoRA on MPS.
+- [x] Verify FLUX.1 (Nunchaku and Nunchaku Lite checkpoints), Z-Image, and runtime LoRA on MPS.
+- [ ] Verify Qwen-Image on MPS (needs about 27 GB of downloads).
 - [x] Faster attention on MPS: MLX's Neural Accelerator flash attention (M5), Hub op `attention_mps`, plus
   fused FLUX.2 q/k norm + RoPE on MLX and MPS.
 - [ ] Quantized T5 (TinyChat AWQ g128) on MPS.
 - [ ] NVFP4 checkpoint support.
-- [ ] Fuse activation quantization into the producing GEMM's epilogue (e.g. fc1+GELU
-  -> int8 for fc2) to remove the quantize stage and the inter-kernel bubble (~10% per
-  layer). Fusing only `x @ down` into the quantizer was tried and gave no gain.
+- [x] Investigated fusing activation quantization into the producing GEMM's epilogue. Measured: quantize +
+  low-rank cost at most ~4% of a FLUX.2 Klein 4B step, the producers are mostly attention / SwiGLU /
+  norms, and a per-row scale spans threadgroups; not pursued (see `docs/apple-silicon-next-steps.md`).
 - [x] MLX `load_nunchaku_pipeline` on mflux with a `flux2` adapter (FLUX.2 Klein,
   verified end to end); AWQ W4A16 layers and lazy `qweight` release on MLX.
-- [ ] MLX adapters for FLUX.1, Qwen-Image, Z-Image.
+- [x] MLX adapters for FLUX.1 and Z-Image; base transformer weights are no longer loaded.
+- [ ] MLX adapter for Qwen-Image.
 - [x] Low-rank branch as a second Neural Accelerator matmul in the GEMM epilogue.
 - [ ] End-to-end image benchmarks.
 

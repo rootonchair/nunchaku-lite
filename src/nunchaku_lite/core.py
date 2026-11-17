@@ -11,8 +11,8 @@ from typing import Any, Protocol
 
 import torch
 
-from .manifest import RuntimeManifest, parse_runtime_manifest
-from .utils import get_precision, load_state_dict_in_safetensors
+from .manifest import RuntimeManifest, parse_runtime_manifest, with_target_list_manifest
+from .utils import fetch_or_download, get_precision, load_state_dict_in_safetensors
 
 
 @dataclass
@@ -384,8 +384,14 @@ def _patch_component(
         raise ValueError(f"Transformer is already patched as {existing_target!r}; requested {target!r}.")
 
     state_dict, metadata = load_state_dict_in_safetensors(checkpoint, return_metadata=True)
-    quantization_config = _parse_json_metadata(metadata, "quantization_config")
+    quantization_config = _parse_json_metadata(metadata, "quantization_config") or _sibling_quantization_config(
+        checkpoint
+    )
+    quantization_config = with_target_list_manifest(quantization_config, state_dict.keys())
     runtime_manifest = parse_runtime_manifest(quantization_config)
+    rank = _infer_svdq_rank(state_dict) if runtime_manifest is None and "rank" not in quantization_config else None
+    if rank is not None:
+        quantization_config = {**quantization_config, "rank": rank}
     adapter = _select_adapter_for_checkpoint(transformer, target, runtime_manifest)
     normalized_precision = _normalize_precision(precision, device, checkpoint, runtime_manifest)
     _validate_quantization_compatibility(quantization_config, normalized_precision, device, checkpoint)
@@ -584,6 +590,37 @@ def _coerce_state_dict_for_assign(module: torch.nn.Module, state_dict: dict[str,
         if not (expected.is_floating_point() and value.is_floating_point()):
             continue
         state_dict[key] = value.to(dtype=expected.dtype)
+
+
+def _sibling_quantization_config(checkpoint: str | os.PathLike) -> dict[str, Any]:
+    """``quantization_config`` from the ``config.json`` next to a checkpoint file (Diffusers-format repos that keep it
+    there instead of in the safetensors metadata); ``{}`` when there is none."""
+
+    sibling = Path(checkpoint).parent / "config.json"
+    try:
+        if Path(checkpoint).exists():  # local file: never fall through to a Hub download
+            if not sibling.is_file():
+                return {}
+            config_path = sibling
+        else:  # Hub reference ``org/repo/.../file.safetensors``
+            config_path = fetch_or_download(sibling)
+        value = json.loads(Path(config_path).read_text()).get("quantization_config")
+    except Exception:  # noqa: BLE001 - no readable config.json: no fallback metadata
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _infer_svdq_rank(state_dict: dict[str, torch.Tensor]) -> int | None:
+    """The low-rank branch rank of a lite-format checkpoint (``*.proj_down`` is ``(in_features, rank)``).
+
+    Used when the checkpoint has no ``rank`` metadata, e.g. Diffusers-format repos that keep it only in
+    ``transformer/config.json``; without it, a rank-64 checkpoint would be patched with the default rank 32.
+    """
+
+    for key, value in state_dict.items():
+        if key.endswith(".proj_down") and value.ndim == 2:
+            return int(value.shape[1])
+    return None
 
 
 def _parse_json_metadata(metadata: dict[str, str] | None, key: str) -> dict[str, Any]:

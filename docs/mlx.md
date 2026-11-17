@@ -113,12 +113,50 @@ pipeline's `model_config` and every weight comes from the Nunchaku checkpoint.
 Loading fails if the checkpoint lacks any. This uses less memory than a bf16
 base: the 4B peaks at 5.9 GB with `int4`.
 
+Z-Image Turbo uses mflux's `ZImage` with an original Nunchaku checkpoint:
+
+```python
+from mflux.models.z_image import ZImage
+
+model = load_nunchaku_pipeline(
+    "Tongyi-MAI/Z-Image-Turbo",  # only the text encoder, VAE and tokenizer are downloaded
+    pipeline_cls=ZImage,
+    checkpoint="nunchaku-tech/nunchaku-z-image-turbo/svdq-int4_r128-z-image-turbo.safetensors",
+)
+image = model.generate_image(seed=42, prompt="a glass greenhouse at golden hour", num_inference_steps=8)
+```
+
+Qwen-Image uses mflux's `QwenImage` and an original Nunchaku checkpoint
+(the adapter is unit-tested; the end-to-end check is pending) (for example
+`nunchaku-tech/nunchaku-qwen-image/svdq-int4_r32-qwen-image-lightningv1.0-4steps.safetensors`).
+For the Lightning checkpoints, set the scheduler's time shift to `log(3)` at
+every resolution, as in the Diffusers example:
+
+```python
+import copy, math
+from mflux.models.qwen.variants.txt2img.qwen_image import QwenImage
+
+config = copy.copy(ModelConfig.qwen_image())
+config.sigma_base_shift = config.sigma_max_shift = math.log(3)
+config.sigma_shift_terminal = None
+model = load_nunchaku_pipeline("Qwen/Qwen-Image", pipeline_cls=QwenImage, checkpoint=..., model_config=config)
+image = model.generate_image(seed=0, prompt="...", num_inference_steps=4, guidance=1.0)
+```
+
+By default the base model's transformer weights are neither downloaded nor
+loaded (`load_base_transformer=False`): Nunchaku checkpoints hold the whole
+transformer, so the pipeline is built with an empty, lazy transformer that the
+checkpoint fills, and loading fails if any weight is missing. For Z-Image Turbo
+this skips a 23 GB download, for Qwen-Image 38 GB. Images are bit-identical to loading the base
+weights first. Pass `load_base_transformer=True` for a partial checkpoint.
+
 On 24 GB Macs, cap MLX's buffer cache for the 9B (`mx.set_cache_limit(1 << 30)`).
 Otherwise freed buffers (up to about 9 GB) stay resident, and the first step of
 every image swaps.
 
 Registered adapters: `flux1` (FLUX.1, mflux `Flux1`), `flux2` (FLUX.2 Klein),
-and `manifest`, a generic adapter
+`qwen_image` (Qwen-Image, mflux `QwenImage`), `z_image` (Z-Image, mflux
+`ZImage`), and `manifest`, a generic adapter
 for any transformer whose module names match the manifest's. `target="auto"`
 picks the model-family adapter, else `manifest` when the checkpoint has one.
 Requires `pip install mflux`.
@@ -227,7 +265,8 @@ and low-rank branch) does not change these figures.
 - INT4 SVDQ checkpoints only. NVFP4 is not supported yet.
 - `N % 64 == 0` and `K % 64 == 0`. Tokens are padded internally. The low-rank
   dimension is zero-padded to a multiple of 32.
-- Pipelines: adapters exist for FLUX.1 (`flux1`) and FLUX.2 Klein (`flux2`).
+- Pipelines: adapters exist for FLUX.1 (`flux1`), FLUX.2 Klein (`flux2`),
+  Qwen-Image (`qwen_image`) and Z-Image (`z_image`).
   Other families can use the `manifest` adapter or `patch_transformer` with a
   `key_map` (for example `PrefixMap.from_mflux(<mflux WeightMapping>.get_transformer_mapping())`),
   or register an adapter.

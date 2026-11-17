@@ -133,9 +133,9 @@ the kernel epilogue. Q/K RMSNorm and RoPE run in a fused Metal kernel.
   ```python
   pipe = load_nunchaku_pipeline(..., device="mps", backend="int4")
   ```
-- INT4 checkpoints only (no NVFP4). Verified end to end with FLUX.2 Klein 4B.
-  The FLUX.1, Qwen-Image, and Z-Image adapters use the same code paths but are
-  not yet verified on MPS.
+- INT4 checkpoints only (no NVFP4). Verified end to end with FLUX.2 Klein 4B and
+  9B, FLUX.1-dev (Nunchaku and Nunchaku Lite checkpoints), and Z-Image Turbo. The
+  Qwen-Image adapter uses the same code paths but is not yet verified on MPS.
 
 On an M5 MacBook Pro (FLUX.2 Klein 4B, 4 steps, denoising only):
 
@@ -146,8 +146,9 @@ On an M5 MacBook Pro (FLUX.2 Klein 4B, 4 steps, denoising only):
 | INT4, `int4` backend | 2.67 GB | 4.4 GB | 0.70 s (1.71x) | 2.50 s (1.98x) |
 
 The packed checkpoint `qweight` is released after conversion whenever the
-kernel copy reproduces it exactly (117 of 120 layers for `int8`, all layers for
-`int4`); `state_dict()` re-packs it and `load_state_dict()` restores it.
+kernel copy reproduces it exactly (94 of 100 layers for `int8`, all layers for
+`int4`; AWQ modulation layers too); `state_dict()` re-packs it and
+`load_state_dict()` restores it.
 On M5-class GPUs the patched transformer's attention also runs on the Neural Accelerators (MLX's flash
 attention kernel) instead of PyTorch's MPS attention, and FLUX.2's q/k norm + RoPE is one fused kernel. Both
 come with the Hub kernels; with an older Hub build they are compiled at runtime instead. The dense BF16 row uses

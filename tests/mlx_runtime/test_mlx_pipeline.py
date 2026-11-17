@@ -222,7 +222,7 @@ def test_flux2_adapter_strict_and_selection_errors():
         load_nunchaku_pipeline("p", pipeline_cls=FakeFlux2Pipeline, checkpoint=ckpt, backend="dense")
     load_nunchaku_pipeline("p", pipeline_cls=FakeFlux2Pipeline, checkpoint=ckpt, backend="dense", strict=False)
     with pytest.raises(ValueError, match="Unknown adapter target"):
-        load_nunchaku_pipeline("p", pipeline_cls=FakeFlux2Pipeline, checkpoint=ckpt, target="qwen_image")
+        load_nunchaku_pipeline("p", pipeline_cls=FakeFlux2Pipeline, checkpoint=ckpt, target="sana")
     with pytest.raises(NotImplementedError):
         load_nunchaku_pipeline("p", pipeline_cls=FakeFlux2Pipeline, checkpoint=ckpt, precision="fp4")
     with pytest.raises(ValueError, match="backend must be one of"):

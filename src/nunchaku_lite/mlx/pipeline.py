@@ -12,7 +12,8 @@ adapter supplies the Diffusers -> mflux name map (derived from mflux's own weigh
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -31,6 +32,8 @@ __all__ = [
     "Flux2Adapter",
     "ManifestAdapter",
     "PipelineAdapter",
+    "QwenImageAdapter",
+    "ZImageAdapter",
     "list_adapters",
     "load_nunchaku_pipeline",
     "register_adapter",
@@ -40,7 +43,9 @@ __all__ = [
 class PipelineAdapter(Protocol):
     """Model-family adapter: installs Nunchaku layers into an MLX pipeline's transformer.
 
-    ``manifest`` is the checkpoint's parsed runtime manifest, or ``None`` for checkpoints without one.
+    ``manifest`` is the checkpoint's parsed runtime manifest, or ``None`` for checkpoints without one. ``patch``
+    returns the transformer parameter paths it loaded as dense weights, which :func:`load_nunchaku_pipeline` uses
+    to check that a transformer built without base weights was filled completely.
     """
 
     target: str
@@ -55,7 +60,7 @@ class PipelineAdapter(Protocol):
         manifest: RuntimeManifest | None,
         backend: str,
         strict: bool,
-    ) -> None: ...
+    ) -> set[str]: ...
 
 
 _ADAPTERS: dict[str, PipelineAdapter] = {}
@@ -82,6 +87,7 @@ def load_nunchaku_pipeline(
     precision: str = "int4",
     backend: str = "auto",
     strict: bool = True,
+    load_base_transformer: bool = False,
     **pipeline_kwargs,
 ):
     """Build an MLX pipeline and install a Nunchaku INT4 transformer.
@@ -99,6 +105,10 @@ def load_nunchaku_pipeline(
         backend: Quantized-kernel backend, ``"auto"``, ``"int8"``, ``"int4"``, or ``"dense"`` (same as
             ``nunchaku_lite``); resolved once for the whole transformer.
         strict: Raise when checkpoint tensors do not match the transformer.
+        load_base_transformer: Also download and load the base model's transformer weights. Off by default:
+            Nunchaku checkpoints hold the whole transformer, so the pipeline is built with an empty (lazy, never
+            materialized) transformer that the checkpoint fills; a checkpoint missing any weight raises. This
+            skips e.g. the 23 GB Z-Image-Turbo transformer download.
         **pipeline_kwargs: Forwarded to ``pipeline_cls``.
 
     Returns:
@@ -112,12 +122,54 @@ def load_nunchaku_pipeline(
     manifest = parse_runtime_manifest(quantization_config, checkpoint_keys=state)
     if manifest is not None and manifest.precision == "fp4":
         raise NotImplementedError("NVFP4 (fp4) checkpoints are not supported on MLX yet; use an INT4 checkpoint.")
-    pipeline = pipeline_cls(model_path=str(pretrained_model_name_or_path), **pipeline_kwargs)
+    if load_base_transformer:
+        pipeline = pipeline_cls(model_path=str(pretrained_model_name_or_path), **pipeline_kwargs)
+    else:
+        with _without_base_weights("transformer"):
+            pipeline = pipeline_cls(model_path=str(pretrained_model_name_or_path), **pipeline_kwargs)
     adapter = _select_adapter(pipeline, target, manifest)
-    adapter.patch(pipeline, state, manifest=manifest, backend=backend, strict=strict)
+    loaded = adapter.patch(pipeline, state, manifest=manifest, backend=backend, strict=strict)
+    if not load_base_transformer:
+        _require_complete(pipeline.transformer, loaded, reason="the base transformer weights were not loaded")
     pipeline._nunchaku_lite_target = adapter.target
     pipeline._nunchaku_lite_runtime_manifest = manifest
     return pipeline
+
+
+@contextmanager
+def _without_base_weights(component: str) -> Iterator[None]:
+    """Build an mflux pipeline without downloading or loading one component's weights.
+
+    mflux reads every component through ``WeightLoader``; this drops ``component``'s download patterns and returns
+    no weights for it, so the module keeps its lazy initial parameters (never evaluated, so never allocated).
+    """
+
+    try:
+        from mflux.models.common.weights.loading.weight_loader import WeightLoader
+    except ImportError:  # not an mflux pipeline (or mflux missing): nothing to skip
+        yield
+        return
+
+    original_load = WeightLoader.load
+    original_component = WeightLoader._load_component
+
+    def load(weight_definition, model_path=None, download_patterns=None):
+        patterns = download_patterns if download_patterns is not None else weight_definition.get_download_patterns()
+        patterns = [p for p in patterns if not p.startswith(f"{component}/")]
+        return original_load(weight_definition, model_path=model_path, download_patterns=patterns)
+
+    def load_component(root_path, definition, *args, **kwargs):
+        if definition.name == component:
+            return {}, None, None
+        return original_component(root_path, definition, *args, **kwargs)
+
+    WeightLoader.load = staticmethod(load)
+    WeightLoader._load_component = staticmethod(load_component)
+    try:
+        yield
+    finally:
+        WeightLoader.load = staticmethod(original_load)
+        WeightLoader._load_component = staticmethod(original_component)
 
 
 def _select_adapter(pipeline: Any, target: str, manifest: RuntimeManifest | None = None) -> PipelineAdapter:
@@ -177,8 +229,10 @@ def _fresh_transformer(pipeline: Any) -> nn.Module:
     return type(pipeline.transformer)(**config)
 
 
-def _require_complete(transformer: nn.Module, dense_loaded: set[str]) -> None:
-    """Raise if a rebuilt transformer still has parameters the checkpoint did not provide."""
+def _require_complete(
+    transformer: nn.Module, dense_loaded: set[str], reason: str = "the base transformer is quantized"
+) -> None:
+    """Raise if a rebuilt (or never loaded) transformer still has parameters the checkpoint did not provide."""
 
     quantized = [
         path + "." for path, m in transformer.named_modules() if isinstance(m, (SVDQW4A4Linear, AWQW4A16Linear))
@@ -190,8 +244,9 @@ def _require_complete(transformer: nn.Module, dense_loaded: set[str]) -> None:
     ]
     if missing:
         raise ValueError(
-            f"The base transformer is quantized, so every weight must come from the Nunchaku checkpoint, but "
-            f"{len(missing)} parameter(s) are missing from it, e.g. {missing[0]!r}. Use a non-quantized base pipeline."
+            f"Every transformer weight must come from the Nunchaku checkpoint ({reason}), but {len(missing)} "
+            f"parameter(s) are missing from it, e.g. {missing[0]!r}. Pass load_base_transformer=True with a "
+            "non-quantized base model."
         )
 
 
@@ -206,7 +261,7 @@ class ManifestAdapter:
     def patch(self, pipeline: Any, state, *, manifest: RuntimeManifest | None, backend: str, strict: bool) -> None:
         if manifest is None:
             raise ValueError("target='manifest' requires quantization_config.runtime_manifest metadata.")
-        patch_from_manifest(pipeline.transformer, state, manifest, backend=backend, strict=strict)
+        return patch_from_manifest(pipeline.transformer, state, manifest, backend=backend, strict=strict)
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +384,7 @@ class Flux2Adapter:
         transformer = getattr(pipeline, "transformer", None)
         return type(transformer).__name__ == "Flux2Transformer"
 
-    def patch(self, pipeline: Any, state, *, manifest: RuntimeManifest | None, backend: str, strict: bool) -> None:
+    def patch(self, pipeline: Any, state, *, manifest: RuntimeManifest | None, backend: str, strict: bool) -> set[str]:
         key_map = flux2_key_map()
         rebuilt = _is_quantized_base(pipeline.transformer)
         if rebuilt:
@@ -346,6 +401,7 @@ class Flux2Adapter:
             _require_complete(pipeline.transformer, loaded)
         if mx.metal.is_available():
             install_fused_attention(pipeline.transformer)  # q/k norm + RoPE in one kernel (Metal GPUs)
+        return loaded
 
     def _patch_nunchaku(self, transformer, state, key_map, backend: str, strict: bool) -> set[str]:
         used: set[str] = set()
@@ -426,7 +482,7 @@ class Flux1Adapter:
         cls = type(transformer)
         return cls.__name__ == "Transformer" and cls.__module__.startswith("mflux.models.flux.model.")
 
-    def patch(self, pipeline: Any, state, *, manifest: RuntimeManifest | None, backend: str, strict: bool) -> None:
+    def patch(self, pipeline: Any, state, *, manifest: RuntimeManifest | None, backend: str, strict: bool) -> set[str]:
         if manifest is None:
             raise ValueError(
                 "The FLUX.1 MLX adapter needs a Nunchaku Lite checkpoint (runtime manifest or config.json target "
@@ -446,8 +502,191 @@ class Flux1Adapter:
         )
         if rebuilt:
             _require_complete(pipeline.transformer, loaded)
+        return loaded
+
+
+# ---------------------------------------------------------------------------
+# Z-Image (mflux ZImage)
+# ---------------------------------------------------------------------------
+
+
+# Diffusers -> mflux names used when mflux is not importable; with mflux the map comes from ZImageWeightMapping.
+_Z_IMAGE_RENAMES = (
+    ("t_embedder.mlp.0", "t_embedder.linear1"),
+    ("t_embedder.mlp.2", "t_embedder.linear2"),
+    ("all_final_layer.2-1.adaLN_modulation.1", "all_final_layer.2-1.adaLN_modulation.0"),
+)
+_Z_IMAGE_BLOCK_GROUPS = ("noise_refiner", "context_refiner", "layers")
+
+
+def z_image_key_map() -> PrefixMap:
+    """Diffusers -> mflux Z-Image transformer name map, derived from mflux's ``ZImageWeightMapping``."""
+
+    try:
+        from mflux.models.z_image.weights.z_image_weight_mapping import ZImageWeightMapping
+    except ImportError:
+        return PrefixMap(_Z_IMAGE_RENAMES)
+    return PrefixMap.from_mflux(ZImageWeightMapping.get_transformer_mapping())
+
+
+def _split_rows(state: dict[str, mx.array], key: str, names: list[str], used: set[str]) -> None:
+    """Replace a fused dense ``key`` (``<prefix>.weight``) by equal row blocks named ``names`` (in order)."""
+
+    fused = state[key]
+    used.add(key)
+    for name, part in zip(names, mx.split(fused, len(names), axis=0)):
+        state[name] = part
+
+
+class ZImageAdapter:
+    """Nunchaku Z-Image checkpoints on mflux's Z-Image transformer (``mflux.models.z_image.ZImage``).
+
+    Original Nunchaku checkpoints (e.g. ``nunchaku-tech/nunchaku-z-image-turbo``) store Diffusers names with a
+    fused ``attention.to_qkv`` and the SwiGLU feed-forward as ``feed_forward.net.0.proj`` (``[w3; w1]``: Diffusers'
+    SwiGLU multiplies the first half by ``silu`` of the second) and ``feed_forward.net.2`` (``w2``). They are
+    wrapped to serve mflux's separate ``to_q`` / ``to_k`` / ``to_v`` and ``w1`` / ``w3``. Refiners stored dense
+    (``skip_refiners``) are split the same way. Checkpoints with a runtime manifest use Diffusers' module names,
+    which match mflux's one to one.
+    """
+
+    target = "z_image"
+
+    def matches(self, pipeline: Any) -> bool:
+        return type(getattr(pipeline, "transformer", None)).__name__ == "ZImageTransformer"
+
+    def patch(self, pipeline: Any, state, *, manifest: RuntimeManifest | None, backend: str, strict: bool) -> set[str]:
+        key_map = z_image_key_map()
+        if manifest is not None:
+            return patch_from_manifest(
+                pipeline.transformer, state, manifest, key_map=key_map, backend=backend, strict=strict
+            )
+        transformer, state, used = pipeline.transformer, dict(state), set()
+
+        def svdq(prefix: str):
+            used.update(k for k in state if k.startswith(prefix + "."))
+            return svdq_layer_from_state(state, prefix, dtype=state[f"{prefix}.wscales"].dtype)
+
+        for group in _Z_IMAGE_BLOCK_GROUPS:
+            for i, block in enumerate(getattr(transformer, group)):
+                p = f"{group}.{i}"
+                attn, ff = block.attention, block.feed_forward
+                if f"{p}.attention.to_qkv.qweight" in state:
+                    shared = SharedProjection(svdq(f"{p}.attention.to_qkv"), consumers=3)
+                    for j, name in enumerate(("to_q", "to_k", "to_v")):
+                        setattr(attn, name, ProjectionSlice(shared, j * attn.dim, (j + 1) * attn.dim, owner=j == 0))
+                    attn.to_out = [svdq(f"{p}.attention.to_out.0")]
+                elif f"{p}.attention.to_qkv.weight" in state:
+                    names = [f"{p}.attention.{n}.weight" for n in ("to_q", "to_k", "to_v")]
+                    _split_rows(state, f"{p}.attention.to_qkv.weight", names, used)
+                if f"{p}.feed_forward.net.0.proj.qweight" in state:
+                    gate_up = svdq(f"{p}.feed_forward.net.0.proj")
+                    hidden = gate_up.out_features // 2
+                    shared = SharedProjection(gate_up, consumers=2)
+                    ff.w3 = ProjectionSlice(shared, 0, hidden, owner=True)
+                    ff.w1 = ProjectionSlice(shared, hidden, 2 * hidden, owner=False)
+                    ff.w2 = svdq(f"{p}.feed_forward.net.2")
+                elif f"{p}.feed_forward.net.0.proj.weight" in state:
+                    names = [f"{p}.feed_forward.w3.weight", f"{p}.feed_forward.w1.weight"]
+                    _split_rows(state, f"{p}.feed_forward.net.0.proj.weight", names, used)
+                    state[f"{p}.feed_forward.w2.weight"] = state[f"{p}.feed_forward.net.2.weight"]
+                    used.add(f"{p}.feed_forward.net.2.weight")
+
+        loaded = load_dense_weights(transformer, [(key_map(k), v) for k, v in state.items() if k not in used], strict)
+        configure_backend(transformer, backend)
+        return loaded
+
+
+# ---------------------------------------------------------------------------
+# Qwen-Image (mflux QwenImage)
+# ---------------------------------------------------------------------------
+
+
+def qwen_image_key_map() -> PrefixMap:
+    """Diffusers -> mflux Qwen-Image transformer name map, derived from mflux's ``QwenWeightMapping``."""
+
+    from mflux.models.qwen.weights.qwen_weight_mapping import QwenWeightMapping
+
+    return PrefixMap.from_mflux(QwenWeightMapping.get_transformer_mapping())
+
+
+def _awq_layer_from_state(state: Mapping[str, mx.array], prefix: str, **kwargs) -> AWQW4A16Linear:
+    """An :class:`AWQW4A16Linear` from one checkpoint prefix (shapes read from ``qweight``)."""
+
+    qweight = state[f"{prefix}.qweight"]
+    layer = AWQW4A16Linear(
+        qweight.shape[1] * 2,
+        qweight.shape[0] * 4,
+        bias=f"{prefix}.bias" in state,
+        dtype=state[f"{prefix}.wscales"].dtype,
+        **kwargs,
+    )
+    layer.load_weights(
+        [(n, state[f"{prefix}.{n}"]) for n in ("qweight", "wscales", "wzeros", "bias") if f"{prefix}.{n}" in state]
+    )
+    return layer
+
+
+class QwenImageAdapter:
+    """Original Nunchaku Qwen-Image checkpoints on mflux's Qwen-Image transformer (``mflux.models.qwen``).
+
+    Nunchaku stores Diffusers names with fused ``attn.to_qkv`` / ``attn.add_qkv_proj`` (served to mflux's separate
+    projections from one matmul), GELU MLPs whose second layer takes the shifted, unsigned GELU output, and AWQ
+    W4A16 modulation layers (``img_mod.1`` / ``txt_mod.1``) whose six output chunks are interleaved; unlike FLUX.1
+    the ``+1`` of the scale chunks is added at runtime, not folded into the bias. Checkpoints with a runtime
+    manifest are patched from it with the same name map.
+    """
+
+    target = "qwen_image"
+
+    def matches(self, pipeline: Any) -> bool:
+        return type(getattr(pipeline, "transformer", None)).__name__ == "QwenTransformer"
+
+    def patch(self, pipeline: Any, state, *, manifest: RuntimeManifest | None, backend: str, strict: bool) -> set[str]:
+        key_map = qwen_image_key_map()
+        if manifest is not None:
+            return patch_from_manifest(
+                pipeline.transformer, state, manifest, key_map=key_map, backend=backend, strict=strict
+            )
+        transformer, used = pipeline.transformer, set()
+
+        def take(prefix: str) -> str:
+            used.update(k for k in state if k.startswith(prefix + "."))
+            return prefix
+
+        def svdq(prefix: str, act_unsigned: bool = False):
+            dtype = state[f"{prefix}.wscales"].dtype
+            return svdq_layer_from_state(state, take(prefix), act_unsigned=act_unsigned, dtype=dtype)
+
+        for i, block in enumerate(transformer.transformer_blocks):
+            p, attn = f"transformer_blocks.{i}", block.attn
+            for fused, names in (
+                (f"{p}.attn.to_qkv", ("to_q", "to_k", "to_v")),
+                (f"{p}.attn.add_qkv_proj", ("add_q_proj", "add_k_proj", "add_v_proj")),
+            ):
+                shared = SharedProjection(svdq(fused), consumers=3)
+                for j, name in enumerate(names):
+                    setattr(attn, name, ProjectionSlice(shared, j * attn.dim, (j + 1) * attn.dim, owner=j == 0))
+            attn.attn_to_out = [svdq(f"{p}.attn.to_out.0")]
+            attn.to_add_out = svdq(f"{p}.attn.to_add_out")
+            for stream in ("img", "txt"):
+                ff = getattr(block, f"{stream}_ff")
+                ff.mlp_in = svdq(f"{p}.{stream}_mlp.net.0.proj")
+                ff.mlp_out = svdq(f"{p}.{stream}_mlp.net.2", act_unsigned=True)  # shifted GELU output
+                setattr(
+                    block,
+                    f"{stream}_mod_linear",
+                    _awq_layer_from_state(
+                        state, take(f"{p}.{stream}_mod.1"), adanorm_splits=6, adanorm_folded_one=False
+                    ),
+                )
+
+        loaded = load_dense_weights(transformer, [(key_map(k), v) for k, v in state.items() if k not in used], strict)
+        configure_backend(transformer, backend)
+        return loaded
 
 
 register_adapter(ManifestAdapter())
 register_adapter(Flux1Adapter())
 register_adapter(Flux2Adapter())
+register_adapter(QwenImageAdapter())
+register_adapter(ZImageAdapter())

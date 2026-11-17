@@ -271,6 +271,41 @@ def test_awq_int4pack_matches_dense_fallback(monkeypatch, dtype):
 
 
 @requires_mps
+def test_awq_qweight_is_released_and_round_trips():
+    """After the 4-bit matmul copy is built, qweight is freed; state_dict re-packs it bit-exactly (also after CPU
+    offload), a dtype change rebuilds from the decoded codes, and load_state_dict restores it."""
+    g = torch.Generator().manual_seed(28)
+    n, k = 256, 4224  # k > 2048: the decoder works in chunks
+    codes = torch.randint(0, 16, (n, k), generator=g, dtype=torch.int32)
+    packed = _pack_awq_g64(codes)
+    assert torch.equal(mps_ops._awq_g64_pack(codes), packed)
+    module = AWQW4A16Linear(k, n, bias=False, group_size=64, torch_dtype=torch.bfloat16, device="cpu")
+    module.qweight.data = packed.clone()
+    module.wscales.data = (torch.rand(k // 64, n, generator=g) * 0.02 + 0.001).bfloat16()
+    module.wzeros.data = (-7 * module.wscales.data.float()).bfloat16()
+    module = module.to("mps")
+    dense = mps_ops.dequantize_awq_g64_int32(packed, module.wscales.cpu(), module.wzeros.cpu())
+    x = torch.randn(2, k, generator=g)
+    out = module(x.bfloat16().to("mps"))
+    assert module.qweight.numel() == 0 and module._nunchaku_lite_qweight_released
+    assert torch.equal(module.state_dict()["qweight"].cpu(), packed)
+
+    module.to("cpu")  # offload round trip keeps the cache and the exact codes
+    assert torch.equal(module.state_dict()["qweight"].cpu(), packed)
+    module.to("mps")
+    torch.testing.assert_close(module(x.bfloat16().to("mps")), out)
+
+    half = module(x.half().to("mps"))  # new activation dtype: cache rebuilt from the decoded codes
+    assert _rel(half, x.double() @ dense.double().t()) < 1e-2
+    assert module.qweight.numel() == 0
+
+    fresh = {"qweight": packed, "wscales": module.wscales.cpu(), "wzeros": module.wzeros.cpu()}
+    module.load_state_dict(fresh)
+    assert not module._nunchaku_lite_qweight_released and torch.equal(module.qweight.cpu(), packed)
+    torch.testing.assert_close(module(x.bfloat16().to("mps")), out)
+
+
+@requires_mps
 def test_svdq_cache_follows_device_moves_and_stays_out_of_state_dict(monkeypatch):
     w = _logical(seed=9)
     module = _module(w, "mps", backend="dense")
