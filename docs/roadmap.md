@@ -83,8 +83,8 @@ kernels for M5-class Neural Accelerators, plus a portable W4A16 fallback.
 - [x] Fused per-token int8 activation quantization kernel.
 - [x] PyTorch MPS ops in `nunchaku-lite-kernels` (`svdq_quantize_act_int8`,
   `svdq_gemm_w8a8`, `svdq_gemm_w4a8`), built locally on macOS via `setup.py`.
-- [ ] Hub (kernel-builder) Metal build: add a `cpp-metal` kernel section to
-  `build.toml` and verify with Nix on a Mac.
+- [x] Hub (kernel-builder) Metal build: `cpp-metal` kernel section in
+  `build.toml`, built with Nix on a Mac and published in the `v2` branch.
 - [x] Wire the MPS ops into `nunchaku_lite`: SVDQ / AWQ modules and the fused
   GELU-MLP and QKV-norm-RoPE ops dispatch to `nunchaku_lite.ops.mps` on MPS
   tensors (verified end to end with FLUX.2 Klein 4B).

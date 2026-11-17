@@ -113,7 +113,7 @@ the two-step warmup went from 87 s to 23 s.
 ### 3. Distribution
 
 6. **Hub build for Metal.** `build.toml` now declares the `metal` backend and a
-   `cpp-metal` kernel (version 3), and kernel-builder builds all six Metal variants
+   `cpp-metal` kernel, and kernel-builder builds all six Metal variants
    (`torch210`-`torch215-metal-aarch64-darwin`). Each passes kernel-builder's checks
    (macOS 15 ABI, loading with `get_kernel`), and the `torch213` and `torch215`
    builds pass `nunchaku-lite-kernels/tests/test_metal_kernels.py` (plus
@@ -127,9 +127,10 @@ the two-step warmup went from 87 s to 23 s.
      the `huggingface.cachix.org` cache in `/etc/nix/nix.custom.conf`, and Xcode's
      Metal toolchain component (`xcodebuild -downloadComponent MetalToolchain`);
      without it the configure step fails silently.
-   Remaining: rebuild and test the CUDA variants on a GPU, publish as `v3` (leaves
-   `v2` untouched for released versions), and set `HF_KERNEL_VERSION = 3` in
-   `src/nunchaku_lite/ops/backend.py` in the same release.
+   The Metal variants are published in the existing `v2` branch next to the CUDA
+   variants. Adding ops on a new backend is backward compatible, so the kernel
+   version stays 2 and `HF_KERNEL_VERSION` is unchanged; the CUDA variants were
+   not rebuilt (their kernels did not change).
 7. **Release the torch/mlx extras split.** `nunchaku_lite.mlx` now lives in the
    main package. A bare `pip install nunchaku-lite` no longer installs torch;
    CUDA users need `nunchaku-lite[torch]`. Call this out in the release notes.
