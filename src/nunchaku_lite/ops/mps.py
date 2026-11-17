@@ -35,14 +35,14 @@ stored per layer as ``SVDQW4A4Linear.backend``):
 ``dense``
     Dequantized fallback (exact W4A16 math); any Apple GPU.
 
-Two kernels are compiled at runtime with ``torch.mps.compile_shader`` instead (no ``nunchaku_lite_kernels``
-build needed):
+Two attention kernels come from the same ``nunchaku_lite_kernels`` build. When the installed build predates them,
+they are compiled at runtime with ``torch.mps.compile_shader`` from the same sources:
 
 * q/k RMSNorm + RoPE (:func:`qk_norm_rope_mps` for Diffusers' FLUX.2 processors, and in place on the dense qkv in
-  :func:`qkv_norm_rotary_mps` for the Nunchaku processors). Its body is shared with the MLX runtime
-  (:data:`nunchaku_lite.shaders.QK_NORM_ROPE`).
+  :func:`qkv_norm_rotary_mps` for the Nunchaku processors); op ``qk_norm_rope_mps_``. Its body is shared with the
+  MLX runtime (:data:`nunchaku_lite.shaders.QK_NORM_ROPE`).
 * :func:`attention_mps`: MLX's Neural Accelerator flash attention (vendored in :mod:`._mlx_steel_attention`),
-  about 3.7x faster than PyTorch's MPS attention on M5-class GPUs, with lower error.
+  about 3.7x faster than PyTorch's MPS attention on M5-class GPUs, with lower error; op ``attention_mps``.
 """
 
 from __future__ import annotations
@@ -56,6 +56,8 @@ import weakref
 
 import torch
 import torch.nn.functional as F
+
+from ..shaders import ATTENTION_HEAD_DIMS, ATTENTION_TILE
 
 GELU_SHIFT = 0.171875
 """Shift Nunchaku INT4 applies to post-GELU activations of ``act_unsigned`` projections."""
@@ -698,30 +700,44 @@ def awq_linear_mps(module, x: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Runtime-compiled kernels (torch.mps.compile_shader): FLUX.2 q/k norm + RoPE
+# Attention kernels: from nunchaku_lite_kernels, or compiled at runtime when the installed build predates them
 # ---------------------------------------------------------------------------
 
-# The kernel body is shared with the MLX runtime (:data:`nunchaku_lite.shaders.QK_NORM_ROPE`).
+
+@functools.cache
+def _lite_op(name: str):
+    """The ``nunchaku_lite_kernels`` op ``name``, or ``None`` when no build loads or the build predates it."""
+
+    try:
+        return getattr(_kernel_ops(), name, None)
+    except Exception:  # noqa: BLE001 - any load failure: fall back to the runtime-compiled kernel
+        return None
+
+
+def _can_compile_shaders() -> bool:
+    return torch.backends.mps.is_available() and hasattr(torch.mps, "compile_shader")
+
+
+# FLUX.2 q/k norm + RoPE. The kernel body is shared with the MLX runtime (:data:`nunchaku_lite.shaders.QK_NORM_ROPE`).
 _QK_TYPES = {torch.float16: "half", torch.bfloat16: "bfloat", torch.float32: "float"}
-_QK_FLOAT_INPUTS = frozenset({"wqt", "wkt", "wqi", "wki", "cosb", "sinb", "epsb"})
 
 
 @functools.cache
 def _qk_norm_rope_library():
-    from ..shaders import QK_NORM_ROPE, QK_NORM_ROPE_INPUTS, QK_NORM_ROPE_OUTPUTS, mps_library_source
+    from ..shaders import qk_norm_rope_library_source
 
-    inputs = {n: "float" if n in _QK_FLOAT_INPUTS else "int" if n == "dims" else "T" for n in QK_NORM_ROPE_INPUTS}
-    types = {t: t for t in _QK_TYPES.values()}
-    return torch.mps.compile_shader(
-        mps_library_source("qk_norm_rope", QK_NORM_ROPE, inputs, QK_NORM_ROPE_OUTPUTS, types)
-    )
+    return torch.mps.compile_shader(qk_norm_rope_library_source())
 
 
 @functools.cache
 def qk_norm_rope_mps_available() -> bool:
-    """Whether the runtime-compiled q/k norm + RoPE kernel builds on this machine."""
+    """Whether the q/k norm + RoPE kernel runs here (from ``nunchaku_lite_kernels``, or compiled at runtime)."""
 
-    if not (torch.backends.mps.is_available() and hasattr(torch.mps, "compile_shader")):
+    if not torch.backends.mps.is_available():
+        return False
+    if _lite_op("qk_norm_rope_mps_") is not None:
+        return True
+    if not _can_compile_shaders():
         return False
     try:
         _qk_norm_rope_library()
@@ -783,6 +799,13 @@ def _launch_qk_norm_rope(
 ) -> None:
     """Run the shared kernel. Sources and outputs are 2-D row views (outputs may alias sources)."""
 
+    op = _lite_op("qk_norm_rope_mps_")
+    if op is not None:
+        op(
+            *image, *(text if text is not None else (None, None, None)), weights[2], weights[3], weights[0],
+            weights[1], cos, sin, *outputs, float(eps[0]), float(eps[1]), heads, rot_rows, cs_pair, *out_strides,
+        )  # fmt: skip
+        return
     device = image[0].device
     txt = text if text is not None else image
     lt = text[0].shape[0] if text is not None else 0
@@ -851,20 +874,17 @@ def qk_norm_rope_mps(
     return out
 
 
-# ---------------------------------------------------------------------------
-# Runtime-compiled kernels: flash attention on the Neural Accelerators (MLX's steel NAX kernel)
-# ---------------------------------------------------------------------------
-
-_ATTN_BQ, _ATTN_BK, _ATTN_WM = 64, 32, 4  # MLX's NAX tile for head dims 64-128 (query block, key block, simdgroups)
-_ATTN_HEAD_DIMS = (64, 96, 128)
+# Flash attention on the Neural Accelerators (MLX's steel NAX kernel)
 _ATTN_TYPES = {torch.float16: "half", torch.bfloat16: "bfloat"}
 
 
 @functools.cache
 def _attention_library(align_q: bool, align_k: bool, has_mask: bool):
     """Compile the kernel for one (query alignment, key alignment, mask) combination. MLX selects these features
-    with Metal function constants, which ``compile_shader`` cannot set, so they become compile-time constants."""
+    with Metal function constants, which ``compile_shader`` cannot set, so they become compile-time constants
+    (the ``nunchaku_lite_kernels`` build specializes the function constants instead)."""
 
+    from ..shaders import attention_instantiations
     from ._mlx_steel_attention import SOURCE
 
     consts = {
@@ -885,21 +905,19 @@ def _attention_library(align_q: bool, align_k: bool, has_mask: bool):
         if n != 1:
             raise RuntimeError(f"Vendored MLX attention source has no function constant {name!r}.")
     source = re.sub(r", function_constant\(\w+\)\]\]", "]]", source)
-    for t in _ATTN_TYPES.values():
-        for d in _ATTN_HEAD_DIMS:
-            for mask_name, mask_type in (("add", t), ("bool", "bool")):
-                source += (
-                    f'instantiate_kernel("attention_{t}_{d}_{mask_name}", attention_nax, {t}, {_ATTN_BQ}, '
-                    f"{_ATTN_BK}, {d}, {d}, {_ATTN_WM}, 1, {mask_type}, float)\n"
-                )
-    return torch.mps.compile_shader(source)
+    return torch.mps.compile_shader(source + attention_instantiations())
 
 
 @functools.cache
 def attention_mps_available() -> bool:
-    """Whether :func:`attention_mps` can run: an M5-class GPU and a PyTorch with ``torch.mps.compile_shader``."""
+    """Whether :func:`attention_mps` can run: an M5-class GPU, and the ``nunchaku_lite_kernels`` op or a PyTorch
+    with ``torch.mps.compile_shader``."""
 
-    if not (torch.backends.mps.is_available() and hasattr(torch.mps, "compile_shader") and has_neural_accelerators()):
+    if not (torch.backends.mps.is_available() and has_neural_accelerators()):
+        return False
+    if _lite_op("attention_mps") is not None:
+        return True
+    if not _can_compile_shaders():
         return False
     try:
         _attention_library(True, True, False)
@@ -932,7 +950,7 @@ def attention_mps_supported(
         and query.dtype in _ATTN_TYPES
         and query.dtype == key.dtype == value.dtype
         and query.ndim == key.ndim == value.ndim == 4
-        and query.shape[-1] in _ATTN_HEAD_DIMS
+        and query.shape[-1] in ATTENTION_HEAD_DIMS
         and key.shape[-1] == value.shape[-1] == query.shape[-1]
         and key.shape[:3] == value.shape[:3]
         and query.shape[0] == key.shape[0]
@@ -966,8 +984,16 @@ def attention_mps(
     batch, q_len, heads, dim = query.shape
     k_len, kv_heads = key.shape[1], key.shape[2]
     scale = dim**-0.5 if scale is None else float(scale)
+    mask = None
+    if attn_mask is not None:
+        mask = _mask_4d(attn_mask, query, k_len)
+        if mask.dtype != torch.bool and mask.dtype != query.dtype:
+            mask = mask.to(query.dtype)
+    op = _lite_op("attention_mps")
+    if op is not None:
+        return op(query, key, value, mask, scale)
     out = torch.empty_like(query, memory_format=torch.contiguous_format)
-    bq, bk = _ATTN_BQ, _ATTN_BK
+    bq, bk, wm = ATTENTION_TILE
     nq, nk, nq_full, nk_full = -(-q_len // bq), -(-k_len // bk), q_len // bq, k_len // bk
 
     def strides(t):  # (B, L, H, D) -> the kernel's (B, H, L) strides
@@ -982,20 +1008,15 @@ def attention_mps(
     device = query.device
     params = torch.frombuffer(bytearray(params), dtype=torch.uint8).to(device)
     unused = torch.empty(16, dtype=torch.uint8, device=device)  # sinks / lse slots (disabled)
-    mask_kind = "add"
-    if attn_mask is None:
+    mask_kind = "bool" if mask is not None and mask.dtype == torch.bool else "add"
+    if mask is None:
         mask, mask_params = unused, unused
     else:
-        mask = _mask_4d(attn_mask, query, k_len)
-        if mask.dtype == torch.bool:
-            mask_kind = "bool"
-        elif mask.dtype != query.dtype:
-            mask = mask.to(query.dtype)
         mask_params = torch.tensor(mask.stride()[:3], dtype=torch.int64).view(torch.uint8).to(device)
     library = _attention_library(q_len % bq == 0, k_len % bk == 0, attn_mask is not None)
     kernel = getattr(library, f"attention_{_ATTN_TYPES[query.dtype]}_{dim}_{mask_kind}")
     kernel(
         query, key, value, out, params, mask_params, mask, unused, unused,
-        threads=(nq * 32, heads * _ATTN_WM, batch), group_size=(32, _ATTN_WM, 1),
+        threads=(nq * 32, heads * wm, batch), group_size=(32, wm, 1),
     )  # fmt: skip
     return out

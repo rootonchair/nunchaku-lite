@@ -56,7 +56,7 @@ def _rel(out: torch.Tensor, ref: torch.Tensor) -> float:
 
 
 def test_ops_are_exported():
-    for name in ("svdq_quantize_act_int8", "svdq_gemm_w8a8", "svdq_gemm_w4a8"):
+    for name in ("svdq_quantize_act_int8", "svdq_gemm_w8a8", "svdq_gemm_w4a8", "qk_norm_rope_mps_", "attention_mps"):
         assert callable(getattr(nunchaku_lite_kernels, name))
         assert name in nunchaku_lite_kernels.__all__
 
@@ -78,7 +78,9 @@ def test_quantize_act_int8_matches_reference(dtype, shift):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("m,n,k,r", [(256, 256, 512, 32), (128, 384, 1024, 64), (64, 128, 192, 32)])
+@pytest.mark.parametrize(
+    "m,n,k,r", [(256, 256, 512, 32), (128, 384, 1024, 64), (64, 128, 192, 32), (128, 256, 8192, 32)]
+)
 @pytest.mark.parametrize("bias", [True, False])
 def test_gemm_w8a8_matches_reference(dtype, m, n, k, r, bias):
     t, ref = _case(m, n, k, r, dtype, bias=bias)
@@ -166,3 +168,134 @@ def test_qk_norm_rope_matches_reference(dtype, norms, rope):
     torch.testing.assert_close(
         out.view(batch, seq, 3, heads, d)[:, :, 2].cpu(), qkv.view(batch, seq, 3, heads, d)[:, :, 2]
     )
+
+
+def _norm_rope_ref(x, w, cos, sin, eps):
+    """(rows, heads, 128) float64: per-head RMSNorm, then interleaved RoPE with per-pair (rows, 64) tables."""
+    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w
+    x0, x1 = x[..., 0::2], x[..., 1::2]
+    out = torch.empty_like(x)
+    out[..., 0::2] = x0 * cos[:, None] - x1 * sin[:, None]
+    out[..., 1::2] = x0 * sin[:, None] + x1 * cos[:, None]
+    return out
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_qk_norm_rope_mps_joint_head_major(dtype):
+    """Text + image rows from column slices of fused projections, Diffusers' doubled tables, (L, H, 128) output."""
+    g = _gen(21)
+    lt, li, heads = 7, 33, 3
+    width = heads * 128
+    proj_t = torch.randn(lt, 3 * width, generator=g).to(dtype)
+    proj_i = torch.randn(li, 3 * width + 64, generator=g).to(dtype)  # padded rows: row stride != 3 * width
+    w = [torch.rand(128, generator=g) + 0.5 for _ in range(4)]  # wqt, wkt, wqi, wki
+    angles = torch.randn(lt + li, 64, generator=g).double()
+    cos = angles.cos().repeat_interleave(2, -1).float()
+    sin = angles.sin().repeat_interleave(2, -1).float()
+    mps_t, mps_i = proj_t.to("mps"), proj_i.to("mps")
+    outs = [torch.empty(lt + li, heads, 128, dtype=dtype, device="mps") for _ in range(3)]
+    ops.qk_norm_rope_mps_(
+        mps_i[:, :width], mps_i[:, width : 2 * width], mps_i[:, 2 * width : 3 * width],
+        mps_t[:, :width], mps_t[:, width : 2 * width], mps_t[:, 2 * width :],
+        w[2].to("mps"), w[3].to("mps"), w[0].to("mps"), w[1].to("mps"), cos.to("mps"), sin.to("mps"),
+        *outs, 1e-6, 1e-5, heads, lt + li, 2, 128, width,
+    )  # fmt: skip
+    src = torch.cat([proj_t[:, : 3 * width], proj_i[:, : 3 * width]]).double().view(lt + li, 3, heads, 128)
+    for part, (wt, wi, eps) in enumerate(((w[0], w[2], 1e-6), (w[1], w[3], 1e-5))):
+        ref = torch.cat(
+            [
+                _norm_rope_ref(src[:lt, part], wt.double(), angles[:lt].cos(), angles[:lt].sin(), eps),
+                _norm_rope_ref(src[lt:, part], wi.double(), angles[lt:].cos(), angles[lt:].sin(), eps),
+            ]
+        )
+        assert _rel(outs[part], ref) < 1e-2
+    torch.testing.assert_close(outs[2].cpu(), src[:, 2].to(dtype))
+
+
+def test_qk_norm_rope_mps_in_place_leaves_v():
+    """In place on one fused (rows, 3 * width) buffer with per-pair tables reused across a flattened batch."""
+    g = _gen(22)
+    batch, seq, heads = 2, 24, 2
+    width = heads * 128
+    qkv = torch.randn(batch * seq, 3 * width, generator=g).to(torch.bfloat16)
+    w = [torch.rand(128, generator=g) + 0.5 for _ in range(2)]
+    angles = torch.randn(seq, 64, generator=g).double()
+    buf = qkv.to("mps")
+    q, k, v = buf[:, :width], buf[:, width : 2 * width], buf[:, 2 * width :]
+    wq, wk = w[0].to("mps"), w[1].to("mps")
+    ops.qk_norm_rope_mps_(
+        q, k, v, None, None, None, wq, wk, wq, wk,
+        angles.cos().float().to("mps"), angles.sin().float().to("mps"),
+        q, k, v, 1e-6, 1e-6, heads, seq, 1, 128, 3 * width,
+    )  # fmt: skip
+    src = qkv.double().view(batch * seq, 3, heads, 128)
+    cos, sin = angles.cos().repeat(batch, 1), angles.sin().repeat(batch, 1)
+    for part in (0, 1):
+        ref = _norm_rope_ref(src[:, part], w[part].double(), cos, sin, 1e-6)
+        assert _rel(buf.view(batch * seq, 3, heads, 128)[:, part], ref) < 1e-2
+    torch.testing.assert_close(buf[:, 2 * width :].cpu(), qkv[:, 2 * width :])
+
+
+def _has_neural_accelerators() -> bool:
+    import subprocess
+
+    result = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], check=False, capture_output=True, text=True)
+    brand = result.stdout.split()
+    return len(brand) > 1 and brand[0] == "Apple" and brand[1][1:].isdigit() and int(brand[1][1:]) >= 5
+
+
+needs_nax = pytest.mark.skipif(not _has_neural_accelerators(), reason="requires an M5-class GPU")
+
+
+def _attention_ref(q, k, v, mask, scale):
+    q, k, v = (t.double().transpose(1, 2) for t in (q, k, v))  # (B, H, L, D)
+    k = k.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
+    v = v.repeat_interleave(q.shape[1] // v.shape[1], dim=1)
+    s = q @ k.transpose(-1, -2) * scale
+    if mask is not None:
+        s = s.masked_fill(~mask, float("-inf")) if mask.dtype == torch.bool else s + mask.double()
+    return (s.softmax(-1) @ v).transpose(1, 2)
+
+
+@needs_nax
+@pytest.mark.parametrize(
+    "batch,q_len,k_len,heads,kv_heads,dim,dtype",
+    [
+        (1, 256, 256, 4, 4, 128, torch.bfloat16),  # aligned
+        (2, 77, 133, 4, 2, 64, torch.float16),  # unaligned, grouped-query
+        (1, 100, 64, 2, 2, 96, torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize("mask_kind", [None, "bool", "add"])
+def test_attention_mps_matches_reference(batch, q_len, k_len, heads, kv_heads, dim, dtype, mask_kind):
+    g = _gen(31)
+    q = torch.randn(batch, q_len, heads, dim, generator=g).to(dtype)
+    k = torch.randn(batch, k_len, kv_heads, dim, generator=g).to(dtype)
+    v = torch.randn(batch, k_len, kv_heads, dim, generator=g).to(dtype)
+    mask = None
+    if mask_kind is not None:
+        keep = torch.rand(batch, 1, 1, k_len, generator=g) > 0.3
+        keep[..., 0] = True
+        mask = keep if mask_kind == "bool" else torch.zeros(keep.shape).masked_fill(~keep, -1e4).to(dtype)
+        mask = mask.expand(batch, heads, q_len, k_len)
+    scale = dim**-0.5
+    out = ops.attention_mps(q.to("mps"), k.to("mps"), v.to("mps"), None if mask is None else mask.to("mps"), scale)
+    assert out.shape == q.shape and out.dtype == dtype
+    assert _rel(out, _attention_ref(q, k, v, mask, scale)) < 2e-2
+
+
+@needs_nax
+def test_attention_mps_strided_views():
+    """q/k/v as head slices of one fused (B, L, 3 * H, D) projection, read in place."""
+    g = _gen(32)
+    qkv = torch.randn(1, 130, 3 * 4, 128, generator=g).to(torch.bfloat16)
+    m = qkv.to("mps")
+    out = ops.attention_mps(m[:, :, :4], m[:, :, 4:8], m[:, :, 8:], None, 128**-0.5)
+    ref = _attention_ref(qkv[:, :, :4], qkv[:, :, 4:8], qkv[:, :, 8:], None, 128**-0.5)
+    assert _rel(out, ref) < 2e-2
+
+
+def test_attention_mps_fake():
+    with FakeTensorMode():
+        q = torch.empty(1, 64, 4, 128, device="mps", dtype=torch.bfloat16)
+        assert ops.attention_mps(q, q, q, None, 0.1).shape == q.shape

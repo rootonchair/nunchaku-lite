@@ -149,8 +149,9 @@ The packed checkpoint `qweight` is released after conversion whenever the
 kernel copy reproduces it exactly (117 of 120 layers for `int8`, all layers for
 `int4`); `state_dict()` re-packs it and `load_state_dict()` restores it.
 On M5-class GPUs the patched transformer's attention also runs on the Neural Accelerators (MLX's flash
-attention kernel, compiled at runtime) instead of PyTorch's MPS attention, and FLUX.2's q/k norm + RoPE is
-one fused kernel; the dense BF16 row uses stock Diffusers.
+attention kernel) instead of PyTorch's MPS attention, and FLUX.2's q/k norm + RoPE is one fused kernel. Both
+come with the Hub kernels; with an older Hub build they are compiled at runtime instead. The dense BF16 row uses
+stock Diffusers.
 
 There is also an MLX runtime, `nunchaku_lite.mlx` (`pip install "nunchaku-lite[mlx]" mflux`),
 which loads the same checkpoints into [mflux](https://github.com/filipstrand/mflux)

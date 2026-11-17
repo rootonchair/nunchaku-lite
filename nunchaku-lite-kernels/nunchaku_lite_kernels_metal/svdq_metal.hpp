@@ -45,4 +45,43 @@ void svdq_qk_norm_rope_(at::Tensor &qkv,
                         int64_t heads,
                         int64_t seq_len);
 
+// Per-head RMSNorm of q and k + interleaved RoPE + layout change for 128-wide heads, in one pass (the kernel in
+// nunchaku_lite/shaders.py). Rows: the optional text rows qt/kt/vt, then the image rows qi/ki/vi; each group is
+// (rows, heads * 128) views sharing a row stride (column slices of one projection are fine). Weights: float32
+// (128,). cos/sin: float32 tables, row r uses table row r % rot_rows; cs_pair = 1 (one value per pair) or 2
+// (Diffusers' tables). Element (row, head, c) is written at row * os_l + head * os_h + c of each output; outputs
+// may alias the inputs (in place). When v_out is vi itself, v is left untouched.
+void qk_norm_rope_mps_(const at::Tensor &qi,
+                       const at::Tensor &ki,
+                       const at::Tensor &vi,
+                       const std::optional<at::Tensor> &qt,
+                       const std::optional<at::Tensor> &kt,
+                       const std::optional<at::Tensor> &vt,
+                       const at::Tensor &wqi,
+                       const at::Tensor &wki,
+                       const at::Tensor &wqt,
+                       const at::Tensor &wkt,
+                       const at::Tensor &cos,
+                       const at::Tensor &sin,
+                       at::Tensor &q_out,
+                       at::Tensor &k_out,
+                       at::Tensor &v_out,
+                       double eps_q,
+                       double eps_k,
+                       int64_t heads,
+                       int64_t rot_rows,
+                       int64_t cs_pair,
+                       int64_t os_h,
+                       int64_t os_l);
+
+// Softmax attention on the Neural Accelerators (MLX's flash attention, M5-class GPUs). q: (B, Lq, H, D), k / v:
+// (B, Lk, Hkv, D) with any strides and a contiguous head dim; D in {64, 96, 128}; H % Hkv == 0. mask: optional
+// (B, H, Lq, Lk) view with a contiguous last dim, bool (true = attend) or additive in q's dtype.
+// Returns (B, Lq, H, D).
+at::Tensor attention_mps(const at::Tensor &q,
+                         const at::Tensor &k,
+                         const at::Tensor &v,
+                         const std::optional<at::Tensor> &mask,
+                         double scale);
+
 }  // namespace nunchaku_lite::metal

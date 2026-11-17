@@ -297,7 +297,7 @@ template [[host_name("svdq_gemm_w8a8_half_128_64_4_64_8")]] [[kernel]] void svdq
     uint thread_index_in_threadgroup [[thread_index_in_threadgroup]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]);
 
-template [[host_name("svdq_gemm_w8a8_half_128_128_8_64_1")]] [[kernel]] void svdq_gemm_w8a8<half, 128, 128, 8, 64, 1>(
+template [[host_name("svdq_gemm_w8a8_half_128_128_8_32_2")]] [[kernel]] void svdq_gemm_w8a8<half, 128, 128, 8, 32, 2>(
     const device int8_t* a [[buffer(0)]],
     const device int8_t* b [[buffer(1)]],
     const device float* ascale [[buffer(2)]],
@@ -336,7 +336,7 @@ template [[host_name("svdq_gemm_w8a8_bfloat_128_64_4_64_8")]] [[kernel]] void sv
     uint thread_index_in_threadgroup [[thread_index_in_threadgroup]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]);
 
-template [[host_name("svdq_gemm_w8a8_bfloat_128_128_8_64_1")]] [[kernel]] void svdq_gemm_w8a8<bfloat, 128, 128, 8, 64, 1>(
+template [[host_name("svdq_gemm_w8a8_bfloat_128_128_8_32_2")]] [[kernel]] void svdq_gemm_w8a8<bfloat, 128, 128, 8, 32, 2>(
     const device int8_t* a [[buffer(0)]],
     const device int8_t* b [[buffer(1)]],
     const device float* ascale [[buffer(2)]],

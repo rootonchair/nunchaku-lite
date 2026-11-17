@@ -5,6 +5,7 @@ The PyTorch MPS attention kernel is MLX's Neural Accelerator ("NAX") flash atten
 into a single Metal source and writes it, with MLX's MIT license notice, as a Python module.
 
     python tools/vendor_mlx_attention.py            # needs `pip install mlx`
+    python tools/sync_hub_shaders.py                # then refresh the Hub build's copy
 """
 
 from __future__ import annotations
@@ -56,7 +57,7 @@ def main() -> None:
         f'MLX_VERSION = "{dist.version}"\n\n'
         f'SOURCE = r"""{source}"""\n'
     )
-    print(f"wrote {OUT} ({len(source.splitlines())} lines, MLX {dist.version})")
+    print(f"wrote {OUT} ({len(source.splitlines())} lines, MLX {dist.version}); now run tools/sync_hub_shaders.py")
 
 
 if __name__ == "__main__":

@@ -115,4 +115,5 @@ src = [
     "nunchaku_lite_kernels_metal/svdq_metal.hpp",
     "nunchaku_lite_kernels_metal/svdq_shaders.hpp",
     "nunchaku_lite_kernels_metal/qk_norm_rope_shaders.hpp",
+    "nunchaku_lite_kernels_metal/lite_shaders.hpp",
 ]

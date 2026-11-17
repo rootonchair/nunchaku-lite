@@ -2,17 +2,34 @@
 
 This module imports neither framework, so ``nunchaku_lite.mlx`` stays torch-free and ``nunchaku_lite.ops.mps``
 stays mlx-free. Each source is a kernel *body*. MLX wraps it with ``mx.fast.metal_kernel`` (which generates the
-signature from input and output names); PyTorch compiles :func:`mps_library_source` with
-``torch.mps.compile_shader``. Both see the same buffer names, the same ``T`` element type and the same
-thread-position names.
+signature from input and output names). For PyTorch, :func:`mps_library_source` builds a full Metal library: the
+``nunchaku_lite_kernels`` Hub build compiles it (written into its sources by ``tools/sync_hub_shaders.py``), and
+``nunchaku_lite.ops.mps`` compiles it with ``torch.mps.compile_shader`` when the installed Hub build predates the
+kernel. All of them see the same buffer names, the same ``T`` element type and the same thread-position names.
+
+The attention kernel (MLX's Neural Accelerator flash attention, vendored in ``nunchaku_lite.ops._mlx_steel_attention``)
+is instantiated from :func:`attention_instantiations` by both PyTorch paths.
 """
 
 from __future__ import annotations
 
-__all__ = ["QK_NORM_ROPE", "QK_NORM_ROPE_INPUTS", "QK_NORM_ROPE_OUTPUTS", "mps_library_source"]
+__all__ = [
+    "ATTENTION_HEAD_DIMS",
+    "ATTENTION_TILE",
+    "ATTENTION_TYPES",
+    "QK_NORM_ROPE",
+    "QK_NORM_ROPE_INPUTS",
+    "QK_NORM_ROPE_OUTPUTS",
+    "QK_NORM_ROPE_TYPES",
+    "attention_instantiations",
+    "mps_library_source",
+    "qk_norm_rope_library_source",
+]
 
 QK_NORM_ROPE_INPUTS = ("qt", "kt", "vt", "qi", "ki", "vi", "wqt", "wkt", "wqi", "wki", "cosb", "sinb", "epsb", "dims")
 QK_NORM_ROPE_OUTPUTS = ("q_out", "k_out", "v_out")
+QK_NORM_ROPE_TYPES = ("half", "bfloat", "float")
+_QK_NORM_ROPE_FLOAT_INPUTS = frozenset({"wqt", "wkt", "wqi", "wki", "cosb", "sinb", "epsb"})
 
 QK_NORM_ROPE = r"""
     // Attention prologue for 128-wide heads: per-head RMSNorm of q and k, interleaved-pair RoPE (pair i is
@@ -70,8 +87,9 @@ def mps_library_source(
     inputs: dict[str, str],
     outputs: tuple[str, ...],
     types: dict[str, str],
+    constant_inputs: frozenset[str] = frozenset(),
 ) -> str:
-    """A ``torch.mps.compile_shader`` library: ``body`` as kernel ``{name}_{type}`` for each Metal type in ``types``.
+    """A Metal library with ``body`` as kernel ``{name}_{type}`` for each Metal type in ``types``.
 
     Args:
         name: Kernel base name.
@@ -79,11 +97,15 @@ def mps_library_source(
         inputs: Input buffer name -> element type (``"T"`` for the templated type).
         outputs: Output buffer names (element type ``T``).
         types: Host name suffix -> Metal type, e.g. ``{"bfloat16": "bfloat"}``.
+        constant_inputs: Inputs in the ``constant`` address space (small arguments the host sets with ``setBytes``).
 
     Buffers are bound in order: inputs, then outputs.
     """
 
-    params = [f"const device {t}* {n} [[buffer({i})]]" for i, (n, t) in enumerate(inputs.items())]
+    params = [
+        f"{'constant' if n in constant_inputs else 'const device'} {t}* {n} [[buffer({i})]]"
+        for i, (n, t) in enumerate(inputs.items())
+    ]
     params += [f"device T* {n} [[buffer({len(inputs) + i})]]" for i, n in enumerate(outputs)]
     signature = ",\n    ".join([*params, *_THREAD_ARGS])
     source = (
@@ -96,3 +118,40 @@ def mps_library_source(
             f"{name}<{metal_type}>;\n"
         )
     return source
+
+
+def qk_norm_rope_library_source(constant_args: bool = False) -> str:
+    """The q/k norm + RoPE library: kernels ``qk_norm_rope_{half,bfloat,float}``.
+
+    ``constant_args`` puts ``epsb`` and ``dims`` in the ``constant`` address space (the Hub build sets them with
+    ``setBytes``); ``torch.mps.compile_shader`` binds every argument as a tensor, so it uses ``False``.
+    """
+
+    inputs = {
+        n: "float" if n in _QK_NORM_ROPE_FLOAT_INPUTS else "int" if n == "dims" else "T" for n in QK_NORM_ROPE_INPUTS
+    }
+    types = {t: t for t in QK_NORM_ROPE_TYPES}
+    constants = frozenset({"epsb", "dims"}) if constant_args else frozenset()
+    return mps_library_source("qk_norm_rope", QK_NORM_ROPE, inputs, QK_NORM_ROPE_OUTPUTS, types, constants)
+
+
+ATTENTION_TILE = (64, 32, 4)
+"""MLX's Neural Accelerator attention tile for head dims 64-128: (query block, key block, simdgroups)."""
+ATTENTION_HEAD_DIMS = (64, 96, 128)
+ATTENTION_TYPES = ("half", "bfloat")
+
+
+def attention_instantiations() -> str:
+    """``instantiate_kernel`` lines appended to the vendored MLX source: ``attention_{type}_{head_dim}_{add|bool}``
+    (additive mask in the element type, or a bool mask)."""
+
+    bq, bk, wm = ATTENTION_TILE
+    lines = []
+    for t in ATTENTION_TYPES:
+        for d in ATTENTION_HEAD_DIMS:
+            for mask_name, mask_type in (("add", t), ("bool", "bool")):
+                lines.append(
+                    f'instantiate_kernel("attention_{t}_{d}_{mask_name}", attention_nax, {t}, {bq}, {bk}, {d}, {d}, '
+                    f"{wm}, 1, {mask_type}, float)"
+                )
+    return "\n".join(lines) + "\n"

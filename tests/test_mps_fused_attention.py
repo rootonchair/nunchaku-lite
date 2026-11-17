@@ -1,4 +1,7 @@
-"""Fused FLUX.2 q/k norm + RoPE on MPS: kernel numerics and the Diffusers processor swap."""
+"""Fused FLUX.2 q/k norm + RoPE and Neural Accelerator attention on MPS: kernel numerics and the processor swap.
+
+MPS tests run twice: with the ``nunchaku_lite_kernels`` ops ("hub") and with the runtime-compiled fallback.
+"""
 
 import pytest
 import torch
@@ -20,6 +23,19 @@ from nunchaku_lite.ops.mps import (
 
 needs_mps = pytest.mark.skipif(not qk_norm_rope_mps_available(), reason="requires MPS with torch.mps.compile_shader")
 DIM, HEADS = 256, 2
+
+
+@pytest.fixture(autouse=True, params=["hub", "runtime"])
+def kernel_source(request, monkeypatch):
+    """Run against the nunchaku_lite_kernels ops, then against the runtime-compiled kernels."""
+
+    from nunchaku_lite.ops import mps as mps_ops
+
+    if request.param == "runtime":
+        monkeypatch.setattr(mps_ops, "_lite_op", lambda name: None)
+    elif not torch.backends.mps.is_available() or mps_ops._lite_op("attention_mps") is None:
+        pytest.skip("the installed nunchaku_lite_kernels build has no attention ops")
+    return request.param
 
 
 def _tables(n, device):
@@ -220,6 +236,17 @@ def test_qkv_norm_rotary_in_place_matches_fallback(monkeypatch):
     monkeypatch.setattr(mps_ops, "qk_norm_rope_mps_available", lambda: False)
     ref = mps_ops.qkv_norm_rotary_mps(x, None, wq, wk, packed, eps_q=1e-6, eps_k=1e-5)
     torch.testing.assert_close(fused.float(), ref.float(), rtol=0, atol=2e-2 * ref.float().abs().max().item())
+
+
+def test_hub_shader_header_in_sync():
+    """nunchaku-lite-kernels compiles a generated copy of the shared kernels; regenerate it after changing them."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    tool = Path(__file__).resolve().parents[1] / "tools/sync_hub_shaders.py"
+    result = subprocess.run([sys.executable, str(tool), "--check"], check=False)
+    assert result.returncode == 0, "run: python tools/sync_hub_shaders.py"
 
 
 def test_shared_shader_sources_import_no_framework():

@@ -4,15 +4,19 @@
 #import <Metal/Metal.h>
 
 #include <array>
+#include <cmath>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include <ATen/mps/MPSDevice.h>
 #include <ATen/mps/MPSStream.h>
 #include <c10/util/Exception.h>
 
 #include "svdq_metal.hpp"
+#include "lite_shaders.hpp"
 #include "qk_norm_rope_shaders.hpp"
 #include "svdq_shaders.hpp"
 
@@ -25,47 +29,87 @@ struct Tile {
     int bm, bn, sg, kc, swz;
 };
 
-id<MTLLibrary> library() {
-    static id<MTLLibrary> lib = nil;
-    static std::once_flag once;
-    std::call_once(once, [] {
-        id<MTLDevice> device = at::mps::MPSDevice::getInstance()->device();
-        MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
-        if (@available(macOS 26.0, *)) {
-            // MTLLanguageVersion4_0 ((4 << 16) + 0) as a raw value: the enum constant exists only in the
-            // macOS 26 SDK, and kernel-builder currently builds with Xcode 16 (macOS 15 SDK).
-            options.languageVersion = static_cast<MTLLanguageVersion>((4 << 16) + 0);
-        }
-        NSError *error = nil;
-        const std::string source = std::string(kSvdqMetalSource) + kQkNormRopeMetalSource;
-        lib = [device newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()]
-                                   options:options
-                                     error:&error];
-        [options release];
-        TORCH_CHECK(lib != nil,
-                    "nunchaku_lite_kernels: failed to compile SVDQ Metal kernels (requires macOS 26+ with Metal 4): ",
-                    error ? error.localizedDescription.UTF8String : "unknown error");
-    });
+enum class Lib { kSvdq, kQkNormRope, kAttention };
+
+// Each library compiles on first use, so the 120 KB attention source costs nothing until attention runs.
+id<MTLLibrary> library(Lib which) {
+    static std::mutex mutex;
+    static std::unordered_map<int, id<MTLLibrary>> libs;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = libs.find(int(which));
+    if (it != libs.end()) {
+        return it->second;
+    }
+    std::string source;
+    switch (which) {
+    case Lib::kSvdq:
+        source = std::string(kSvdqMetalSource) + kQkNormRopeMetalSource;
+        break;
+    case Lib::kQkNormRope:
+        source = kQkNormRopeLiteSource;
+        break;
+    case Lib::kAttention:
+        source = kAttentionNaxSource;
+        break;
+    }
+    id<MTLDevice> device = at::mps::MPSDevice::getInstance()->device();
+    MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+    if (@available(macOS 26.0, *)) {
+        // MTLLanguageVersion4_0 ((4 << 16) + 0) as a raw value: the enum constant exists only in the
+        // macOS 26 SDK, and kernel-builder currently builds with Xcode 16 (macOS 15 SDK).
+        options.languageVersion = static_cast<MTLLanguageVersion>((4 << 16) + 0);
+    }
+    NSError *error = nil;
+    id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()]
+                                              options:options
+                                                error:&error];
+    [options release];
+    TORCH_CHECK(lib != nil,
+                "nunchaku_lite_kernels: failed to compile Metal kernels (requires macOS 26+ with Metal 4): ",
+                error ? error.localizedDescription.UTF8String : "unknown error");
+    libs.emplace(int(which), lib);
     return lib;
 }
 
-id<MTLComputePipelineState> pipeline(const std::string &name) {
+// Bool Metal function constants (index, value) used to specialize a kernel.
+using BoolConstants = std::vector<std::pair<int, bool>>;
+
+id<MTLComputePipelineState> pipeline(const std::string &name, Lib which = Lib::kSvdq,
+                                     const BoolConstants &constants = {}) {
     static std::mutex mutex;
     static std::unordered_map<std::string, id<MTLComputePipelineState>> cache;
+    std::string key = std::to_string(int(which)) + ":" + name;
+    for (const auto &[index, value] : constants) {
+        key += "," + std::to_string(index) + "=" + (value ? "1" : "0");
+    }
+    id<MTLLibrary> lib = library(which);
     std::lock_guard<std::mutex> lock(mutex);
-    auto it = cache.find(name);
+    auto it = cache.find(key);
     if (it != cache.end()) {
         return it->second;
     }
-    id<MTLFunction> fn = [library() newFunctionWithName:[NSString stringWithUTF8String:name.c_str()]];
-    TORCH_CHECK(fn != nil, "nunchaku_lite_kernels: missing Metal kernel ", name);
+    NSString *fn_name = [NSString stringWithUTF8String:name.c_str()];
+    id<MTLFunction> fn = nil;
     NSError *error = nil;
+    if (constants.empty()) {
+        fn = [lib newFunctionWithName:fn_name];
+    } else {
+        MTLFunctionConstantValues *values = [[MTLFunctionConstantValues alloc] init];
+        for (const auto &[index, value] : constants) {
+            const bool v = value;
+            [values setConstantValue:&v type:MTLDataTypeBool atIndex:index];
+        }
+        fn = [lib newFunctionWithName:fn_name constantValues:values error:&error];
+        [values release];
+    }
+    TORCH_CHECK(fn != nil, "nunchaku_lite_kernels: missing Metal kernel ", name,
+                error ? std::string(": ") + error.localizedDescription.UTF8String : std::string());
     id<MTLComputePipelineState> pso =
         [at::mps::MPSDevice::getInstance()->device() newComputePipelineStateWithFunction:fn error:&error];
     [fn release];
     TORCH_CHECK(pso != nil, "nunchaku_lite_kernels: failed to build pipeline ", name, ": ",
                 error ? error.localizedDescription.UTF8String : "unknown error");
-    cache.emplace(name, pso);
+    cache.emplace(key, pso);
     return pso;
 }
 
@@ -93,13 +137,19 @@ void check_mps(const at::Tensor &t, const char *name) {
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
 }
 
+// An MPS tensor read through explicit strides: only the last dim must be contiguous.
+void check_mps_rows(const at::Tensor &t, const char *name) {
+    TORCH_CHECK(t.device().is_mps(), name, " must be an MPS tensor");
+    TORCH_CHECK(t.stride(-1) == 1, name, " must have a contiguous last dimension");
+}
+
 // Tuned on an M5 (AC power); mirrors nunchaku_lite_mlx.kernels.default_tile.
 Tile default_tile(bool w8, int64_t m, int64_t n, int64_t k) {
     if (m % kTileM) {
         return {64, 64, 4, 64, 4};
     }
     if (k >= 8192 && n % 128 == 0) {
-        return {kTileM, 128, 8, 64, w8 ? 1 : 4};
+        return w8 ? Tile{kTileM, 128, 8, 32, 2} : Tile{kTileM, 128, 8, 64, 4};
     }
     return {kTileM, 64, 4, 64, w8 ? 8 : 4};
 }
@@ -250,7 +300,7 @@ void svdq_qk_norm_rope_(at::Tensor &qkv,
     if (m == 0 || (!norm_q.has_value() && !norm_k.has_value() && !rope.has_value())) {
         return;
     }
-    id<MTLComputePipelineState> pso = pipeline(std::string("svdq_qk_norm_rope_") + type_name(dtype));
+    id<MTLComputePipelineState> pso = pipeline(std::string("svdq_qk_norm_rope_") + type_name(dtype), Lib::kSvdq);
     const std::array<int, 8> dims = {int(m), int(heads), int(seq_len), int(rope_batch), int(rope_seq),
                                      norm_q.has_value() ? 1 : 0, norm_k.has_value() ? 1 : 0, rope.has_value() ? 1 : 0};
     const std::array<float, 2> eps = {float(eps_q), float(eps_k)};
@@ -273,6 +323,217 @@ void svdq_qk_norm_rope_(at::Tensor &qkv,
                     threadsPerThreadgroup:MTLSizeMake(32 * kSimdgroups, 1, 1)];
         }
     });
+}
+
+void qk_norm_rope_mps_(const at::Tensor &qi,
+                       const at::Tensor &ki,
+                       const at::Tensor &vi,
+                       const std::optional<at::Tensor> &qt,
+                       const std::optional<at::Tensor> &kt,
+                       const std::optional<at::Tensor> &vt,
+                       const at::Tensor &wqi,
+                       const at::Tensor &wki,
+                       const at::Tensor &wqt,
+                       const at::Tensor &wkt,
+                       const at::Tensor &cos,
+                       const at::Tensor &sin,
+                       at::Tensor &q_out,
+                       at::Tensor &k_out,
+                       at::Tensor &v_out,
+                       double eps_q,
+                       double eps_k,
+                       int64_t heads,
+                       int64_t rot_rows,
+                       int64_t cs_pair,
+                       int64_t os_h,
+                       int64_t os_l) {
+    constexpr int64_t kHeadDim = 128;
+    const bool has_text = qt.has_value();
+    TORCH_CHECK(has_text == kt.has_value() && has_text == vt.has_value(), "pass all of qt, kt, vt or none");
+    const at::Tensor &qt_ = has_text ? *qt : qi, &kt_ = has_text ? *kt : ki, &vt_ = has_text ? *vt : vi;
+    const at::ScalarType dtype = qi.scalar_type();
+    TORCH_CHECK(dtype == at::kHalf || dtype == at::kBFloat16 || dtype == at::kFloat,
+                "q/k/v must be float16, bfloat16 or float32");
+    const int64_t width = heads * kHeadDim;
+    for (const at::Tensor *t : {&qi, &ki, &vi, &qt_, &kt_, &vt_}) {
+        check_mps_rows(*t, "q/k/v");
+        TORCH_CHECK(t->dim() == 2 && t->size(1) == width && t->scalar_type() == dtype,
+                    "q/k/v must be (rows, heads * 128) views of one dtype");
+    }
+    TORCH_CHECK(qi.stride(0) == ki.stride(0) && qi.stride(0) == vi.stride(0) && qi.size(0) == ki.size(0) &&
+                    qi.size(0) == vi.size(0),
+                "image q/k/v must share rows and row stride");
+    TORCH_CHECK(qt_.stride(0) == kt_.stride(0) && qt_.stride(0) == vt_.stride(0) && qt_.size(0) == kt_.size(0) &&
+                    qt_.size(0) == vt_.size(0),
+                "text q/k/v must share rows and row stride");
+    for (const at::Tensor *w : {&wqi, &wki, &wqt, &wkt}) {
+        check_mps(*w, "norm weight");
+        TORCH_CHECK(w->scalar_type() == at::kFloat && w->numel() == kHeadDim, "norm weights must be float32 (128,)");
+    }
+    for (const at::Tensor *t : {&cos, &sin}) {
+        check_mps_rows(*t, "cos/sin");
+        TORCH_CHECK(t->scalar_type() == at::kFloat && t->dim() == 2, "cos/sin must be 2-D float32 tables");
+    }
+    TORCH_CHECK(cos.strides() == sin.strides(), "cos and sin must share strides");
+    TORCH_CHECK(cs_pair == 1 || cs_pair == 2, "cs_pair must be 1 or 2");
+    TORCH_CHECK(cos.size(1) >= 64 * cs_pair, "rotary tables are too narrow");
+    const int64_t lt = has_text ? qt_.size(0) : 0;
+    const int64_t total = lt + qi.size(0);
+    TORCH_CHECK(rot_rows > 0 && cos.size(0) >= std::min(rot_rows, total), "rotary tables have too few rows");
+    const int64_t span = (total - 1) * os_l + (heads - 1) * os_h + kHeadDim;
+    for (const at::Tensor *o : {&q_out, &k_out, &v_out}) {
+        TORCH_CHECK(o->device().is_mps() && o->scalar_type() == dtype, "outputs must be MPS tensors in the input dtype");
+        TORCH_CHECK(o->storage().nbytes() >= size_t(o->storage_offset() + span) * o->element_size(),
+                    "outputs are too small for the given strides");
+    }
+    if (total == 0) {
+        return;
+    }
+    const bool copy_v = v_out.data_ptr() != vi.data_ptr();
+    const std::array<int, 12> dims = {int(lt), int(qt_.stride(0)), int(qi.stride(0)), 0, 0, 0,
+                                      int(rot_rows), int(cos.stride(0)), int(cs_pair), int(os_h), int(os_l),
+                                      copy_v ? 1 : 0};
+    const std::array<float, 2> eps = {float(eps_q), float(eps_k)};
+    int group = 1;
+    for (int g : {8, 4, 2}) {
+        if (heads % g == 0) {
+            group = g;
+            break;
+        }
+    }
+    id<MTLComputePipelineState> pso = pipeline(std::string("qk_norm_rope_") + type_name(dtype), Lib::kQkNormRope);
+    at::mps::MPSStream *stream = at::mps::getCurrentMPSStream();
+    dispatch_sync(stream->queue(), ^() {
+        @autoreleasepool {
+            id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
+            [encoder setComputePipelineState:pso];
+            int index = 0;
+            for (const at::Tensor *t : {&qt_, &kt_, &vt_, &qi, &ki, &vi, &wqt, &wkt, &wqi, &wki, &cos, &sin}) {
+                set_tensor(encoder, *t, index++);
+            }
+            [encoder setBytes:eps.data() length:sizeof(float) * eps.size() atIndex:index++];
+            [encoder setBytes:dims.data() length:sizeof(int) * dims.size() atIndex:index++];
+            set_tensor(encoder, q_out, index++);
+            set_tensor(encoder, k_out, index++);
+            set_tensor(encoder, v_out, index++);
+            [encoder dispatchThreadgroups:MTLSizeMake(heads / group, total, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32 * group, 1, 1)];
+        }
+    });
+}
+
+namespace {
+
+// Mirrors steel::AttnParams / steel::AttnMaskParams in the MLX source.
+struct AttnParams {
+    int B, H, D, qL, kL, gqa_factor;
+    float scale;
+    int NQ, NK, NQ_aligned, NK_aligned, qL_rem, kL_rem, qL_off;
+    int64_t Q_strides[3], K_strides[3], V_strides[3], O_strides[3];
+};
+struct AttnMaskParams {
+    int64_t M_strides[3];
+};
+static_assert(sizeof(AttnParams) == 14 * 4 + 12 * 8, "AttnParams layout must match the Metal struct");
+
+// MLX's tile for head dims 64-128 (nunchaku_lite.shaders.ATTENTION_TILE) and its function constant indices.
+constexpr int kAttnBQ = 64, kAttnBK = 32, kAttnWM = 4;
+constexpr int kAlignQ = 200, kAlignK = 201, kHasMask = 300, kDoCausal = 301, kHasSinks = 302, kSaveLse = 303;
+
+void fill_strides(int64_t *dst, const at::Tensor &t) {  // (B, L, H, D) -> the kernel's (B, H, L)
+    dst[0] = t.stride(0);
+    dst[1] = t.stride(2);
+    dst[2] = t.stride(1);
+}
+
+}  // namespace
+
+at::Tensor attention_mps(const at::Tensor &q,
+                         const at::Tensor &k,
+                         const at::Tensor &v,
+                         const std::optional<at::Tensor> &mask,
+                         double scale) {
+    check_mps_rows(q, "q");
+    check_mps_rows(k, "k");
+    check_mps_rows(v, "v");
+    const at::ScalarType dtype = q.scalar_type();
+    TORCH_CHECK(dtype == at::kHalf || dtype == at::kBFloat16, "q must be float16 or bfloat16");
+    TORCH_CHECK(k.scalar_type() == dtype && v.scalar_type() == dtype, "q, k and v must share a dtype");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q, k and v must be (B, L, H, D)");
+    const int64_t batch = q.size(0), q_len = q.size(1), heads = q.size(2), dim = q.size(3);
+    const int64_t k_len = k.size(1), kv_heads = k.size(2);
+    TORCH_CHECK(dim == 64 || dim == 96 || dim == 128, "head dim must be 64, 96 or 128, got ", dim);
+    TORCH_CHECK(k.size(0) == batch && v.sizes() == k.sizes() && k.size(3) == dim, "k and v must be (B, Lk, Hkv, D)");
+    TORCH_CHECK(kv_heads > 0 && heads % kv_heads == 0, "query heads must be a multiple of key/value heads");
+    const char *mask_kind = "add";
+    if (mask.has_value()) {
+        check_mps_rows(*mask, "mask");
+        TORCH_CHECK(mask->dim() == 4 && mask->size(0) == batch && mask->size(1) == heads && mask->size(2) == q_len &&
+                        mask->size(3) == k_len,
+                    "mask must be (B, H, Lq, Lk) (expanded views are fine)");
+        TORCH_CHECK(mask->scalar_type() == at::kBool || mask->scalar_type() == dtype,
+                    "mask must be bool or the query dtype");
+        if (mask->scalar_type() == at::kBool) {
+            mask_kind = "bool";
+        }
+    }
+    at::Tensor out = at::empty({batch, q_len, heads, dim}, q.options());
+    if (out.numel() == 0) {
+        return out;
+    }
+    AttnParams params{};
+    params.B = int(batch);
+    params.H = int(heads);
+    params.D = int(dim);
+    params.qL = int(q_len);
+    params.kL = int(k_len);
+    params.gqa_factor = int(heads / kv_heads);
+    params.scale = float(scale);
+    params.NQ = int((q_len + kAttnBQ - 1) / kAttnBQ);
+    params.NK = int((k_len + kAttnBK - 1) / kAttnBK);
+    params.NQ_aligned = int(q_len / kAttnBQ);
+    params.NK_aligned = int(k_len / kAttnBK);
+    params.qL_rem = int(q_len - params.NQ_aligned * kAttnBQ);
+    params.kL_rem = int(k_len - params.NK_aligned * kAttnBK);
+    params.qL_off = int(k_len - q_len);
+    fill_strides(params.Q_strides, q);
+    fill_strides(params.K_strides, k);
+    fill_strides(params.V_strides, v);
+    fill_strides(params.O_strides, out);
+    AttnMaskParams mask_params{};
+    if (mask.has_value()) {
+        for (int i = 0; i < 3; ++i) {
+            mask_params.M_strides[i] = mask->stride(i);
+        }
+    }
+    const std::string name =
+        std::string("attention_") + type_name(dtype) + "_" + std::to_string(dim) + "_" + mask_kind;
+    id<MTLComputePipelineState> pso = pipeline(name, Lib::kAttention,
+                                               {{kAlignQ, q_len % kAttnBQ == 0},
+                                                {kAlignK, k_len % kAttnBK == 0},
+                                                {kHasMask, mask.has_value()},
+                                                {kDoCausal, false},
+                                                {kHasSinks, false},
+                                                {kSaveLse, false}});
+    at::mps::MPSStream *stream = at::mps::getCurrentMPSStream();
+    dispatch_sync(stream->queue(), ^() {
+        @autoreleasepool {
+            id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
+            [encoder setComputePipelineState:pso];
+            set_tensor(encoder, q, 0);
+            set_tensor(encoder, k, 1);
+            set_tensor(encoder, v, 2);
+            set_tensor(encoder, out, 3);
+            [encoder setBytes:&params length:sizeof(params) atIndex:4];
+            if (mask.has_value()) {
+                [encoder setBytes:&mask_params length:sizeof(mask_params) atIndex:5];
+                set_tensor(encoder, *mask, 6);
+            }
+            [encoder dispatchThreadgroups:MTLSizeMake(params.NQ, heads, batch)
+                    threadsPerThreadgroup:MTLSizeMake(32, kAttnWM, 1)];
+        }
+    });
+    return out;
 }
 
 at::Tensor svdq_gemm_w8a8(const at::Tensor &a,

@@ -196,6 +196,11 @@ TORCH_LIBRARY(nunchaku_lite_kernels, ops) {
             "Tensor lact, Tensor lup, Tensor? bias) -> Tensor");
     ops.def("svdq_qk_norm_rope_(Tensor(a!) qkv, Tensor? norm_q, Tensor? norm_k, Tensor? rope, "
             "float eps_q, float eps_k, int heads, int seq_len) -> ()");
+    ops.def("qk_norm_rope_mps_(Tensor qi, Tensor ki, Tensor vi, Tensor? qt, Tensor? kt, Tensor? vt, "
+            "Tensor wqi, Tensor wki, Tensor wqt, Tensor wkt, Tensor cos, Tensor sin, Tensor(a!) q_out, "
+            "Tensor(b!) k_out, Tensor(c!) v_out, float eps_q, float eps_k, int heads, int rot_rows, "
+            "int cs_pair, int os_h, int os_l) -> ()");
+    ops.def("attention_mps(Tensor q, Tensor k, Tensor v, Tensor? mask, float scale) -> Tensor");
 
 #if defined(NUNCHAKU_LITE_REGISTER_CUDA_DISPATCH) || defined(CUDA_KERNEL) || defined(ROCM_KERNEL)
     ops.impl("gemm_w4a4", torch::kCUDA, &dispatch_gemm_w4a4);
@@ -214,5 +219,7 @@ TORCH_LIBRARY(nunchaku_lite_kernels, ops) {
     ops.impl("svdq_gemm_w8a8", at::kMPS, &nunchaku_lite::metal::svdq_gemm_w8a8);
     ops.impl("svdq_gemm_w4a8", at::kMPS, &nunchaku_lite::metal::svdq_gemm_w4a8);
     ops.impl("svdq_qk_norm_rope_", at::kMPS, &nunchaku_lite::metal::svdq_qk_norm_rope_);
+    ops.impl("qk_norm_rope_mps_", at::kMPS, &nunchaku_lite::metal::qk_norm_rope_mps_);
+    ops.impl("attention_mps", at::kMPS, &nunchaku_lite::metal::attention_mps);
 #endif
 }
