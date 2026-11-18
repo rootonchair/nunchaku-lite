@@ -43,7 +43,7 @@ def pypi_readme(root_dir: str, version: str) -> str:
     def absolute(path: str, image: bool) -> str:
         if re.match(r"^([a-z][a-z0-9+.-]*:|#|/)", path):  # URL, anchor or site-absolute: keep
             return path
-        path = path[2:] if path.startswith("./") else path
+        path = path.removeprefix("./")
         if image:
             return f"https://raw.githubusercontent.com/{_REPO}/{ref}/{path}"
         return f"https://github.com/{_REPO}/blob/{ref}/{path}"
