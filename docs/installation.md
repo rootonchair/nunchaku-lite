@@ -18,13 +18,20 @@ instead of compiling kernels locally.
     12.6 or newer is the documented minimum; Blackwell `sm120a` requires CUDA
     12.8 or newer, and `sm121a` requires CUDA 13.0 or newer.
 
+## Install From PyPI
+
+```bash
+pip install nunchaku-lite                # PyTorch runtime (CUDA, Apple MPS)
+pip install "nunchaku-lite[mlx]" mflux   # adds the MLX runtime (Apple silicon), see mlx.md
+```
+
 ## Install From Source
 
 Clone the repository and install from the repository root:
 
 ```bash
-git clone https://github.com/rootonchair/nunchaku_lite.git
-cd nunchaku_lite
+git clone https://github.com/rootonchair/nunchaku-lite.git
+cd nunchaku-lite
 pip install .          # PyTorch runtime (CUDA, Apple MPS)
 pip install ".[mlx]"   # adds the MLX runtime (Apple silicon), see mlx.md
 ```
@@ -72,12 +79,12 @@ nix flake show path:./nunchaku-lite-kernels
 ## Install From GitHub
 
 ```bash
-pip install git+https://github.com/rootonchair/nunchaku_lite.git
+pip install git+https://github.com/rootonchair/nunchaku-lite.git
 ```
 
 ## Build A Wheel
 
 ```bash
-python setup.py bdist_wheel
+python -m build --wheel
 pip install dist/nunchaku_lite-*.whl
 ```

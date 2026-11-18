@@ -3,11 +3,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/rootonchair/nunchaku_lite/actions/workflows/cpu-tests.yml">
-    <img src="https://github.com/rootonchair/nunchaku_lite/actions/workflows/cpu-tests.yml/badge.svg" alt="CPU Tests">
+  <a href="https://github.com/rootonchair/nunchaku-lite/actions/workflows/cpu-tests.yml">
+    <img src="https://github.com/rootonchair/nunchaku-lite/actions/workflows/cpu-tests.yml/badge.svg" alt="CPU Tests">
   </a>
-  <a href="https://github.com/rootonchair/nunchaku_lite/actions/workflows/wheels.yml">
-    <img src="https://github.com/rootonchair/nunchaku_lite/actions/workflows/wheels.yml/badge.svg" alt="Release Wheels">
+  <a href="https://github.com/rootonchair/nunchaku-lite/actions/workflows/wheels.yml">
+    <img src="https://github.com/rootonchair/nunchaku-lite/actions/workflows/wheels.yml/badge.svg" alt="Release Wheels">
   </a>
   <a href="https://nunchaku-lite.readthedocs.io/en/latest/">
     <img src="https://img.shields.io/badge/docs-readthedocs.io-blue" alt="Documentation">
@@ -161,12 +161,12 @@ pipelines with the same `load_nunchaku_pipeline` interface. See
 
 ## Installation
 
-Install from source:
-
 ```bash
-pip install .          # PyTorch runtime (CUDA, Apple MPS) for Diffusers pipelines
-pip install ".[mlx]"   # adds the MLX runtime (Apple silicon) for mflux pipelines
+pip install nunchaku-lite                # PyTorch runtime (CUDA, Apple MPS) for Diffusers pipelines
+pip install "nunchaku-lite[mlx]" mflux   # adds the MLX runtime (Apple silicon) for mflux pipelines
 ```
+
+From a source checkout, `pip install .` and `pip install ".[mlx]"` do the same.
 
 This installs the root Python runtime and uses Hugging Face prebuilt kernels by
 default. `nunchaku_lite.mlx` does not import torch, even though the base install
@@ -187,7 +187,7 @@ over the Hugging Face fallback.
 Build and install a wheel:
 
 ```bash
-python setup.py bdist_wheel
+python -m build --wheel
 pip install dist/nunchaku_lite-*.whl
 ```
 
