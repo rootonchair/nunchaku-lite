@@ -94,7 +94,8 @@ kernels for M5-class Neural Accelerators, plus a portable W4A16 fallback.
 - [x] Verify FLUX.1 (Nunchaku and Nunchaku Lite checkpoints), Z-Image, and runtime LoRA on MPS.
 - [x] Verify Qwen-Image on MPS.
 - [x] Faster attention on MPS: MLX's Neural Accelerator flash attention (M5), Hub op `attention_mps`, plus
-  fused FLUX.2 q/k norm + RoPE on MLX and MPS.
+  fused q/k norm + RoPE: FLUX.2 on MPS; FLUX.1, FLUX.2, Qwen-Image and Z-Image on MLX.
+- [ ] Fused q/k norm + RoPE on MPS for FLUX.1, Qwen-Image and Z-Image (same kernel as MLX).
 - [ ] Quantized T5 (TinyChat AWQ g128) on MPS.
 - [x] Investigated fusing activation quantization into the producing GEMM's epilogue; not pursued.
   On FLUX.2 Klein 4B (MLX), activation quantization plus the low-rank down projection cost 0.5-2.2 ms

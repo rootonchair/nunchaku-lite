@@ -22,7 +22,7 @@ import mlx.core as mx
 from mlx import nn
 
 from ..checkpoint_keys import convert_flux2_state_dict
-from .flux2_attention import install_fused_attention
+from .fused_attention import install_fused_attention
 from .keymap import PrefixMap
 from .linear import AWQW4A16Linear, SVDQW4A4Linear, resolve_backend
 from .manifest import RuntimeManifest, apply_runtime_manifest, parse_runtime_manifest
@@ -138,6 +138,8 @@ def load_nunchaku_pipeline(
                 "PipelineAdapter), or pass load_base_transformer=True."
             )
         _require_complete(pipeline.transformer, loaded, reason="the base transformer weights were not loaded")
+    if mx.metal.is_available() and isinstance(pipeline.transformer, nn.Module):
+        install_fused_attention(pipeline.transformer)  # q/k norm + RoPE in one kernel (Metal GPUs)
     pipeline._nunchaku_lite_target = adapter.target
     pipeline._nunchaku_lite_runtime_manifest = manifest
     return pipeline
@@ -434,8 +436,6 @@ class Flux2Adapter:
             )
         if rebuilt:
             _require_complete(pipeline.transformer, loaded)
-        if mx.metal.is_available():
-            install_fused_attention(pipeline.transformer)  # q/k norm + RoPE in one kernel (Metal GPUs)
         return loaded
 
     def _patch_nunchaku(self, transformer, state, key_map, backend: str, strict: bool) -> set[str]:
@@ -497,6 +497,14 @@ def flux1_key_map() -> PrefixMap:
     return PrefixMap.from_mflux(FluxWeightMapping.get_transformer_mapping())
 
 
+def _block_count(state: Mapping[str, Any], group: str) -> int:
+    """Number of ``<group>.<i>.`` blocks in a checkpoint (highest index + 1)."""
+
+    prefix = group + "."
+    ids = {int(k[len(prefix) :].split(".", 1)[0]) for k in state if k.startswith(prefix)}
+    return max(ids) + 1 if ids else 0
+
+
 class Flux1Adapter:
     """Nunchaku Lite FLUX.1 checkpoints on mflux's FLUX.1 transformer (``mflux.models.flux.variants.Flux1``).
 
@@ -524,13 +532,16 @@ class Flux1Adapter:
                 "lists, e.g. lite-infer/flux.1-dev-nunchaku-lite-int4-r32); original Nunchaku FLUX.1 checkpoints "
                 "are not supported on MLX."
             )
-        rebuilt = _is_quantized_base(pipeline.transformer)
+        # mflux sizes the FLUX.1 transformer from the weights it loads, so without base weights it has no blocks;
+        # rebuild it from the checkpoint's block counts (also replaces a quantized base).
+        old = pipeline.transformer
+        blocks = (_block_count(state, "transformer_blocks"), _block_count(state, "single_transformer_blocks"))
+        rebuilt = _is_quantized_base(old) or (len(old.transformer_blocks), len(old.single_transformer_blocks)) != blocks
         if rebuilt:
-            old = pipeline.transformer
             pipeline.transformer = type(old)(
                 model_config=pipeline.model_config,
-                num_transformer_blocks=len(old.transformer_blocks),
-                num_single_transformer_blocks=len(old.single_transformer_blocks),
+                num_transformer_blocks=blocks[0],
+                num_single_transformer_blocks=blocks[1],
             )
         loaded = patch_from_manifest(
             pipeline.transformer, state, manifest, key_map=flux1_key_map(), backend=backend, strict=strict

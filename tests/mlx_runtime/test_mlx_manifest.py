@@ -374,6 +374,13 @@ class FakeFlux1Pipeline:
             nn.quantize(self.transformer, group_size=64, bits=quantize)
 
 
+class FakeFlux1PipelineWithoutWeights(FakeFlux1Pipeline):
+    """mflux sizes FLUX.1 from the loaded weights: built without base weights, the transformer has no blocks."""
+
+    def __init__(self, model_path: str, **kwargs):
+        self.transformer = Transformer(self.model_config, num_transformer_blocks=0, num_single_transformer_blocks=0)
+
+
 _FLUX1_SVDQ = {
     **{f"transformer_blocks.0.attn.{n}": (D, D) for n in ("to_q", "to_k", "to_v", "add_q_proj", "to_out.0")},
     "transformer_blocks.0.ff.net.0.proj": (MLP, D),
@@ -430,12 +437,14 @@ def test_manifest_from_config_target_lists(tmp_path):
     assert by_name["transformer_blocks.0.norm1.linear"].nunchaku_op == "awq_w4a16"
 
 
-@pytest.mark.parametrize("quantize", [None, 4])
+@pytest.mark.parametrize("quantize", [None, 4, "no-base-weights"])
 def test_lite_flux1_repo_loads_from_config_target_lists(tmp_path, quantize):
     ws, _, _, biases = _lite_flux1_repo(tmp_path / "repo")
-    pipe = load_nunchaku_pipeline(
-        "base", pipeline_cls=FakeFlux1Pipeline, checkpoint=tmp_path / "repo", backend="dense", quantize=quantize
-    )
+    if quantize == "no-base-weights":
+        cls, kwargs = FakeFlux1PipelineWithoutWeights, {}
+    else:
+        cls, kwargs = FakeFlux1Pipeline, {"quantize": quantize}
+    pipe = load_nunchaku_pipeline("base", pipeline_cls=cls, checkpoint=tmp_path / "repo", backend="dense", **kwargs)
     assert pipe._nunchaku_lite_target == "flux1"
     tr = pipe.transformer
     assert not any(isinstance(m, nn.QuantizedLinear) for _, m in tr.named_modules())

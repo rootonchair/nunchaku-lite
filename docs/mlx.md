@@ -223,6 +223,14 @@ example when saving weights) and then yields the exact checkpoint bytes.
 Evaluating it explicitly (for example `mx.eval(model.parameters())`)
 materializes the copy again.
 
+On Metal GPUs, `load_nunchaku_pipeline` also routes mflux's attention modules
+(FLUX.1, FLUX.2, Qwen-Image, Z-Image) through one fused kernel for the q/k
+RMSNorm, RoPE and head-major layout, which reads q/k/v straight from the
+projection output. mflux runs these as separate float32 ops; on FLUX.1-dev the
+fused path takes about 5% off each step. Cases the kernel does not cover (batch
+> 1, head dim other than 128, KV cache, Z-Image float16 compute) use mflux's own
+code.
+
 ## Results (Apple M5, MacBook Pro, AC power)
 
 FLUX.1 projections, bf16, including activation quantization and the low-rank
