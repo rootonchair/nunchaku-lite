@@ -136,16 +136,16 @@ def test_legacy_hadamard_rotation_format_is_refused_with_reexport_hint():
 
 
 @pytest.mark.parametrize(
-    "rotation,match",
+    "rotation,error,match",
     [
-        ({"type": "learned", "block_size": 64, "shared": True}, "unsupported rotation type"),
-        ({"type": "block_matrix", "block_size": 0, "shared": True}, "block_size"),
-        ({"type": "block_matrix", "block_size": 64}, "shared"),
-        ({"type": "block_matrix", "block_size": 64, "shared": True, "generator": 1}, "generator"),
+        ({"type": "learned", "block_size": 64, "shared": True}, ValueError, "unsupported rotation type"),
+        ({"type": "block_matrix", "block_size": 0, "shared": True}, ValueError, "block_size"),
+        ({"type": "block_matrix", "block_size": 64}, TypeError, "shared"),
+        ({"type": "block_matrix", "block_size": 64, "shared": True, "generator": 1}, TypeError, "generator"),
     ],
 )
-def test_malformed_rotation_metadata_is_refused(rotation, match):
-    with pytest.raises(ValueError, match=match):
+def test_malformed_rotation_metadata_is_refused(rotation, error, match):
+    with pytest.raises(error, match=match):
         _parse(_manifest(rotation=rotation))
 
 
@@ -444,7 +444,7 @@ def test_bind_input_rotations_validates_each_layer():
 
     with pytest.raises(ValueError, match="does not belong"):
         bind_input_rotations(_BindModel(), {"missing.input_transform": hadamard_matrix(64)}, ROTATION)
-    with pytest.raises(ValueError, match="not an SVDQ"):
+    with pytest.raises(TypeError, match="not an SVDQ"):
         bind_input_rotations(_BindModel(), {"dense.input_transform": hadamard_matrix(64)}, ROTATION)
 
     unsigned = _BindModel()

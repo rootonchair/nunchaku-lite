@@ -139,7 +139,7 @@ def test_native_hadamard_op_matches_plain_op_on_prerotated_input(dtype, tokens, 
     q_h, s_h, _ = svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda(x.to(dtype), lora_down=lora_down, smooth=smooth)
     x_rot = hadamard_rotate(x).to(dtype)
     q_r, s_r, _ = svdq_quantize_w4a4_act_fuse_lora_cuda(x_rot, lora_down=lora_down, smooth=smooth)
-    q_n, s_n, _ = svdq_quantize_w4a4_act_fuse_lora_cuda(x.to(dtype), lora_down=lora_down, smooth=smooth)
+    _, s_n, _ = svdq_quantize_w4a4_act_fuse_lora_cuda(x.to(dtype), lora_down=lora_down, smooth=smooth)
 
     torch.testing.assert_close(s_h.float(), s_r.float(), rtol=2e-2, atol=1e-3)
     assert (q_h == q_r).float().mean().item() > 0.97

@@ -15,7 +15,6 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-
 from torch import nn
 
 from .manifest import ROTATION_FORMAT_VERSION, RuntimeManifestTarget, _validate_rotation
@@ -118,8 +117,9 @@ def bind_input_rotations(
         The module paths that were bound.
 
     Raises:
-        ValueError: If a transform belongs to no SVDQ layer, to a layer whose input is
+        ValueError: If a transform belongs to no module, to a layer whose input is
             unsigned or quantized inside a fused MLP epilogue, or is malformed.
+        TypeError: If a transform belongs to a module that is not an SVDQ W4A4 layer.
         NotImplementedError: For valid transforms without a native kernel path.
     """
 
@@ -133,7 +133,7 @@ def bind_input_rotations(
         except AttributeError as exc:
             raise ValueError(f"Rotation tensor {key!r} does not belong to any module of the patched model.") from exc
         if not isinstance(module, SVDQW4A4Linear):
-            raise ValueError(f"Rotation tensor {key!r} belongs to {type(module).__name__}, not an SVDQ W4A4 layer.")
+            raise TypeError(f"Rotation tensor {key!r} belongs to {type(module).__name__}, not an SVDQ W4A4 layer.")
         if module.act_unsigned or getattr(module, FUSED_MLP_FC2_ATTR, False):
             raise ValueError(
                 f"Layer {prefix!r} quantizes unsigned or fused-MLP activations, which cannot be rotated "

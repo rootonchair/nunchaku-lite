@@ -330,10 +330,10 @@ def _validate_rotation(checkpoint_prefix: str, nunchaku_op: str, rotation: Any) 
     if not isinstance(block_size, int) or isinstance(block_size, bool) or block_size <= 0:
         raise ValueError(f"runtime_manifest target {checkpoint_prefix!r} rotation.block_size must be a positive int.")
     if not isinstance(rotation.get("shared"), bool):
-        raise ValueError(f"runtime_manifest target {checkpoint_prefix!r} rotation.shared must be a bool.")
+        raise TypeError(f"runtime_manifest target {checkpoint_prefix!r} rotation.shared must be a bool.")
     generator = rotation.get("generator")
     if generator is not None and not isinstance(generator, str):
-        raise ValueError(f"runtime_manifest target {checkpoint_prefix!r} rotation.generator must be a string.")
+        raise TypeError(f"runtime_manifest target {checkpoint_prefix!r} rotation.generator must be a string.")
 
 
 def _validate_structural_patch(raw: Any) -> dict[str, Any]:
