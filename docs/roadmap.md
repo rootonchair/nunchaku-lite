@@ -96,16 +96,21 @@ kernels for M5-class Neural Accelerators, plus a portable W4A16 fallback.
 - [x] Faster attention on MPS: MLX's Neural Accelerator flash attention (M5), Hub op `attention_mps`, plus
   fused FLUX.2 q/k norm + RoPE on MLX and MPS.
 - [ ] Quantized T5 (TinyChat AWQ g128) on MPS.
-- [ ] NVFP4 checkpoint support.
-- [x] Investigated fusing activation quantization into the producing GEMM's epilogue. Measured: quantize +
-  low-rank cost at most ~4% of a FLUX.2 Klein 4B step, the producers are mostly attention / SwiGLU /
-  norms, and a per-row scale spans threadgroups; not pursued (see `docs/apple-silicon-next-steps.md`).
+- [x] Investigated fusing activation quantization into the producing GEMM's epilogue; not pursued.
+  On FLUX.2 Klein 4B (MLX), activation quantization plus the low-rank down projection cost 0.5-2.2 ms
+  per linear; removing both entirely would save about 70 ms of a 1.81 s step (under 4%). Most inputs
+  come from attention, SwiGLU or norms rather than a GEMM, and a per-token scale needs the whole row,
+  which spans threadgroups. Fusing the down projection into the quantizer saves at most ~14 ms per step.
 - [x] MLX `load_nunchaku_pipeline` on mflux with a `flux2` adapter (FLUX.2 Klein,
   verified end to end); AWQ W4A16 layers and lazy `qweight` release on MLX.
 - [x] MLX adapters for FLUX.1 and Z-Image; base transformer weights are no longer loaded.
 - [x] MLX adapter for Qwen-Image (verified end to end).
 - [x] Low-rank branch as a second Neural Accelerator matmul in the GEMM epilogue.
 - [ ] End-to-end image benchmarks.
+- [ ] Free the text encoder after encoding on MLX, so Qwen-Image fits a 24 GB Mac.
+- [ ] NVFP4 on Apple GPUs: the accelerators have no fp4 input type; fp4 x 2 converts exactly to int8,
+  but the scale every 16 values needs a different kernel design.
+- [ ] Add `backend=` to Diffusers' own `NunchakuLiteQuantizationConfig` (following `AutoRoundConfig`).
 
 ## Runtime Manifest Adapter Backlog
 

@@ -3,7 +3,7 @@
 The q/k norm + RoPE library (``nunchaku_lite/shaders.py``) and the vendored MLX attention kernel
 (``nunchaku_lite/ops/_mlx_steel_attention.py``) are the single sources of truth. ``nunchaku_lite`` compiles them
 with ``torch.mps.compile_shader`` only when the installed Hub build predates them; the Hub build compiles this
-header. Run after changing either source (``tests/test_hub_shaders_in_sync.py`` fails until you do):
+header. Run after changing either source (``tests/test_mps_fused_attention.py`` fails until you do):
 
     python tools/sync_hub_shaders.py
 """

@@ -77,6 +77,41 @@ a cinematic photo of a glass greenhouse full of tropical plants during golden ho
 | --- | --- |
 | ![Z-Image Turbo original Diffusers output](assets/benchmarks/z-image-turbo-original.jpg) | ![Z-Image Turbo nunchaku_lite output](assets/benchmarks/z-image-turbo-sample.jpg) |
 
+## Apple silicon (M5, 24 GB)
+
+End-to-end checks on an M5 MacBook Pro (24 GB, AC power, 1024x1024). Step times
+are per denoising step. On PyTorch MPS the text encoder was freed after
+encoding, and memory is the MPS driver's total after generation. On MLX the
+base pipeline supplies only the text encoder and VAE, and peaks include them.
+
+PyTorch MPS:
+
+| Model | Checkpoint | Steps | Step time | Memory |
+| --- | --- | ---: | ---: | ---: |
+| FLUX.2 Klein 9B | `lite-infer/flux.2-klein-9b-nunchaku-lite-int4-r32` | 4 | 7.6 s (int8), 8.1 s (int4) | 11.5 GB (int8), 6.3 GB (int4) |
+| FLUX.1-dev | `nunchaku-tech/nunchaku-flux.1-dev` INT4 r32 | 20 | 8.5 s | 9.3 GB |
+| FLUX.1-dev | `lite-infer/flux.1-dev-nunchaku-lite-int4-r32` | 20 | 6.4 s (int4) | 13.4 GB |
+| Z-Image Turbo | `nunchaku-tech/nunchaku-z-image-turbo` INT4 r128 | 8 | 4.35 s (int8) | 14.1 GB |
+| Qwen-Image Lightning | `nunchaku-tech/nunchaku-qwen-image` INT4 r32, 4-step | 4 | 6.2-6.8 s (int4) | 26.5 GB |
+
+MLX (mflux pipelines; mflux q4 for comparison where it fits):
+
+| Model | Checkpoint | Steps | Step time | Peak memory | mflux q4 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| FLUX.2 Klein 4B | `lite-infer/flux.2-klein-4b-nunchaku-lite-int4-r32` | 4 | 2.69 s (int8), 2.87 s (int4) | 7.8 GB (int8), 5.9 GB (int4) | 3.25 s, 5.5 GB |
+| FLUX.2 Klein 9B | `lite-infer/flux.2-klein-9b-nunchaku-lite-int4-r32` | 4 | 4.6-5.7 s (int8), 5.1-5.9 s (int4) | 16.4 GB (int8), 11.2 GB (int4) | 6.97 s, 10.3 GB |
+| FLUX.1-dev | `lite-infer/flux.1-dev-nunchaku-lite-int4-r32` | 20 | 7.45-7.9 s (int4) | 22.7 GB | 11.48 s, 21.8 GB |
+| Z-Image Turbo | `nunchaku-tech/nunchaku-z-image-turbo` INT4 r128 | 8 | 3.86 s | 12.4 GB | not measured |
+| Qwen-Image Lightning | `nunchaku-tech/nunchaku-qwen-image` INT4 r32, 4-step | 4 | 24 s (int4, swapping) | 30.1 GB | not measured |
+
+Qwen-Image does not fit in 24 GB: on MPS the first step of each image swaps
+(30-70 s; the steady-state steps are shown), and on MLX mflux keeps the bf16
+text encoder (about 16 GB) resident, so every step swaps. On 24 GB, cap MLX's
+buffer cache (`mx.set_cache_limit(1 << 30)`): otherwise up to 9 GB of freed
+buffers stay resident in the Klein 9B pipeline and the first step of every image
+swaps. `backend="auto"` picks int4 where int8 would not fit (Klein 9B, FLUX.1-dev,
+Qwen-Image).
+
 ## Reproducing
 
 The benchmark scripts live under `benchmarks/`. Each script writes generated
