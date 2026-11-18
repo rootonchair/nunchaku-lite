@@ -1,7 +1,8 @@
 # Release Wheels
 
-Release wheels are built by GitHub Actions with `cibuildwheel` when a version
-tag is pushed.
+Releases are built by GitHub Actions when a version tag is pushed: an sdist and
+a pure-Python wheel, attached to a GitHub Release and published to PyPI as
+[`nunchaku-lite`](https://pypi.org/project/nunchaku-lite/).
 
 Before releasing, make sure `src/nunchaku_lite/__version__.py` points at the
 release series. For example, `0.1.0dev` is valid for tag `v0.1.0`.
@@ -21,8 +22,10 @@ either `0.1.0` or `0.1.0dev`. For tag builds, CI strips only the build version
 by setting `NUNCHAKU_LITE_RELEASE_VERSION`; it does not edit the committed
 source file.
 
-The root `nunchaku_lite` wheel is pure Python and uses the package version
-directly, for example:
+The build also writes the release version into the packaged copy of
+`__version__.py` (wheel and sdist), so `nunchaku_lite.__version__` reports the
+released version; the checkout is unchanged. The root `nunchaku_lite` wheel is
+pure Python and uses the package version directly, for example:
 
 ```text
 0.1.0
@@ -37,6 +40,22 @@ git commit -m "Start 0.1.1 development"
 
 Manual builds are available from the `Release Wheels` workflow through
 `workflow_dispatch`; manual builds may use dev versions for validation.
+
+## PyPI Publishing
+
+The `Publish to PyPI` job uploads the tag's sdist and wheel with
+[trusted publishing](https://docs.pypi.org/trusted-publishers/): no API token
+is stored in the repository. One-time setup:
+
+1. On PyPI, add a trusted publisher for project `nunchaku-lite` (a pending
+   publisher before the first upload): owner `rootonchair`, repository
+   `nunchaku-lite`, workflow `wheels.yml`, environment `pypi`.
+2. In the GitHub repository settings, create the `pypi` environment
+   (optionally with required reviewers, to approve each upload).
+
+A tag push then runs lint, version validation, the build and `twine check`,
+and publishes. PyPI versions are immutable: a broken release is fixed with a
+new version, not a re-upload.
 
 ## Build Matrix
 

@@ -3,8 +3,8 @@ site_description: Lite runtime for applying Nunchaku v2 quantized transformer we
 site_url: https://nunchaku-lite.readthedocs.io/en/latest/
 site_author: nunchaku_lite contributors
 
-repo_url: https://github.com/rootonchair/nunchaku_lite
-repo_name: rootonchair/nunchaku_lite
+repo_url: https://github.com/rootonchair/nunchaku-lite
+repo_name: rootonchair/nunchaku-lite
 edit_uri: edit/main/docs/
 
 theme:
@@ -94,4 +94,4 @@ nav:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/rootonchair/nunchaku_lite
+      link: https://github.com/rootonchair/nunchaku-lite
