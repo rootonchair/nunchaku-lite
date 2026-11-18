@@ -11,8 +11,11 @@ from diffusers.models.embeddings import apply_rotary_emb
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.transformers.transformer_flux2 import (
     Flux2Attention,
+    Flux2AttnProcessor,
     Flux2FeedForward,
     Flux2ParallelSelfAttention,
+    Flux2ParallelSelfAttnProcessor,
+    _get_qkv_projections,
 )
 from torch import nn
 
@@ -30,6 +33,7 @@ from .common import (
     prepare_transformer_dtype,
     svdq_from_linear,
 )
+from .mps_processors import fusable, fused_attention, real_rope_tables, register_mps_processor
 
 
 def _pack_flux2_rotary_emb(freqs_cis: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
@@ -616,5 +620,58 @@ def _drop_unused_zero_bias_tensors(transformer: torch.nn.Module, checkpoint_stat
         if torch.count_nonzero(value) == 0:
             checkpoint_state.pop(key)
 
+
+
+# ---------------------------------------------------------------------------
+# Stock Diffusers processors with the fused MPS q/k norm + RoPE prologue (manifest checkpoints on Apple silicon)
+# ---------------------------------------------------------------------------
+
+
+class MPSFusedFlux2AttnProcessor(Flux2AttnProcessor):
+    """Diffusers ``Flux2AttnProcessor`` (joint text + image attention) with the fused MPS prologue."""
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, image_rotary_emb=None):
+        joint = encoder_hidden_states is not None and attn.added_kv_proj_dim is not None
+        norms = (attn.norm_q, attn.norm_k) + ((attn.norm_added_q, attn.norm_added_k) if joint else ())
+        rows = hidden_states.shape[1] + (encoder_hidden_states.shape[1] if joint else 0)
+        tables = real_rope_tables(image_rotary_emb, rows)
+        if (
+            attention_mask is not None
+            or tables is None
+            or (encoder_hidden_states is not None and not joint)
+            or not fusable(hidden_states, attn.head_dim, norms)
+        ):
+            return super().__call__(attn, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb)
+        query, key, value, enc_query, enc_key, enc_value = _get_qkv_projections(
+            attn, hidden_states, encoder_hidden_states
+        )
+        text = (enc_query, enc_key, enc_value) if joint else None
+        out = fused_attention(self, (query, key, value), norms, tables, attn.heads, text=text)
+        if not joint:
+            return attn.to_out[1](attn.to_out[0](out))
+        lt = encoder_hidden_states.shape[1]
+        encoder_out, out = out.split_with_sizes([lt, out.shape[1] - lt], dim=1)
+        return attn.to_out[1](attn.to_out[0](out)), attn.to_add_out(encoder_out)
+
+
+class MPSFusedFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
+    """Diffusers ``Flux2ParallelSelfAttnProcessor`` (single-stream blocks) with the fused MPS prologue."""
+
+    def __call__(self, attn, hidden_states, attention_mask=None, image_rotary_emb=None):
+        norms = (attn.norm_q, attn.norm_k)
+        tables = real_rope_tables(image_rotary_emb, hidden_states.shape[1])
+        if attention_mask is not None or tables is None or not fusable(hidden_states, attn.head_dim, norms):
+            return super().__call__(attn, hidden_states, attention_mask, image_rotary_emb)
+        proj = attn.to_qkv_mlp_proj(hidden_states)
+        inner = attn.inner_dim
+        if proj.shape[-1] != 3 * inner + attn.mlp_hidden_dim * attn.mlp_mult_factor:  # column-sharded (TP)
+            return super().__call__(attn, hidden_states, attention_mask, image_rotary_emb)
+        qkv = (proj[..., :inner], proj[..., inner : 2 * inner], proj[..., 2 * inner : 3 * inner])
+        out = fused_attention(self, qkv, norms, tables, attn.heads)
+        return attn.to_out(torch.cat([out, attn.mlp_act_fn(proj[..., 3 * inner :])], dim=-1))
+
+
+register_mps_processor(Flux2AttnProcessor, MPSFusedFlux2AttnProcessor)
+register_mps_processor(Flux2ParallelSelfAttnProcessor, MPSFusedFlux2ParallelSelfAttnProcessor)
 
 register_adapter(Flux2Adapter())

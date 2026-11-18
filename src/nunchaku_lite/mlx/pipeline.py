@@ -22,6 +22,7 @@ import mlx.core as mx
 from mlx import nn
 
 from ..checkpoint_keys import convert_flux2_state_dict
+from . import fused_attention as fa
 from .fused_attention import install_fused_attention
 from .keymap import PrefixMap
 from .linear import AWQW4A16Linear, SVDQW4A4Linear, resolve_backend
@@ -474,6 +475,91 @@ class Flux2Adapter:
         return loaded
 
 
+
+# Fused attention prologue for mflux's FLUX.2 attention modules (registered below; see fused_attention.py)
+
+
+def _flux2_joint(
+    self, base, hidden_states, encoder_hidden_states, image_rotary_emb, kv_cache=None, kv_cache_layer_idx=None
+):
+    def fallback():
+        return base.__call__(
+            self,
+            hidden_states,
+            encoder_hidden_states,
+            image_rotary_emb,
+            kv_cache=kv_cache,
+            kv_cache_layer_idx=kv_cache_layer_idx,
+        )
+
+    if (
+        kv_cache is not None
+        or image_rotary_emb is None
+        or encoder_hidden_states is None
+        or self.added_kv_proj_dim is None
+        or hidden_states.shape[0] != 1
+    ):
+        return fallback()
+    dtype, context_dtype = hidden_states.dtype, encoder_hidden_states.dtype
+    precision = self.compute_precision
+    rows = fa.joint_qkv(
+        self,
+        precision.to_compute(hidden_states),
+        precision.to_compute(encoder_hidden_states),
+        self.inner_dim,
+        fa.IMAGE_QKV,
+        fa.TEXT_QKV,
+    )
+    if rows is None:
+        return fallback()
+    img, txt, offs = rows
+    cos, sin = image_rotary_emb
+    q, k, v = fa.qk_norm_rope(
+        img,
+        offs,
+        self.norm_q.weight,
+        self.norm_k.weight,
+        cos,
+        sin,
+        self.heads,
+        eps=self.norm_q.eps,
+        text=txt,
+        text_q_weight=self.norm_added_q.weight,
+        text_k_weight=self.norm_added_k.weight,
+    )
+    out = fa.attention(q, k, v)
+    lt = encoder_hidden_states.shape[1]
+    encoder_out = precision.to_stream(self.to_add_out(out[:, :lt]), context_dtype)
+    return precision.to_stream(self.to_out(out[:, lt:]), dtype), encoder_out
+
+
+def _flux2_parallel(self, base, hidden_states, image_rotary_emb, kv_cache=None, kv_cache_layer_idx=None):
+    if kv_cache is not None or image_rotary_emb is None or hidden_states.shape[0] != 1:
+        return base.__call__(
+            self, hidden_states, image_rotary_emb, kv_cache=kv_cache, kv_cache_layer_idx=kv_cache_layer_idx
+        )
+    dtype, precision = hidden_states.dtype, self.compute_precision
+    proj = self.to_qkv_mlp_proj(precision.to_compute(hidden_states))
+    inner = self.inner_dim
+    cos, sin = image_rotary_emb
+    q, k, v = fa.qk_norm_rope(
+        proj.reshape(-1, proj.shape[-1]),
+        (0, inner, 2 * inner),
+        self.norm_q.weight,
+        self.norm_k.weight,
+        cos,
+        sin,
+        self.heads,
+        eps=self.norm_q.eps,
+    )
+    out = fa.attention(q, k, v)
+    mlp_hidden = self.mlp_act(proj[..., 3 * inner :])
+    out = self.to_out(mx.concatenate([out, mlp_hidden], axis=-1))
+    return precision.to_stream(out, dtype)
+
+
+# ---------------------------------------------------------------------------
+
 # ---------------------------------------------------------------------------
 # FLUX.1 (mflux Flux1)
 # ---------------------------------------------------------------------------
@@ -550,6 +636,58 @@ class Flux1Adapter:
             _require_complete(pipeline.transformer, loaded)
         return loaded
 
+
+
+# Fused attention prologue for mflux's FLUX.1 attention modules (registered below; see fused_attention.py)
+
+
+def _flux1_tables(image_rotary_emb: mx.array, rows: int) -> tuple[mx.array, mx.array] | None:
+    """cos / sin ``(L, 64)`` from mflux's FLUX.1 rotation matrices ``(1, 1, L, 64, 2, 2)`` = [[cos, -sin], [sin,
+    cos]]."""
+
+    if image_rotary_emb.shape != (1, 1, rows, fa.HEAD_DIM // 2, 2, 2):
+        return None
+    return image_rotary_emb[0, 0, :, :, 0, 0], image_rotary_emb[0, 0, :, :, 1, 0]
+
+
+def _flux1_joint(self, base, hidden_states, encoder_hidden_states, image_rotary_emb):
+    lt = encoder_hidden_states.shape[1]
+    tables = _flux1_tables(image_rotary_emb, lt + hidden_states.shape[1])
+    width = self.num_heads * fa.HEAD_DIM
+    rows = None
+    if hidden_states.shape[0] == 1 and tables is not None:
+        rows = fa.joint_qkv(self, hidden_states, encoder_hidden_states, width, fa.IMAGE_QKV, fa.TEXT_QKV)
+    if rows is None:
+        return base.__call__(self, hidden_states, encoder_hidden_states, image_rotary_emb)
+    img, txt, offs = rows
+    q, k, v = fa.qk_norm_rope(
+        img,
+        offs,
+        self.norm_q.weight,
+        self.norm_k.weight,
+        *tables,
+        self.num_heads,
+        eps=self.norm_q.eps,
+        text=txt,
+        text_q_weight=self.norm_added_q.weight,
+        text_k_weight=self.norm_added_k.weight,
+    )
+    out = fa.attention(q, k, v)
+    return self.to_out[0](out[:, lt:]), self.to_add_out(out[:, :lt])
+
+
+def _flux1_single(self, base, hidden_states, image_rotary_emb):
+    tables = _flux1_tables(image_rotary_emb, hidden_states.shape[1])
+    if hidden_states.shape[0] != 1 or tables is None:
+        return base.__call__(self, hidden_states, image_rotary_emb)
+    rows, offs = fa.qkv_rows(self, hidden_states, fa.IMAGE_QKV, self.num_heads * fa.HEAD_DIM)
+    q, k, v = fa.qk_norm_rope(
+        rows, offs, self.norm_q.weight, self.norm_k.weight, *tables, self.num_heads, eps=self.norm_q.eps
+    )
+    return fa.attention(q, k, v)
+
+
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Z-Image (mflux ZImage)
@@ -643,6 +781,40 @@ class ZImageAdapter:
         return loaded
 
 
+
+# Fused attention prologue for mflux's Z-Image attention module (registered below; see fused_attention.py)
+
+
+def _z_image(self, base, hidden_states, attention_mask=None, freqs_cis=None):
+    length = hidden_states.shape[1]
+    if (
+        freqs_cis is None
+        or hidden_states.shape[0] != 1
+        or self.norm_q is None
+        or self.norm_k is None
+        or self.float32
+        or self.compute_precision.dtype is not None  # float16 compute shrinks v, which the kernel copies as is
+        or freqs_cis.shape != (length, fa.HEAD_DIM // 2, 2)
+    ):
+        return base.__call__(self, hidden_states, attention_mask=attention_mask, freqs_cis=freqs_cis)
+    rows, offs = fa.qkv_rows(self, hidden_states, fa.IMAGE_QKV, self.dim)
+    q, k, v = fa.qk_norm_rope(
+        rows,
+        offs,
+        self.norm_q.weight,
+        self.norm_k.weight,
+        freqs_cis[..., 0],
+        freqs_cis[..., 1],
+        self.n_heads,
+        eps=self.norm_q.eps,
+    )
+    mask = None
+    if attention_mask is not None:
+        mask = mx.where(
+            attention_mask[:, None, None, :], mx.array(0.0, dtype=q.dtype), mx.array(float("-inf"), dtype=q.dtype)
+        )
+    return self.to_out[0](fa.attention(q, k, v, mask))
+
 # ---------------------------------------------------------------------------
 # Qwen-Image (mflux QwenImage)
 # ---------------------------------------------------------------------------
@@ -732,8 +904,56 @@ class QwenImageAdapter:
         return loaded
 
 
+
+# Fused attention prologue for mflux's Qwen-Image attention module (registered below; see fused_attention.py)
+
+
+def _qwen(self, base, img_modulated, txt_modulated, encoder_hidden_states_mask, image_rotary_emb, block_idx=None):
+    def fallback():
+        return base.__call__(
+            self, img_modulated, txt_modulated, encoder_hidden_states_mask, image_rotary_emb, block_idx=block_idx
+        )
+
+    norms = (self.norm_q, self.norm_k, self.norm_added_q, self.norm_added_k)
+    if image_rotary_emb is None or img_modulated.shape[0] != 1 or any(n is None for n in norms):
+        return fallback()
+    (img_cos, img_sin), (txt_cos, txt_sin) = image_rotary_emb
+    li, lt = img_modulated.shape[1], txt_modulated.shape[1]
+    if not (fa.tables_fit(img_cos, img_sin, li) and fa.tables_fit(txt_cos, txt_sin, lt)):
+        return fallback()
+    rows = fa.joint_qkv(self, img_modulated, txt_modulated, self.num_heads * fa.HEAD_DIM, fa.IMAGE_QKV, fa.TEXT_QKV)
+    if rows is None:
+        return fallback()
+    img, txt, offs = rows
+    q, k, v = fa.qk_norm_rope(
+        img,
+        offs,
+        self.norm_q.weight,
+        self.norm_k.weight,
+        mx.concatenate([txt_cos, img_cos]),
+        mx.concatenate([txt_sin, img_sin]),
+        self.num_heads,
+        eps=self.norm_q.eps,
+        text=txt,
+        text_q_weight=self.norm_added_q.weight,
+        text_k_weight=self.norm_added_k.weight,
+    )
+    mask = self._convert_mask_for_qwen(mask=encoder_hidden_states_mask, joint_seq_len=lt + li, txt_seq_len=lt)
+    out = fa.attention(q, k, v, mask)
+    return self.attn_to_out[0](out[:, lt:]), self.to_add_out(out[:, :lt])
+
+
+# ---------------------------------------------------------------------------
+
 register_adapter(ManifestAdapter())
 register_adapter(Flux1Adapter())
 register_adapter(Flux2Adapter())
 register_adapter(QwenImageAdapter())
 register_adapter(ZImageAdapter())
+
+fa.register_fused_attention("flux", "JointAttention", _flux1_joint)
+fa.register_fused_attention("flux", "SingleBlockAttention", _flux1_single)
+fa.register_fused_attention("flux2", "Flux2Attention", _flux2_joint)
+fa.register_fused_attention("flux2", "Flux2ParallelSelfAttention", _flux2_parallel)
+fa.register_fused_attention("qwen", "QwenAttention", _qwen)
+fa.register_fused_attention("z_image", "ZImageAttention", _z_image)

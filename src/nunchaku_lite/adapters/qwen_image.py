@@ -11,6 +11,7 @@ from diffusers.models.attention import AttentionModuleMixin, FeedForward
 from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.transformers.transformer_qwenimage import (
+    QwenDoubleStreamAttnProcessor2_0,
     QwenImageTransformerBlock,
     apply_rotary_emb_qwen,
 )
@@ -28,7 +29,13 @@ from .common import (
     prepare_transformer_dtype,
     svdq_from_linear,
 )
-from .mps_processors import complex_rope_tables, fused_qk_norm_rope
+from .mps_processors import (
+    complex_rope_tables,
+    fusable,
+    fused_attention,
+    fused_qk_norm_rope,
+    register_mps_processor,
+)
 
 
 def _compute_text_seq_len_from_mask(
@@ -163,16 +170,14 @@ class NunchakuQwenImageAttnProcessor:
         seq_txt = encoder_hidden_states.shape[1]
         img_qkv = attn.to_qkv(hidden_states).chunk(3, dim=-1)
         txt_qkv = attn.add_qkv_proj(encoder_hidden_states).chunk(3, dim=-1)
-        fused = None
-        if image_rotary_emb is not None and hidden_states.device.type == "mps":
-            # one MPS kernel for the q/k norms, RoPE and head layout (None when it does not apply)
+        # On MPS: one kernel for the q/k norms, RoPE and head layout (both branches share the projections).
+        norms = (attn.norm_q, attn.norm_k, attn.norm_added_q, attn.norm_added_k)
+        tables = None
+        if image_rotary_emb is not None and fusable(hidden_states, img_qkv[0].shape[-1] // attn.heads, norms):
             img_freqs, txt_freqs = image_rotary_emb
-            tables = complex_rope_tables((txt_freqs, img_freqs))
-            if tables is not None and tables[0].shape[0] == seq_txt + hidden_states.shape[1]:
-                norms = (attn.norm_q, attn.norm_k, attn.norm_added_q, attn.norm_added_k)
-                fused = fused_qk_norm_rope(img_qkv, norms, *tables, attn.heads, text=txt_qkv)
-        if fused is not None:
-            joint_query, joint_key, joint_value = fused
+            tables = complex_rope_tables((txt_freqs, img_freqs), seq_txt + hidden_states.shape[1])
+        if tables is not None:
+            joint_query, joint_key, joint_value = fused_qk_norm_rope(img_qkv, norms, tables, attn.heads, text=txt_qkv)
         else:
             joint_query, joint_key, joint_value = self._unfused_qkv(attn, img_qkv, txt_qkv, image_rotary_emb)
         joint_hidden_states = dispatch_attention_fn(
@@ -628,5 +633,53 @@ class QwenImageAdapter:
             },
         )
 
+
+
+class MPSFusedQwenDoubleStreamAttnProcessor(QwenDoubleStreamAttnProcessor2_0):
+    """Diffusers ``QwenDoubleStreamAttnProcessor2_0`` (manifest checkpoints) with the fused MPS q/k norm + RoPE
+    prologue (see :mod:`nunchaku_lite.adapters.mps_processors`)."""
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        encoder_hidden_states_mask=None,
+        attention_mask=None,
+        image_rotary_emb=None,
+    ):
+        norms = (attn.norm_q, attn.norm_k, attn.norm_added_q, attn.norm_added_k)
+        tables = None
+        if (
+            encoder_hidden_states is not None
+            and attention_mask is None
+            and image_rotary_emb is not None
+            and fusable(hidden_states, attn.inner_dim // attn.heads, norms)
+        ):
+            img_freqs, txt_freqs = image_rotary_emb
+            tables = complex_rope_tables((txt_freqs, img_freqs), encoder_hidden_states.shape[1] + hidden_states.shape[1])
+        if tables is None:
+            return super().__call__(
+                attn, hidden_states, encoder_hidden_states, encoder_hidden_states_mask, attention_mask, image_rotary_emb
+            )
+        lt = encoder_hidden_states.shape[1]
+        image = (attn.to_q(hidden_states), attn.to_k(hidden_states), attn.to_v(hidden_states))
+        text = (
+            attn.add_q_proj(encoder_hidden_states),
+            attn.add_k_proj(encoder_hidden_states),
+            attn.add_v_proj(encoder_hidden_states),
+        )
+        mask = None
+        if encoder_hidden_states_mask is not None:
+            image_mask = torch.ones((1, hidden_states.shape[1]), dtype=torch.bool, device=hidden_states.device)
+            mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)[:, None, None, :]
+        out = fused_attention(self, image, norms, tables, attn.heads, text=text, mask=mask)
+        img_out = attn.to_out[0](out[:, lt:].contiguous())
+        if len(attn.to_out) > 1:
+            img_out = attn.to_out[1](img_out)
+        return img_out, attn.to_add_out(out[:, :lt].contiguous())
+
+
+register_mps_processor(QwenDoubleStreamAttnProcessor2_0, MPSFusedQwenDoubleStreamAttnProcessor)
 
 register_adapter(QwenImageAdapter())

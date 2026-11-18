@@ -12,11 +12,10 @@ from diffusers.models.transformers import transformer_flux2 as flux2
 from diffusers.models.transformers import transformer_qwenimage as qwen
 from diffusers.models.transformers import transformer_z_image as z_image
 
-from nunchaku_lite.adapters.mps_processors import (
-    MPSFusedFlux2AttnProcessor,
-    MPSFusedFlux2ParallelSelfAttnProcessor,
-    install_mps_fused_processors,
-)
+import nunchaku_lite.adapters.flux  # registers the FLUX.1 fused processor
+import nunchaku_lite.adapters.z_image  # noqa: F401 - registers the Z-Image fused processor
+from nunchaku_lite.adapters.flux2 import MPSFusedFlux2AttnProcessor, MPSFusedFlux2ParallelSelfAttnProcessor
+from nunchaku_lite.adapters.mps_processors import install_mps_fused_processors
 from nunchaku_lite.adapters.qwen_image import NunchakuQwenImageAttnProcessor
 from nunchaku_lite.ops.mps import (
     attention_mps,

@@ -10,8 +10,10 @@ from diffusers.models.attention import AttentionModuleMixin, FeedForward
 from diffusers.models.normalization import AdaLayerNormZero, AdaLayerNormZeroSingle
 from diffusers.models.transformers.transformer_flux import (
     FluxAttention,
+    FluxAttnProcessor,
     FluxSingleTransformerBlock,
     FluxTransformerBlock,
+    _get_qkv_projections,
 )
 from packaging.version import Version
 from torch import nn
@@ -34,6 +36,7 @@ from .common import (
     prepare_transformer_dtype,
     svdq_from_linear,
 )
+from .mps_processors import fusable, fused_attention, real_rope_tables, register_mps_processor
 
 
 def rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
@@ -994,5 +997,36 @@ def _is_uncorrected_flux_key(key: str) -> bool:
 
     return False
 
+
+
+class MPSFusedFluxAttnProcessor(FluxAttnProcessor):
+    """Diffusers ``FluxAttnProcessor`` (joint and single blocks of manifest checkpoints) with the fused MPS q/k norm
+    + RoPE prologue (see :mod:`nunchaku_lite.adapters.mps_processors`)."""
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, image_rotary_emb=None):
+        joint = encoder_hidden_states is not None and attn.added_kv_proj_dim is not None
+        norms = (attn.norm_q, attn.norm_k) + ((attn.norm_added_q, attn.norm_added_k) if joint else ())
+        rows = hidden_states.shape[1] + (encoder_hidden_states.shape[1] if joint else 0)
+        tables = real_rope_tables(image_rotary_emb, rows)
+        if (
+            attention_mask is not None
+            or tables is None
+            or (encoder_hidden_states is not None and not joint)
+            or not fusable(hidden_states, attn.head_dim, norms)
+        ):
+            return super().__call__(attn, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb)
+        query, key, value, enc_query, enc_key, enc_value = _get_qkv_projections(
+            attn, hidden_states, encoder_hidden_states
+        )
+        text = (enc_query, enc_key, enc_value) if joint else None
+        out = fused_attention(self, (query, key, value), norms, tables, attn.heads, text=text)
+        if not joint:
+            return out  # single blocks project the attention output together with the MLP
+        lt = encoder_hidden_states.shape[1]
+        encoder_out, out = out.split_with_sizes([lt, out.shape[1] - lt], dim=1)
+        return attn.to_out[1](attn.to_out[0](out.contiguous())), attn.to_add_out(encoder_out.contiguous())
+
+
+register_mps_processor(FluxAttnProcessor, MPSFusedFluxAttnProcessor)
 
 register_adapter(FluxAdapter())

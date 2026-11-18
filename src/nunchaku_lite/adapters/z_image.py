@@ -24,6 +24,7 @@ from .common import (
     prepare_transformer_dtype,
     svdq_from_linear,
 )
+from .mps_processors import complex_rope_tables, fusable, fused_attention, register_mps_processor
 
 
 def _pack_z_image_rotary_emb(freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -393,5 +394,33 @@ class ZImageAdapter:
         transformer.forward = forward_with_packed_rope
         transformer._nunchaku_lite_rope_wrapped = True
 
+
+
+class MPSFusedZSingleStreamAttnProcessor(ZSingleStreamAttnProcessor):
+    """Diffusers ``ZSingleStreamAttnProcessor`` (manifest checkpoints) with the fused MPS q/k norm + RoPE prologue
+    (see :mod:`nunchaku_lite.adapters.mps_processors`)."""
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, freqs_cis=None):
+        norms = (attn.norm_q, attn.norm_k)
+        tables = None
+        if (
+            torch.is_tensor(freqs_cis)
+            and freqs_cis.ndim == 3
+            and freqs_cis.shape[0] == 1
+            and fusable(hidden_states, attn.inner_dim // attn.heads, norms)
+        ):
+            tables = complex_rope_tables((freqs_cis[0],), hidden_states.shape[1])
+        if tables is None:
+            return super().__call__(attn, hidden_states, encoder_hidden_states, attention_mask, freqs_cis)
+        qkv = (attn.to_q(hidden_states), attn.to_k(hidden_states), attn.to_v(hidden_states))
+        if attention_mask is not None and attention_mask.ndim == 2:
+            attention_mask = attention_mask[:, None, None, :]
+        output = attn.to_out[0](fused_attention(self, qkv, norms, tables, attn.heads, mask=attention_mask))
+        if len(attn.to_out) > 1:
+            output = attn.to_out[1](output)
+        return output
+
+
+register_mps_processor(ZSingleStreamAttnProcessor, MPSFusedZSingleStreamAttnProcessor)
 
 register_adapter(ZImageAdapter())
