@@ -83,6 +83,7 @@ nav:
           - Qwen-Image: models/qwen_image.md
           - SDXL: models/sdxl.md
           - Z-Image Turbo: models/z_image.md
+      - MLX runtime (Apple silicon): mlx.md
       - API Reference: api.md
       - Roadmap: roadmap.md
       - Documentation Deployment: deployment.md

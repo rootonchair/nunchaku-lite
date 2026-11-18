@@ -11,8 +11,8 @@ from typing import Any, Protocol
 
 import torch
 
-from .manifest import RuntimeManifest, parse_runtime_manifest
-from .utils import get_precision, load_state_dict_in_safetensors
+from .manifest import RuntimeManifest, parse_runtime_manifest, with_target_list_manifest
+from .utils import fetch_or_download, get_precision, load_state_dict_in_safetensors
 
 
 @dataclass
@@ -29,6 +29,7 @@ class PatchOptions:
             match.
         adapter_options: Adapter-specific options, such as rank overrides or
             model-family toggles.
+        backend: Quantized-kernel backend for SVDQ layers (Apple silicon).
     """
 
     precision: str
@@ -36,6 +37,7 @@ class PatchOptions:
     device: str | torch.device | None = None
     strict: bool = True
     adapter_options: dict[str, Any] = field(default_factory=dict)
+    backend: str = "auto"
 
 
 class TransformerAdapter(Protocol):
@@ -129,6 +131,7 @@ def patch_transformer(
     device: str | torch.device | None = None,
     strict: bool = True,
     adapter_options: dict[str, Any] | None = None,
+    backend: str = "auto",
 ) -> torch.nn.Module:
     """Patch a Diffusers transformer in place with a Nunchaku Lite checkpoint.
 
@@ -147,6 +150,14 @@ def patch_transformer(
         device: Optional device to move the patched transformer to.
         strict: Whether ``load_state_dict`` should enforce exact key matching.
         adapter_options: Optional adapter-specific patch settings.
+        backend: Quantized-kernel backend for SVDQ layers, following the
+            Diffusers ``AutoRoundConfig(backend=...)`` convention. On Apple
+            silicon (MPS): ``"auto"`` (``int8`` when it fits comfortably in GPU
+            memory, else ``int4``; ``dense`` without Neural Accelerators),
+            ``"int8"`` (fastest), ``"int4"`` (4-bit weights in memory), or
+            ``"dense"`` (exact fallback). CUDA has a single kernel and accepts
+            only ``"auto"``. This is unrelated to the attention backend
+            (``model.set_attention_backend``).
 
     Returns:
         The same ``transformer`` object after mutation and checkpoint loading.
@@ -166,6 +177,7 @@ def patch_transformer(
         strict=strict,
         adapter_options=adapter_options,
         assign=False,
+        backend=backend,
     )
 
 
@@ -182,6 +194,7 @@ def load_nunchaku_pipeline(
     strict: bool = True,
     adapter_options: dict[str, Any] | None = None,
     quantized_encoder_checkpoints: dict[str, str | Path] | None = None,
+    backend: str = "auto",
     **pipeline_kwargs,
 ):
     """Load a Diffusers pipeline with its Nunchaku component installed up front.
@@ -209,6 +222,8 @@ def load_nunchaku_pipeline(
         quantized_encoder_checkpoints: Optional mapping from Diffusers pipeline
             component name to quantized encoder checkpoint. This currently
             supports T5-compatible Nunchaku checkpoints.
+        backend: Quantized-kernel backend for SVDQ layers (``"auto"``,
+            ``"int8"``, ``"int4"``, ``"dense"``); see :func:`patch_transformer`.
         **pipeline_kwargs: Additional keyword arguments forwarded to
             ``pipeline_cls.from_pretrained``.
 
@@ -252,6 +267,7 @@ def load_nunchaku_pipeline(
         strict=strict,
         adapter_options=adapter_options,
         pipeline_kwargs=pipeline_kwargs,
+        backend=backend,
     )
 
     pipe = pipeline_cls.from_pretrained(
@@ -325,6 +341,20 @@ def _load_quantized_encoder_component(
         ) from exc
 
 
+def _install_mps_attention(transformer: torch.nn.Module) -> None:
+    """On Apple silicon: route stock FLUX.1 / FLUX.2 / Qwen-Image / Z-Image attention processors through the fused
+    q/k norm + RoPE kernel, and run the transformer's attention on the Neural Accelerators where supported (both
+    fall back per call)."""
+
+    if not torch.backends.mps.is_available():
+        return
+    from .adapters.attention_dispatch import install_mps_attention
+    from .adapters.mps_processors import install_mps_fused_processors
+
+    install_mps_fused_processors(transformer)
+    install_mps_attention(transformer)
+
+
 def _patch_component(
     transformer: torch.nn.Module,
     checkpoint: str | Path,
@@ -336,7 +366,16 @@ def _patch_component(
     strict: bool,
     adapter_options: dict[str, Any] | None,
     assign: bool,
+    backend: str = "auto",
 ) -> torch.nn.Module:
+    from .ops.mps import configure_backend, validate_backend
+
+    backend = validate_backend(backend)
+    if backend != "auto" and device is not None and torch.device(device).type == "cuda":
+        raise ValueError(
+            f"backend={backend!r} selects an Apple-silicon (MPS) kernel; CUDA has a single SVDQ kernel. "
+            'Use backend="auto" on CUDA.'
+        )
     _ensure_builtin_adapters()
 
     existing_target = getattr(transformer, "_nunchaku_lite_target", None)
@@ -346,8 +385,17 @@ def _patch_component(
         raise ValueError(f"Transformer is already patched as {existing_target!r}; requested {target!r}.")
 
     state_dict, metadata = load_state_dict_in_safetensors(checkpoint, return_metadata=True)
-    quantization_config = _parse_json_metadata(metadata, "quantization_config")
+    quantization_config = _parse_json_metadata(metadata, "quantization_config") or _sibling_quantization_config(
+        checkpoint
+    )
+    quantization_config = with_target_list_manifest(quantization_config, state_dict.keys())
     runtime_manifest = parse_runtime_manifest(quantization_config)
+    if "rank" not in quantization_config:
+        # Family adapters read the top-level rank (also when target= names one for a manifest checkpoint).
+        rank = runtime_manifest.requirements.get("rank") if runtime_manifest is not None else None
+        rank = rank or _infer_svdq_rank(state_dict)
+        if rank:
+            quantization_config = {**quantization_config, "rank": int(rank)}
     adapter = _select_adapter_for_checkpoint(transformer, target, runtime_manifest)
     normalized_precision = _normalize_precision(precision, device, checkpoint, runtime_manifest)
     _validate_quantization_compatibility(quantization_config, normalized_precision, device, checkpoint)
@@ -357,6 +405,7 @@ def _patch_component(
         device=device,
         strict=strict,
         adapter_options=adapter_options or {},
+        backend=backend,
     )
 
     maybe_state_dict = adapter.patch(transformer, state_dict, quantization_config, options)
@@ -369,6 +418,8 @@ def _patch_component(
     _materialize_known_meta_tensors(transformer)
     if device is not None:
         transformer.to(device)
+    configure_backend(transformer, backend)
+    _install_mps_attention(transformer)
 
     transformer._nunchaku_lite_patched = True
     transformer._nunchaku_lite_target = adapter.target
@@ -475,6 +526,7 @@ def _load_nunchaku_component_from_config(
     strict: bool,
     adapter_options: dict[str, Any] | None,
     pipeline_kwargs: dict[str, Any],
+    backend: str = "auto",
 ) -> torch.nn.Module:
     if not hasattr(component_cls, "load_config") or not hasattr(component_cls, "from_config"):
         raise TypeError(f"{component_cls.__module__}.{component_cls.__name__} must support load_config/from_config.")
@@ -498,6 +550,7 @@ def _load_nunchaku_component_from_config(
         strict=strict,
         adapter_options=adapter_options,
         assign=True,
+        backend=backend,
     )
 
 
@@ -541,6 +594,49 @@ def _coerce_state_dict_for_assign(module: torch.nn.Module, state_dict: dict[str,
         if not (expected.is_floating_point() and value.is_floating_point()):
             continue
         state_dict[key] = value.to(dtype=expected.dtype)
+
+
+def _sibling_quantization_config(checkpoint: str | os.PathLike) -> dict[str, Any]:
+    """``quantization_config`` from the ``config.json`` next to a checkpoint file (Diffusers-format repos that keep it
+    there instead of in the safetensors metadata); ``{}`` when there is none."""
+
+    from huggingface_hub.errors import EntryNotFoundError
+
+    sibling = Path(checkpoint).parent / "config.json"
+    try:
+        if Path(checkpoint).exists():  # local file: never fall through to a Hub download
+            if not sibling.is_file():
+                return {}
+            config_path = sibling
+        else:  # Hub reference ``org/repo/.../file.safetensors``
+            config_path = fetch_or_download(sibling)
+        value = json.loads(Path(config_path).read_text()).get("quantization_config")
+    except json.JSONDecodeError as exc:
+        warnings.warn(f"Ignoring malformed {sibling} ({exc}).", stacklevel=3)
+        return {}
+    except (EntryNotFoundError, FileNotFoundError, ValueError):  # no config.json (ValueError: not a Hub path)
+        return {}
+    except Exception as exc:  # noqa: BLE001 - e.g. network or auth errors: continue without, but say so
+        warnings.warn(f"Could not read {sibling} for checkpoint metadata ({exc}); continuing without it.", stacklevel=3)
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _infer_svdq_rank(state_dict: dict[str, torch.Tensor]) -> int | None:
+    """The low-rank branch rank of a lite-format checkpoint (``*.proj_down`` is ``(in_features, rank)``).
+
+    Used when the checkpoint has no ``rank`` metadata, e.g. Diffusers-format repos that keep it only in
+    ``transformer/config.json``; without it, a rank-64 checkpoint would be patched with the default rank 32.
+    """
+
+    ranks = {int(v.shape[1]) for k, v in state_dict.items() if k.endswith(".proj_down") and v.ndim == 2}
+    if not ranks:
+        return None
+    if len(ranks) > 1:
+        warnings.warn(
+            f"Checkpoint low-rank branches have mixed ranks {sorted(ranks)}; using {max(ranks)}.", stacklevel=3
+        )
+    return max(ranks)
 
 
 def _parse_json_metadata(metadata: dict[str, str] | None, key: str) -> dict[str, Any]:

@@ -106,16 +106,71 @@ apply only when installing the local `nunchaku_lite_kernels` package from
 > `nunchaku_lite_kernels` package, then falls back to
 > `rootonchair/nunchaku-lite-kernels` through Hugging Face `kernels`.
 
+### Apple silicon (MPS, experimental)
+
+INT4 SVDQ checkpoints also run on Apple-silicon GPUs with `device="mps"`.
+Apple GPUs have no INT4 matmul, so the MPS path runs SVDQ layers as **W8A8**:
+the 4-bit weights (plus folded group scales) become int8, activations are
+quantized to int8 per token after smoothing, and the matmul runs on the M5
+Neural Accelerators with the SVD low-rank branch, scales and bias fused into
+the kernel epilogue. Q/K RMSNorm and RoPE run in a fused Metal kernel.
+
+- Requires macOS 26+ and a PyTorch build with MPS. With PyTorch 2.10 to 2.15 the
+  Metal kernels download from the Hugging Face Hub on first use (the `kernels`
+  dependency of `nunchaku-lite`). For other PyTorch versions, build them
+  locally: `pip install --no-build-isolation ./nunchaku-lite-kernels`
+- Choose the quantized-kernel backend with `backend=` on `load_nunchaku_pipeline`
+  or `patch_transformer` (the same keyword Diffusers uses for kernel selection in
+  `AutoRoundConfig`; unrelated to `set_attention_backend`). CUDA has a single
+  kernel and accepts only `"auto"`.
+  - `"auto"` (default): `"int8"` when the transformer fits in half of the GPU
+    working set with int8 weights, otherwise `"int4"`; `"dense"` on Apple GPUs
+    without Neural Accelerators (pre-M5).
+  - `"int8"`: fastest. `"int4"`: weights stay 4-bit in memory, a few percent
+    slower, identical output. `"dense"`: exact dequantized fallback (more
+    memory, no speedup).
+
+  ```python
+  pipe = load_nunchaku_pipeline(..., device="mps", backend="int4")
+  ```
+- INT4 checkpoints only (no NVFP4). Verified end to end with FLUX.2 Klein 4B and
+  9B, FLUX.1-dev (Nunchaku and Nunchaku Lite checkpoints), Z-Image Turbo, and
+  Qwen-Image Lightning (which needs more than 24 GB to run without swapping).
+
+On an M5 MacBook Pro (FLUX.2 Klein 4B, 4 steps, denoising only):
+
+| Transformer | Weights | Live GPU memory (1024px) | Step 512px | Step 1024px |
+| --- | --- | --- | --- | --- |
+| Dense BF16 | 7.75 GB | 8.1 GB | 1.20 s | 4.96 s |
+| INT4, `int8` backend (default) | 4.57 GB | 5.6 GB | 0.62 s (1.94x) | 2.27 s (2.19x) |
+| INT4, `int4` backend | 2.67 GB | 4.4 GB | 0.70 s (1.71x) | 2.50 s (1.98x) |
+
+The packed checkpoint `qweight` is released after conversion whenever the
+kernel copy reproduces it exactly (94 of 100 layers for `int8`, all layers for
+`int4`; AWQ modulation layers too); `state_dict()` re-packs it and
+`load_state_dict()` restores it.
+On M5-class GPUs the patched transformer's attention also runs on the Neural Accelerators (MLX's flash
+attention kernel) instead of PyTorch's MPS attention, and the q/k norm + RoPE of FLUX.1, FLUX.2, Qwen-Image and
+Z-Image is one fused kernel. Both come with the Hub kernels; with an older Hub build they are compiled at runtime
+instead. The dense BF16 row uses stock Diffusers.
+
+There is also an MLX runtime, `nunchaku_lite.mlx` (`pip install "nunchaku-lite[mlx]" mflux`),
+which loads the same checkpoints into [mflux](https://github.com/filipstrand/mflux)
+pipelines with the same `load_nunchaku_pipeline` interface. See
+[docs/mlx.md](docs/mlx.md).
+
 ## Installation
 
 Install from source:
 
 ```bash
-pip install .
+pip install .          # PyTorch runtime (CUDA, Apple MPS) for Diffusers pipelines
+pip install ".[mlx]"   # adds the MLX runtime (Apple silicon) for mflux pipelines
 ```
 
 This installs the root Python runtime and uses Hugging Face prebuilt kernels by
-default.
+default. `nunchaku_lite.mlx` does not import torch, even though the base install
+includes it.
 
 To build and use the local CUDA kernels package:
 

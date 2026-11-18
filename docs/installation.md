@@ -25,12 +25,14 @@ Clone the repository and install from the repository root:
 ```bash
 git clone https://github.com/rootonchair/nunchaku_lite.git
 cd nunchaku_lite
-pip install .
+pip install .          # PyTorch runtime (CUDA, Apple MPS)
+pip install ".[mlx]"   # adds the MLX runtime (Apple silicon), see mlx.md
 ```
 
 This installs the Python dependencies from `pyproject.toml` and builds the
 root Python package without compiling CUDA code. At runtime, `nunchaku_lite`
-uses Hugging Face prebuilt kernels by default.
+uses Hugging Face prebuilt kernels by default. The `mlx` extra adds `mlx` and
+`numpy`; `nunchaku_lite.mlx` does not import torch.
 
 ## Install Local CUDA Kernels
 

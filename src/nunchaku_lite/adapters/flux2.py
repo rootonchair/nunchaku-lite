@@ -11,11 +11,15 @@ from diffusers.models.embeddings import apply_rotary_emb
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.transformers.transformer_flux2 import (
     Flux2Attention,
+    Flux2AttnProcessor,
     Flux2FeedForward,
     Flux2ParallelSelfAttention,
+    Flux2ParallelSelfAttnProcessor,
+    _get_qkv_projections,
 )
 from torch import nn
 
+from ..checkpoint_keys import convert_flux2_state_dict, flux2_state_dict_needs_conversion
 from ..core import PatchOptions, register_adapter
 from ..ops.fused import fused_qkv_norm_rotary
 from .common import (
@@ -29,6 +33,7 @@ from .common import (
     prepare_transformer_dtype,
     svdq_from_linear,
 )
+from .mps_processors import fusable, fused_attention, real_rope_tables, register_mps_processor
 
 
 def _pack_flux2_rotary_emb(freqs_cis: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
@@ -555,7 +560,7 @@ class Flux2Adapter:
 
         transformer._nunchaku_lite_flux2_original_forward = transformer.forward
         transformer.forward = types.MethodType(lite_flux2_forward, transformer)
-        if _flux2_state_dict_needs_conversion(checkpoint_state):
+        if flux2_state_dict_needs_conversion(checkpoint_state):
             checkpoint_state = convert_flux2_state_dict(checkpoint_state)
         finalize_svdq_checkpoint(transformer, checkpoint_state, context)
         _drop_unused_zero_bias_tensors(transformer, checkpoint_state)
@@ -604,111 +609,6 @@ class Flux2Adapter:
         )
 
 
-def convert_flux2_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Normalize original Nunchaku Flux2 checkpoint keys to lite module names."""
-
-    if not _flux2_state_dict_needs_conversion(state_dict):
-        return state_dict
-
-    converted: dict[str, torch.Tensor] = {}
-    for key, value in state_dict.items():
-        new_key = key
-
-        if new_key.startswith("transformer_blocks.") and not any(
-            marker in new_key for marker in (".attn.", ".ff.", ".ff_context.")
-        ):
-            replacements = (
-                (".qkv_proj_context.", ".attn.to_added_qkv."),
-                (".qkv_proj.", ".attn.to_qkv."),
-                (".out_proj_context.", ".attn.to_add_out."),
-                (".out_proj.", ".attn.to_out.0."),
-                (".mlp_context_fc1.", ".ff_context.linear_in."),
-                (".mlp_context_fc2.", ".ff_context.linear_out."),
-                (".mlp_fc1.", ".ff.linear_in."),
-                (".mlp_fc2.", ".ff.linear_out."),
-                (".norm_added_q.", ".attn.norm_added_q."),
-                (".norm_added_k.", ".attn.norm_added_k."),
-                (".norm_q.", ".attn.norm_q."),
-                (".norm_k.", ".attn.norm_k."),
-            )
-            for old, new in replacements:
-                if old in new_key:
-                    new_key = new_key.replace(old, new, 1)
-                    break
-
-        elif new_key.startswith("single_transformer_blocks.") and ".attn." not in new_key:
-            replacements = (
-                (".qkv_proj.", ".attn.qkv_proj."),
-                (".mlp_fc1.", ".attn.mlp_fc1."),
-                (".out_proj.", ".attn.out_proj."),
-                (".mlp_fc2.", ".attn.mlp_fc2."),
-                (".norm_q.", ".attn.norm_q."),
-                (".norm_k.", ".attn.norm_k."),
-            )
-            for old, new in replacements:
-                if old in new_key:
-                    new_key = new_key.replace(old, new, 1)
-                    break
-
-        new_key = new_key.replace(".lora_down", ".proj_down")
-        new_key = new_key.replace(".lora_up", ".proj_up")
-        if ".smooth_orig" in new_key and ".smooth_factor_orig" not in new_key:
-            new_key = new_key.replace(".smooth_orig", ".smooth_factor_orig")
-        elif ".smooth" in new_key and ".smooth_factor" not in new_key:
-            new_key = new_key.replace(".smooth", ".smooth_factor")
-
-        converted[new_key] = value
-    return converted
-
-
-def _flux2_state_dict_needs_conversion(state_dict: dict[str, torch.Tensor]) -> bool:
-    return any(_is_uncorrected_flux2_key(key) for key in state_dict)
-
-
-def _is_uncorrected_flux2_key(key: str) -> bool:
-    double_block_key = key.startswith("transformer_blocks.")
-    single_block_key = key.startswith("single_transformer_blocks.")
-    if not double_block_key and not single_block_key:
-        return False
-
-    if key.endswith((".lora_down", ".lora_up", ".smooth", ".smooth_orig")):
-        return True
-
-    if double_block_key and not any(marker in key for marker in (".attn.", ".ff.", ".ff_context.")):
-        return any(
-            marker in key
-            for marker in (
-                ".qkv_proj_context.",
-                ".qkv_proj.",
-                ".out_proj_context.",
-                ".out_proj.",
-                ".mlp_context_fc1.",
-                ".mlp_context_fc2.",
-                ".mlp_fc1.",
-                ".mlp_fc2.",
-                ".norm_added_q.",
-                ".norm_added_k.",
-                ".norm_q.",
-                ".norm_k.",
-            )
-        )
-
-    if single_block_key and ".attn." not in key:
-        return any(
-            marker in key
-            for marker in (
-                ".qkv_proj.",
-                ".mlp_fc1.",
-                ".out_proj.",
-                ".mlp_fc2.",
-                ".norm_q.",
-                ".norm_k.",
-            )
-        )
-
-    return False
-
-
 def _drop_unused_zero_bias_tensors(transformer: torch.nn.Module, checkpoint_state: dict[str, torch.Tensor]) -> None:
     """Drop zero bias tensors emitted by original Flux2 checkpoints for biasless modules."""
 
@@ -720,5 +620,58 @@ def _drop_unused_zero_bias_tensors(transformer: torch.nn.Module, checkpoint_stat
         if torch.count_nonzero(value) == 0:
             checkpoint_state.pop(key)
 
+
+
+# ---------------------------------------------------------------------------
+# Stock Diffusers processors with the fused MPS q/k norm + RoPE prologue (manifest checkpoints on Apple silicon)
+# ---------------------------------------------------------------------------
+
+
+class MPSFusedFlux2AttnProcessor(Flux2AttnProcessor):
+    """Diffusers ``Flux2AttnProcessor`` (joint text + image attention) with the fused MPS prologue."""
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, image_rotary_emb=None):
+        joint = encoder_hidden_states is not None and attn.added_kv_proj_dim is not None
+        norms = (attn.norm_q, attn.norm_k) + ((attn.norm_added_q, attn.norm_added_k) if joint else ())
+        rows = hidden_states.shape[1] + (encoder_hidden_states.shape[1] if joint else 0)
+        tables = real_rope_tables(image_rotary_emb, rows)
+        if (
+            attention_mask is not None
+            or tables is None
+            or (encoder_hidden_states is not None and not joint)
+            or not fusable(hidden_states, attn.head_dim, norms)
+        ):
+            return super().__call__(attn, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb)
+        query, key, value, enc_query, enc_key, enc_value = _get_qkv_projections(
+            attn, hidden_states, encoder_hidden_states
+        )
+        text = (enc_query, enc_key, enc_value) if joint else None
+        out = fused_attention(self, (query, key, value), norms, tables, attn.heads, text=text)
+        if not joint:
+            return attn.to_out[1](attn.to_out[0](out))
+        lt = encoder_hidden_states.shape[1]
+        encoder_out, out = out.split_with_sizes([lt, out.shape[1] - lt], dim=1)
+        return attn.to_out[1](attn.to_out[0](out)), attn.to_add_out(encoder_out)
+
+
+class MPSFusedFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
+    """Diffusers ``Flux2ParallelSelfAttnProcessor`` (single-stream blocks) with the fused MPS prologue."""
+
+    def __call__(self, attn, hidden_states, attention_mask=None, image_rotary_emb=None):
+        norms = (attn.norm_q, attn.norm_k)
+        tables = real_rope_tables(image_rotary_emb, hidden_states.shape[1])
+        if attention_mask is not None or tables is None or not fusable(hidden_states, attn.head_dim, norms):
+            return super().__call__(attn, hidden_states, attention_mask, image_rotary_emb)
+        proj = attn.to_qkv_mlp_proj(hidden_states)
+        inner = attn.inner_dim
+        if proj.shape[-1] != 3 * inner + attn.mlp_hidden_dim * attn.mlp_mult_factor:  # column-sharded (TP)
+            return super().__call__(attn, hidden_states, attention_mask, image_rotary_emb)
+        qkv = (proj[..., :inner], proj[..., inner : 2 * inner], proj[..., 2 * inner : 3 * inner])
+        out = fused_attention(self, qkv, norms, tables, attn.heads)
+        return attn.to_out(torch.cat([out, attn.mlp_act_fn(proj[..., 3 * inner :])], dim=-1))
+
+
+register_mps_processor(Flux2AttnProcessor, MPSFusedFlux2AttnProcessor)
+register_mps_processor(Flux2ParallelSelfAttnProcessor, MPSFusedFlux2ParallelSelfAttnProcessor)
 
 register_adapter(Flux2Adapter())

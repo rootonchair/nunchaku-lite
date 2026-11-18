@@ -1,4 +1,5 @@
 recursive-include nunchaku_lite_kernels_cuda *.cpp *.h *.hpp *.ipp *.cu *.cuh
+recursive-include nunchaku_lite_kernels_metal *.cpp *.h *.hpp *.mm
 recursive-include torch-ext *.py *.cpp *.h *.hpp *.ipp
 
 include build.toml

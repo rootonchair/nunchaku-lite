@@ -71,6 +71,48 @@ current porting backlog for `nunchaku_lite`:
 - [ ] Remove monkey-patched transformer forward overrides in favor of module
   wrappers or inherited transformer implementations.
 
+## Apple Silicon / MLX Backlog
+
+`nunchaku_lite.mlx` (`pip install "nunchaku-lite[mlx]"`) provides an MLX `SVDQW4A4Linear` and `patch_transformer` (same API as `nunchaku_lite`) with fused W8A8/W4A8 Metal
+kernels for M5-class Neural Accelerators, plus a portable W4A16 fallback.
+
+- [x] Unpack Nunchaku INT4 SVDQ layouts (weights, scales, smooth, bias,
+  low-rank) to logical tensors.
+- [x] Fused int8 Neural Accelerator GEMM with scale, bias, and low-rank
+  epilogue (`w8a8`, `w4a8`).
+- [x] Fused per-token int8 activation quantization kernel.
+- [x] PyTorch MPS ops in `nunchaku-lite-kernels` (`svdq_quantize_act_int8`,
+  `svdq_gemm_w8a8`, `svdq_gemm_w4a8`), prebuilt on the Hub (`v2`) or built locally via `setup.py`.
+- [x] Hub (kernel-builder) Metal build: `cpp-metal` kernel section in
+  `build.toml`, built with Nix on a Mac and published in the `v2` branch.
+- [x] Wire the MPS ops into `nunchaku_lite`: SVDQ / AWQ modules and the fused
+  GELU-MLP and QKV-norm-RoPE ops dispatch to `nunchaku_lite.ops.mps` on MPS
+  tensors (verified end to end with FLUX.2 Klein 4B).
+- [x] Fused Metal QK RMSNorm + RoPE op. Now one kernel body shared by MLX and MPS
+  (`nunchaku_lite/shaders.py`), Hub op `qk_norm_rope_mps_` (compiled at runtime with older Hub builds); the
+  earlier Hub op `svdq_qk_norm_rope_` is no longer called (kept for compatibility).
+- [x] Verify FLUX.1 (Nunchaku and Nunchaku Lite checkpoints), Z-Image, and runtime LoRA on MPS.
+- [x] Verify Qwen-Image on MPS.
+- [x] Faster attention on MPS: MLX's Neural Accelerator flash attention (M5), Hub op `attention_mps`, plus
+  fused q/k norm + RoPE for FLUX.1, FLUX.2, Qwen-Image and Z-Image on both MPS and MLX (Nunchaku processors and
+  Diffusers' stock processors on manifest checkpoints).
+- [ ] Quantized T5 (TinyChat AWQ g128) on MPS.
+- [x] Investigated fusing activation quantization into the producing GEMM's epilogue; not pursued.
+  On FLUX.2 Klein 4B (MLX), activation quantization plus the low-rank down projection cost 0.5-2.2 ms
+  per linear; removing both entirely would save about 70 ms of a 1.81 s step (under 4%). Most inputs
+  come from attention, SwiGLU or norms rather than a GEMM, and a per-token scale needs the whole row,
+  which spans threadgroups. Fusing the down projection into the quantizer saves at most ~14 ms per step.
+- [x] MLX `load_nunchaku_pipeline` on mflux with a `flux2` adapter (FLUX.2 Klein,
+  verified end to end); AWQ W4A16 layers and lazy `qweight` release on MLX.
+- [x] MLX adapters for FLUX.1 and Z-Image; base transformer weights are no longer loaded.
+- [x] MLX adapter for Qwen-Image (verified end to end).
+- [x] Low-rank branch as a second Neural Accelerator matmul in the GEMM epilogue.
+- [ ] End-to-end image benchmarks.
+- [ ] Free the text encoder after encoding on MLX, so Qwen-Image fits a 24 GB Mac.
+- [ ] NVFP4 on Apple GPUs: the accelerators have no fp4 input type; fp4 x 2 converts exactly to int8,
+  but the scale every 16 values needs a different kernel design.
+- [ ] Add `backend=` to Diffusers' own `NunchakuLiteQuantizationConfig` (following `AutoRoundConfig`).
+
 ## Runtime Manifest Adapter Backlog
 
 The generic `manifest` adapter currently covers checkpoint-driven linear

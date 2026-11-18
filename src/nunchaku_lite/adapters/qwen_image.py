@@ -11,6 +11,7 @@ from diffusers.models.attention import AttentionModuleMixin, FeedForward
 from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.transformers.transformer_qwenimage import (
+    QwenDoubleStreamAttnProcessor2_0,
     QwenImageTransformerBlock,
     apply_rotary_emb_qwen,
 )
@@ -27,6 +28,13 @@ from .common import (
     patch_modules_recursively,
     prepare_transformer_dtype,
     svdq_from_linear,
+)
+from .mps_processors import (
+    complex_rope_tables,
+    fusable,
+    fused_attention,
+    fused_qk_norm_rope,
+    register_mps_processor,
 )
 
 
@@ -160,9 +168,44 @@ class NunchakuQwenImageAttnProcessor:
             raise ValueError("NunchakuQwenImageAttnProcessor requires encoder_hidden_states")
 
         seq_txt = encoder_hidden_states.shape[1]
-        img_query, img_key, img_value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
-        txt_query, txt_key, txt_value = attn.add_qkv_proj(encoder_hidden_states).chunk(3, dim=-1)
+        img_qkv = attn.to_qkv(hidden_states).chunk(3, dim=-1)
+        txt_qkv = attn.add_qkv_proj(encoder_hidden_states).chunk(3, dim=-1)
+        # On MPS: one kernel for the q/k norms, RoPE and head layout (both branches share the projections).
+        norms = (attn.norm_q, attn.norm_k, attn.norm_added_q, attn.norm_added_k)
+        tables = None
+        if image_rotary_emb is not None and fusable(hidden_states, img_qkv[0].shape[-1] // attn.heads, norms):
+            img_freqs, txt_freqs = image_rotary_emb
+            tables = complex_rope_tables((txt_freqs, img_freqs), seq_txt + hidden_states.shape[1])
+        if tables is not None:
+            joint_query, joint_key, joint_value = fused_qk_norm_rope(img_qkv, norms, tables, attn.heads, text=txt_qkv)
+        else:
+            joint_query, joint_key, joint_value = self._unfused_qkv(attn, img_qkv, txt_qkv, image_rotary_emb)
+        joint_hidden_states = dispatch_attention_fn(
+            joint_query,
+            joint_key,
+            joint_value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            backend=getattr(attn, "_attention_backend", None),
+            parallel_config=getattr(attn, "_parallel_config", None),
+        )
+        joint_hidden_states = joint_hidden_states.flatten(2, 3).to(joint_query.dtype)
 
+        txt_attn_output = joint_hidden_states[:, :seq_txt]
+        img_attn_output = joint_hidden_states[:, seq_txt:]
+        img_attn_output = attn.to_out[0](img_attn_output.contiguous())
+        if len(attn.to_out) > 1:
+            img_attn_output = attn.to_out[1](img_attn_output)
+        txt_attn_output = attn.to_add_out(txt_attn_output.contiguous())
+        return img_attn_output, txt_attn_output
+
+    @staticmethod
+    def _unfused_qkv(attn, img_qkv, txt_qkv, image_rotary_emb):
+        """Joint ``(q, k, v)`` ``(B, Lt + Li, heads, head_dim)`` with q/k norms and RoPE applied separately."""
+
+        img_query, img_key, img_value = img_qkv
+        txt_query, txt_key, txt_value = txt_qkv
         img_query = img_query.unflatten(-1, (attn.heads, -1))
         img_key = img_key.unflatten(-1, (attn.heads, -1))
         img_value = img_value.unflatten(-1, (attn.heads, -1))
@@ -189,25 +232,7 @@ class NunchakuQwenImageAttnProcessor:
         joint_query = torch.cat([txt_query, img_query], dim=1)
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
-        joint_hidden_states = dispatch_attention_fn(
-            joint_query,
-            joint_key,
-            joint_value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-            backend=getattr(attn, "_attention_backend", None),
-            parallel_config=getattr(attn, "_parallel_config", None),
-        )
-        joint_hidden_states = joint_hidden_states.flatten(2, 3).to(joint_query.dtype)
-
-        txt_attn_output = joint_hidden_states[:, :seq_txt]
-        img_attn_output = joint_hidden_states[:, seq_txt:]
-        img_attn_output = attn.to_out[0](img_attn_output.contiguous())
-        if len(attn.to_out) > 1:
-            img_attn_output = attn.to_out[1](img_attn_output)
-        txt_attn_output = attn.to_add_out(txt_attn_output.contiguous())
-        return img_attn_output, txt_attn_output
+        return joint_query, joint_key, joint_value
 
 
 class NunchakuQwenAttention(nn.Module, AttentionModuleMixin):
@@ -608,5 +633,53 @@ class QwenImageAdapter:
             },
         )
 
+
+
+class MPSFusedQwenDoubleStreamAttnProcessor(QwenDoubleStreamAttnProcessor2_0):
+    """Diffusers ``QwenDoubleStreamAttnProcessor2_0`` (manifest checkpoints) with the fused MPS q/k norm + RoPE
+    prologue (see :mod:`nunchaku_lite.adapters.mps_processors`)."""
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        encoder_hidden_states_mask=None,
+        attention_mask=None,
+        image_rotary_emb=None,
+    ):
+        norms = (attn.norm_q, attn.norm_k, attn.norm_added_q, attn.norm_added_k)
+        tables = None
+        if (
+            encoder_hidden_states is not None
+            and attention_mask is None
+            and image_rotary_emb is not None
+            and fusable(hidden_states, attn.inner_dim // attn.heads, norms)
+        ):
+            img_freqs, txt_freqs = image_rotary_emb
+            tables = complex_rope_tables((txt_freqs, img_freqs), encoder_hidden_states.shape[1] + hidden_states.shape[1])
+        if tables is None:
+            return super().__call__(
+                attn, hidden_states, encoder_hidden_states, encoder_hidden_states_mask, attention_mask, image_rotary_emb
+            )
+        lt = encoder_hidden_states.shape[1]
+        image = (attn.to_q(hidden_states), attn.to_k(hidden_states), attn.to_v(hidden_states))
+        text = (
+            attn.add_q_proj(encoder_hidden_states),
+            attn.add_k_proj(encoder_hidden_states),
+            attn.add_v_proj(encoder_hidden_states),
+        )
+        mask = None
+        if encoder_hidden_states_mask is not None:
+            image_mask = torch.ones((1, hidden_states.shape[1]), dtype=torch.bool, device=hidden_states.device)
+            mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)[:, None, None, :]
+        out = fused_attention(self, image, norms, tables, attn.heads, text=text, mask=mask)
+        img_out = attn.to_out[0](out[:, lt:].contiguous())
+        if len(attn.to_out) > 1:
+            img_out = attn.to_out[1](img_out)
+        return img_out, attn.to_add_out(out[:, :lt].contiguous())
+
+
+register_mps_processor(QwenDoubleStreamAttnProcessor2_0, MPSFusedQwenDoubleStreamAttnProcessor)
 
 register_adapter(QwenImageAdapter())

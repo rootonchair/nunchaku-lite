@@ -108,6 +108,39 @@ def _fake_fused_cross_head_qk_norm_rope(
     return [torch.empty_like(q), torch.empty_like(k)]
 
 
+@torch.library.register_fake(add_op_namespace_prefix("svdq_quantize_act_int8"))
+def _fake_svdq_quantize_act_int8(x, inv_smooth, shift: float):
+    return x.new_empty(x.shape, dtype=torch.int8), x.new_empty(x.shape[:1], dtype=torch.float32)
+
+
+@torch.library.register_fake(add_op_namespace_prefix("svdq_gemm_w8a8"))
+def _fake_svdq_gemm_w8a8(a, w8, ascale, wsc, lact, lup, bias):
+    return lact.new_empty((a.shape[0], w8.shape[0]))
+
+
+@torch.library.register_fake(add_op_namespace_prefix("svdq_gemm_w4a8"))
+def _fake_svdq_gemm_w4a8(a, w4, wr, ascale, wsc, lact, lup, bias):
+    return lact.new_empty((a.shape[0], w4.shape[0]))
+
+
+@torch.library.register_fake(add_op_namespace_prefix("svdq_qk_norm_rope_"))
+def _fake_svdq_qk_norm_rope_(qkv, norm_q, norm_k, rope, eps_q: float, eps_k: float, heads: int, seq_len: int) -> None:
+    return None
+
+
+@torch.library.register_fake(add_op_namespace_prefix("qk_norm_rope_mps_"))
+def _fake_qk_norm_rope_mps_(
+    qi, ki, vi, qt, kt, vt, wqi, wki, wqt, wkt, cos, sin, q_out, k_out, v_out,
+    eps_q: float, eps_k: float, heads: int, rot_rows: int, cs_pair: int, os_h: int, os_l: int,
+) -> None:  # fmt: skip
+    return None
+
+
+@torch.library.register_fake(add_op_namespace_prefix("attention_mps"))
+def _fake_attention_mps(q, k, v, mask, scale: float):
+    return q.new_empty(q.shape)
+
+
 def _get_ops():
     try:
         _ = ops.gemm_w4a4
@@ -125,6 +158,13 @@ fused_affine_modulate = ops.fused_affine_modulate
 fused_cross_head_qk_norm_rope = ops.fused_cross_head_qk_norm_rope
 gemv_awq = ops.gemv_awq
 attention_fp16 = ops.attention_fp16
+# MPS (Metal) SVDQ ops; implemented for the MPS device only.
+svdq_quantize_act_int8 = ops.svdq_quantize_act_int8
+svdq_gemm_w8a8 = ops.svdq_gemm_w8a8
+svdq_gemm_w4a8 = ops.svdq_gemm_w4a8
+svdq_qk_norm_rope_ = ops.svdq_qk_norm_rope_
+qk_norm_rope_mps_ = ops.qk_norm_rope_mps_
+attention_mps = ops.attention_mps
 
 
 def _ceil_divide(a: int, b: int) -> int:
@@ -280,6 +320,7 @@ def attention_fp16_cuda(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, o: to
 __all__ = [
     "attention_fp16",
     "attention_fp16_cuda",
+    "attention_mps",
     "awq_gemm_w4a16_g64_int32",
     "awq_gemm_w4a16_g128_int16",
     "awq_gemv_w4a16_cuda",
@@ -289,7 +330,12 @@ __all__ = [
     "gemm_w4a4",
     "gemv_awq",
     "ops",
+    "qk_norm_rope_mps_",
     "quantize_w4a4_act_fuse_lora",
     "svdq_gemm_w4a4_cuda",
+    "svdq_gemm_w4a8",
+    "svdq_gemm_w8a8",
+    "svdq_qk_norm_rope_",
+    "svdq_quantize_act_int8",
     "svdq_quantize_w4a4_act_fuse_lora_cuda",
 ]

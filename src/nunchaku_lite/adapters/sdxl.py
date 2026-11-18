@@ -13,8 +13,8 @@ from diffusers.models.unets.unet_2d_blocks import (
     UNetMidBlock2DCrossAttn,
 )
 from torch import nn
-from torch.nn import functional as F
 
+from nunchaku_lite.adapters.attention_dispatch import dispatch_lite_attention_fn
 from nunchaku_lite.adapters.common import (
     SVDQPatchContext,
     build_svdq_context,
@@ -147,7 +147,7 @@ class NunchakuSDXLAttnProcessor:
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
-        hidden_states = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
+        hidden_states = dispatch_lite_attention_fn(query, key, value, query_layout="bhsd", output_layout="bhsd")
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
 

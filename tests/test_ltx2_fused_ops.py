@@ -11,10 +11,11 @@ from nunchaku_lite.ops.fused import (
 
 
 def _has_native_cross_head_qk_op() -> bool:
+    # Same lookup as nunchaku_lite.ops.fused (local nunchaku_lite_kernels build, else the Hub kernels).
     try:
-        from nunchaku_lite._C import ops
+        from nunchaku_lite.ops.backend import get_ops
 
-        return hasattr(ops, "fused_cross_head_qk_norm_rope")
+        return hasattr(get_ops(), "fused_cross_head_qk_norm_rope")
     except Exception:  # noqa: BLE001 - feature probe: any failure means "unavailable", so skip
         return False
 

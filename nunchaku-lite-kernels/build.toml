@@ -3,7 +3,7 @@ name = "nunchaku-lite-kernels"
 version = 2
 edition = 6
 license = "Apache-2.0"
-backends = ["cuda"]
+backends = ["cuda", "metal"]
 
 [general.hub]
 repo-id = "rootonchair/nunchaku-lite-kernels"
@@ -11,6 +11,7 @@ repo-id = "rootonchair/nunchaku-lite-kernels"
 [torch]
 include = [
     "nunchaku_lite_kernels_cuda",
+    "nunchaku_lite_kernels_metal",
     "torch-ext",
 ]
 src = [
@@ -19,6 +20,7 @@ src = [
     "torch-ext/torch_binding.cpp",
     "torch-ext/torch_binding.h",
     "nunchaku_lite_kernels_cuda/torch_registration.h",
+    "nunchaku_lite_kernels_metal/svdq_metal.hpp",
 ]
 
 [kernel.nunchaku_lite_kernels]
@@ -99,4 +101,19 @@ src = [
     "nunchaku_lite_kernels_cuda/kernels/awq/gemv_awq.h",
     "nunchaku_lite_kernels_cuda/kernels/awq/dequantize.cuh",
     "nunchaku_lite_kernels_cuda/kernels/awq/semaphore.h",
+]
+
+# SVDQ W8A8 / W4A8 kernels for the PyTorch MPS backend (Neural Accelerators, M5-class GPUs, macOS 26+).
+# The shaders are compiled at runtime from the source strings in *_shaders.hpp, so no .metal files are
+# listed. The headers use .hpp because kernel-builder treats .h files in a Metal kernel as shader sources.
+[kernel.nunchaku_lite_kernels_metal]
+language = "cpp-metal"
+depends = ["torch"]
+include = ["nunchaku_lite_kernels_metal"]
+src = [
+    "nunchaku_lite_kernels_metal/svdq_metal.mm",
+    "nunchaku_lite_kernels_metal/svdq_metal.hpp",
+    "nunchaku_lite_kernels_metal/svdq_shaders.hpp",
+    "nunchaku_lite_kernels_metal/qk_norm_rope_shaders.hpp",
+    "nunchaku_lite_kernels_metal/lite_shaders.hpp",
 ]

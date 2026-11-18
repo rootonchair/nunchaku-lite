@@ -6,11 +6,13 @@ import sys
 import setuptools
 import torch
 from packaging import version as packaging_version
-from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
+from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CppExtension, CUDAExtension
 
 
 class CustomBuildExtension(BuildExtension):
     def build_extensions(self):
+        if ".mm" not in self.compiler.src_extensions:
+            self.compiler.src_extensions.append(".mm")  # Objective-C++ (Metal launchers)
         for ext in self.extensions:
             ext.extra_compile_args.setdefault("cxx", [])
             ext.extra_compile_args.setdefault("nvcc", [])
@@ -71,79 +73,112 @@ if __name__ == "__main__":
         or "0.1.0dev"
     )
 
-    if torch.version.cuda is None:
-        raise RuntimeError("nunchaku_lite_kernels requires a CUDA-enabled PyTorch build")
     torch_version = torch.__version__.split("+")[0]
     torch_major_minor_version = ".".join(torch_version.split(".")[:2])
-    version = f"{base_version}+cu{torch.version.cuda}torch{torch_major_minor_version}"
 
     def here(path: str) -> str:
         return os.path.join(root_dir, path)
 
-    sm_targets = get_sm_targets()
-    print(f"Detected SM targets: {sm_targets}", file=sys.stderr)
+    def setup_package(version: str, extension: setuptools.Extension, description: str) -> None:
+        setuptools.setup(
+            name="nunchaku_lite_kernels",
+            version=version,
+            description=description,
+            package_dir={"": "torch-ext"},
+            packages=setuptools.find_packages(where="torch-ext", include=["nunchaku_lite_kernels"]),
+            ext_modules=[extension],
+            cmdclass={"build_ext": CustomBuildExtension},
+        )
 
-    gcc_flags = ["-DENABLE_BF16=1", "-DBUILD_NUNCHAKU=1", "-fvisibility=hidden", "-g", "-std=c++20", "-UNDEBUG", "-Og"]
-    msvc_flags = ["/DENABLE_BF16=1", "/DBUILD_NUNCHAKU=1", "/std:c++20", "/UNDEBUG", "/Zc:__cplusplus", "/FS"]
-    nvcc_threads = os.getenv("NUNCHAKU_NVCC_THREADS", str(len(sm_targets)))
-    nvcc_flags = [
-        "-DENABLE_BF16=1",
-        "-DBUILD_NUNCHAKU=1",
-        "-g",
-        "-std=c++20",
-        "-UNDEBUG",
-        "-Xcudafe",
-        "--diag_suppress=20208",
-        "-U__CUDA_NO_HALF_OPERATORS__",
-        "-U__CUDA_NO_HALF_CONVERSIONS__",
-        "-U__CUDA_NO_HALF2_OPERATORS__",
-        "-U__CUDA_NO_HALF2_CONVERSIONS__",
-        "-U__CUDA_NO_BFLOAT16_OPERATORS__",
-        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        "-U__CUDA_NO_BFLOAT162_OPERATORS__",
-        "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
-        f"--threads={nvcc_threads}",
-        "--expt-relaxed-constexpr",
-        "--expt-extended-lambda",
-    ]
-    if os.getenv("NUNCHAKU_BUILD_WHEELS", "0") == "0":
-        nvcc_flags.append("--generate-line-info")
-    for target in sm_targets:
-        nvcc_flags += ["-gencode", f"arch=compute_{target},code=sm_{target}"]
+    if sys.platform == "darwin":
+        # Apple silicon: SVDQ W8A8/W4A8 Metal kernels exposed as MPS dispatcher ops.
+        if not torch.backends.mps.is_built():
+            raise RuntimeError("nunchaku_lite_kernels on macOS requires a PyTorch build with MPS support")
+        metal_flags = ["-std=c++20", "-fvisibility=hidden", "-O2", "-Wno-unused-function"]
+        extension = CppExtension(
+            name="nunchaku_lite_kernels._C",
+            sources=[
+                "nunchaku_lite_kernels_metal/torch_dispatch_metal.cpp",
+                "nunchaku_lite_kernels_metal/svdq_metal.mm",
+            ],
+            extra_compile_args={"cxx": [], "gcc": metal_flags, "msvc": [], "nvcc": [], "nvcc_msvc": []},
+            extra_link_args=["-framework", "Metal", "-framework", "Foundation"],
+            include_dirs=[here("nunchaku_lite_kernels_metal")],
+        )
+        setup_package(
+            f"{base_version}+mpstorch{torch_major_minor_version}",
+            extension,
+            "Local kernel package for nunchaku_lite (Metal / MPS).",
+        )
+    else:
+        if torch.version.cuda is None:
+            raise RuntimeError("nunchaku_lite_kernels requires a CUDA-enabled PyTorch build")
+        version = f"{base_version}+cu{torch.version.cuda}torch{torch_major_minor_version}"
 
-    extension = CUDAExtension(
-        name="nunchaku_lite_kernels._C",
-        sources=[
-            "nunchaku_lite_kernels_cuda/pybind.cpp",
-            "nunchaku_lite_kernels_cuda/torch_dispatch.cpp",
-            "nunchaku_lite_kernels_cuda/interop/torch.cpp",
-            "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4.cu",
-            "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_fp16_int4.cu",
-            "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_fp16_int4_fasteri2f.cu",
-            "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_fp16_fp4.cu",
-            "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_bf16_int4.cu",
-            "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_bf16_fp4.cu",
-            "nunchaku_lite_kernels_cuda/kernels/zgemm/attention.cu",
-            "nunchaku_lite_kernels_cuda/kernels/awq/gemm_awq.cu",
-            "nunchaku_lite_kernels_cuda/kernels/awq/gemv_awq.cu",
-            "nunchaku_lite_kernels_cuda/kernels/modulation.cu",
-            "nunchaku_lite_kernels_cuda/kernels/cross_head_qk_norm_rope.cu",
-        ],
-        extra_compile_args={
-            "gcc": gcc_flags,
-            "msvc": msvc_flags,
-            "nvcc": nvcc_flags,
-            "nvcc_msvc": ["-Xcompiler", "/Zc:__cplusplus", "-Xcompiler", "/FS", "-Xcompiler", "/bigobj"],
-        },
-        include_dirs=[here("nunchaku_lite_kernels_cuda")],
-    )
+        sm_targets = get_sm_targets()
+        print(f"Detected SM targets: {sm_targets}", file=sys.stderr)
 
-    setuptools.setup(
-        name="nunchaku_lite_kernels",
-        version=version,
-        description="Local CUDA kernel package for nunchaku_lite.",
-        package_dir={"": "torch-ext"},
-        packages=setuptools.find_packages(where="torch-ext", include=["nunchaku_lite_kernels"]),
-        ext_modules=[extension],
-        cmdclass={"build_ext": CustomBuildExtension},
-    )
+        gcc_flags = [
+            "-DENABLE_BF16=1",
+            "-DBUILD_NUNCHAKU=1",
+            "-fvisibility=hidden",
+            "-g",
+            "-std=c++20",
+            "-UNDEBUG",
+            "-Og",
+        ]
+        msvc_flags = ["/DENABLE_BF16=1", "/DBUILD_NUNCHAKU=1", "/std:c++20", "/UNDEBUG", "/Zc:__cplusplus", "/FS"]
+        nvcc_threads = os.getenv("NUNCHAKU_NVCC_THREADS", str(len(sm_targets)))
+        nvcc_flags = [
+            "-DENABLE_BF16=1",
+            "-DBUILD_NUNCHAKU=1",
+            "-g",
+            "-std=c++20",
+            "-UNDEBUG",
+            "-Xcudafe",
+            "--diag_suppress=20208",
+            "-U__CUDA_NO_HALF_OPERATORS__",
+            "-U__CUDA_NO_HALF_CONVERSIONS__",
+            "-U__CUDA_NO_HALF2_OPERATORS__",
+            "-U__CUDA_NO_HALF2_CONVERSIONS__",
+            "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+            "-U__CUDA_NO_BFLOAT162_OPERATORS__",
+            "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
+            f"--threads={nvcc_threads}",
+            "--expt-relaxed-constexpr",
+            "--expt-extended-lambda",
+        ]
+        if os.getenv("NUNCHAKU_BUILD_WHEELS", "0") == "0":
+            nvcc_flags.append("--generate-line-info")
+        for target in sm_targets:
+            nvcc_flags += ["-gencode", f"arch=compute_{target},code=sm_{target}"]
+
+        extension = CUDAExtension(
+            name="nunchaku_lite_kernels._C",
+            sources=[
+                "nunchaku_lite_kernels_cuda/pybind.cpp",
+                "nunchaku_lite_kernels_cuda/torch_dispatch.cpp",
+                "nunchaku_lite_kernels_cuda/interop/torch.cpp",
+                "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4.cu",
+                "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_fp16_int4.cu",
+                "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_fp16_int4_fasteri2f.cu",
+                "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_fp16_fp4.cu",
+                "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_bf16_int4.cu",
+                "nunchaku_lite_kernels_cuda/kernels/zgemm/gemm_w4a4_launch_bf16_fp4.cu",
+                "nunchaku_lite_kernels_cuda/kernels/zgemm/attention.cu",
+                "nunchaku_lite_kernels_cuda/kernels/awq/gemm_awq.cu",
+                "nunchaku_lite_kernels_cuda/kernels/awq/gemv_awq.cu",
+                "nunchaku_lite_kernels_cuda/kernels/modulation.cu",
+                "nunchaku_lite_kernels_cuda/kernels/cross_head_qk_norm_rope.cu",
+            ],
+            extra_compile_args={
+                "gcc": gcc_flags,
+                "msvc": msvc_flags,
+                "nvcc": nvcc_flags,
+                "nvcc_msvc": ["-Xcompiler", "/Zc:__cplusplus", "-Xcompiler", "/FS", "-Xcompiler", "/bigobj"],
+            },
+            include_dirs=[here("nunchaku_lite_kernels_cuda")],
+        )
+
+        setup_package(version, extension, "Local CUDA kernel package for nunchaku_lite.")

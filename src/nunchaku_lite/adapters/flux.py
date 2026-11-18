@@ -10,8 +10,10 @@ from diffusers.models.attention import AttentionModuleMixin, FeedForward
 from diffusers.models.normalization import AdaLayerNormZero, AdaLayerNormZeroSingle
 from diffusers.models.transformers.transformer_flux import (
     FluxAttention,
+    FluxAttnProcessor,
     FluxSingleTransformerBlock,
     FluxTransformerBlock,
+    _get_qkv_projections,
 )
 from packaging.version import Version
 from torch import nn
@@ -20,6 +22,7 @@ from torch.nn import GELU as TorchGELU
 from ..core import PatchOptions, register_adapter
 from ..linear import DenseRuntimeLoraLinear, SVDQW4A4Linear
 from ..ops.fused import fused_gelu_mlp, fused_qkv_norm_rotary
+from .attention_dispatch import dispatch_lite_attention_fn
 from .common import (
     SVDQPatchContext,
     build_svdq_context,
@@ -33,6 +36,7 @@ from .common import (
     prepare_transformer_dtype,
     svdq_from_linear,
 )
+from .mps_processors import fusable, fused_attention, real_rope_tables, register_mps_processor
 
 
 def rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
@@ -53,10 +57,11 @@ def rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
 
     if dim % 2 != 0:
         raise ValueError("Rotary dimension must be even.")
-    scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
+    freqs_dtype = torch.float32 if pos.device.type == "mps" else torch.float64  # MPS has no float64
+    scale = torch.arange(0, dim, 2, dtype=freqs_dtype, device=pos.device) / dim
     omega = 1.0 / (theta**scale)
     batch_size, seq_len = pos.shape
-    out = torch.einsum("...n,d->...nd", pos, omega)
+    out = torch.einsum("...n,d->...nd", pos.to(freqs_dtype), omega)
     out = torch.stack([torch.sin(out), torch.cos(out)], dim=-1)
     return out.view(batch_size, seq_len, dim // 2, 1, 2).float()
 
@@ -426,7 +431,9 @@ class NunchakuFluxAttnProcessor(nn.Module):
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
         ip_query = ip_query.transpose(1, 2)
-        output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0)
+        output = dispatch_lite_attention_fn(
+            query, key, value, attn_mask=attention_mask, query_layout="bhsd", output_layout="bhsd"
+        )
         output = output.transpose(1, 2).reshape(hidden_states.shape[0], -1, attn.heads * attn.head_dim)
         output = output.to(query.dtype)
 
@@ -990,5 +997,36 @@ def _is_uncorrected_flux_key(key: str) -> bool:
 
     return False
 
+
+
+class MPSFusedFluxAttnProcessor(FluxAttnProcessor):
+    """Diffusers ``FluxAttnProcessor`` (joint and single blocks of manifest checkpoints) with the fused MPS q/k norm
+    + RoPE prologue (see :mod:`nunchaku_lite.adapters.mps_processors`)."""
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, image_rotary_emb=None):
+        joint = encoder_hidden_states is not None and attn.added_kv_proj_dim is not None
+        norms = (attn.norm_q, attn.norm_k) + ((attn.norm_added_q, attn.norm_added_k) if joint else ())
+        rows = hidden_states.shape[1] + (encoder_hidden_states.shape[1] if joint else 0)
+        tables = real_rope_tables(image_rotary_emb, rows)
+        if (
+            attention_mask is not None
+            or tables is None
+            or (encoder_hidden_states is not None and not joint)
+            or not fusable(hidden_states, attn.head_dim, norms)
+        ):
+            return super().__call__(attn, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb)
+        query, key, value, enc_query, enc_key, enc_value = _get_qkv_projections(
+            attn, hidden_states, encoder_hidden_states
+        )
+        text = (enc_query, enc_key, enc_value) if joint else None
+        out = fused_attention(self, (query, key, value), norms, tables, attn.heads, text=text)
+        if not joint:
+            return out  # single blocks project the attention output together with the MLP
+        lt = encoder_hidden_states.shape[1]
+        encoder_out, out = out.split_with_sizes([lt, out.shape[1] - lt], dim=1)
+        return attn.to_out[1](attn.to_out[0](out.contiguous())), attn.to_add_out(encoder_out.contiguous())
+
+
+register_mps_processor(FluxAttnProcessor, MPSFusedFluxAttnProcessor)
 
 register_adapter(FluxAdapter())
