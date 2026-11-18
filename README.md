@@ -134,8 +134,8 @@ the kernel epilogue. Q/K RMSNorm and RoPE run in a fused Metal kernel.
   pipe = load_nunchaku_pipeline(..., device="mps", backend="int4")
   ```
 - INT4 checkpoints only (no NVFP4). Verified end to end with FLUX.2 Klein 4B and
-  9B, FLUX.1-dev (Nunchaku and Nunchaku Lite checkpoints), and Z-Image Turbo. The
-  Qwen-Image adapter uses the same code paths but is not yet verified on MPS.
+  9B, FLUX.1-dev (Nunchaku and Nunchaku Lite checkpoints), Z-Image Turbo, and
+  Qwen-Image Lightning (which needs more than 24 GB to run without swapping).
 
 On an M5 MacBook Pro (FLUX.2 Klein 4B, 4 steps, denoising only):
 

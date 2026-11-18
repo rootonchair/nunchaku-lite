@@ -10,10 +10,8 @@ All Apple-silicon work is on `rootonchair/macos` (PR #14):
 - `nunchaku_lite.mlx` (the `mlx` extra): MLX layers, `patch_transformer`, AWQ W4A16, and
   `load_nunchaku_pipeline` on mflux.
 
-Both test suites pass. FLUX.2 Klein 4B/9B, FLUX.1-dev and Z-Image Turbo are
-verified end to end on PyTorch MPS; FLUX.2 Klein, FLUX.1-dev and Z-Image Turbo
-on MLX. Qwen-Image is not verified on either yet: its INT4 checkpoint plus the
-15 GB text encoder need about 27 GB of downloads.
+Both test suites pass. FLUX.2 Klein 4B/9B, FLUX.1-dev, Z-Image Turbo and
+Qwen-Image Lightning are verified end to end on both PyTorch MPS and MLX.
 
 ## Model checks on PyTorch MPS (M5, 24 GB, 1024 px)
 
@@ -23,12 +21,15 @@ on MLX. Qwen-Image is not verified on either yet: its INT4 checkpoint plus the
 | FLUX.2 Klein 9B | `lite-infer/flux.2-klein-9b-nunchaku-lite-int4-r32` | 4 | 7.6 s (int8), 8.1 s (int4) | 11.5 GB (int8), 6.3 GB (int4) | correct |
 | FLUX.1-dev (Nunchaku Lite) | `lite-infer/flux.1-dev-nunchaku-lite-int4-r32` | 20 | 6.4 s (int4) | 13.4 GB | correct |
 | Z-Image Turbo | `nunchaku-tech/nunchaku-z-image-turbo` INT4 r128 | 8 | 4.35 s (int8) | 14.1 GB | correct |
+| Qwen-Image Lightning | `nunchaku-tech/nunchaku-qwen-image` INT4 r32, 4-step Lightning | 4 | 6.2-6.8 s steady (int4), 8.6 s median | 26.5 GB (swaps on 24 GB) | correct |
 | FLUX.2 Klein 4B + LoRA | `lite-infer/flux.2-klein-4b-nunchaku-lite-int4-r32` + `Barath/flux2-klein-yarn-art-lora` | 4 | about 3.5 s | 7.8 GB with text encoder | LoRA applies and scales; unload restores the base image bit-exactly |
 
 Step times exclude the text encoder, which was freed after encoding: on 24 GB
 the 9B pipeline swaps with its 8B text encoder resident. The FLUX.1 and Z-Image
 rows use the attention kernels and the AWQ release below; memory is the MPS
-driver's total after generation.
+driver's total after generation. Qwen-Image's 20B transformer is about 12 GB at
+int4 and does not fit next to its activations on 24 GB, so its first step swaps
+(30-70 s) and the median includes that; `backend="auto"` picks int4.
 
 The FLUX.1 Nunchaku Lite repo keeps its quantization settings only in
 `transformer/config.json` (no safetensors metadata, rank 64). The PyTorch loader
@@ -71,10 +72,19 @@ int4 kernel being 16% slower in isolation. `backend="auto"` picks int4 for the
 | FLUX.2 Klein 4B | `lite-infer/flux.2-klein-4b-nunchaku-lite-int4-r32` | 2.69 s (int8), 2.87 s (int4) | 7.8 GB (int8), 5.9 GB (int4) | 3.25 s, 5.5 GB | correct |
 | FLUX.1-dev | `lite-infer/flux.1-dev-nunchaku-lite-int4-r32` | 7.45-7.9 s (int4, 20 steps) | 22.7 GB | 11.48 s, 21.8 GB | correct |
 | Z-Image Turbo | `nunchaku-tech/nunchaku-z-image-turbo` INT4 r128 | 3.86 s (8 steps, 37 s per image) | 12.4 GB | not measured | correct |
+| Qwen-Image Lightning | `nunchaku-tech/nunchaku-qwen-image` INT4 r32, 4-step Lightning | 24 s (int4, swap-bound) | 30.1 GB | not measured | correct, matches MPS |
 
 Z-Image uses the bf16 `Tongyi-MAI/Z-Image-Turbo` repo for its text encoder and
 VAE; its 23 GB transformer is never downloaded (see `load_base_transformer` in
 `docs/mlx.md`). The mflux comparison would need that transformer.
+
+Qwen-Image likewise skips its 38 GB base transformer. On 24 GB it is swap-bound:
+mflux keeps the bf16 Qwen2.5-VL text encoder (about 16 GB) resident next to the
+12 GB transformer, so its step time measures swapping, not the kernels. The
+image matches the MPS run, which confirms the AdaNorm handling: the checkpoint's
+`img_mod` / `txt_mod` scale-chunk biases average 1.0, so `+1` is folded in and
+the adapter undoes it as for FLUX.1. Freeing or quantizing the text encoder
+after encoding (as the MPS script does) is the fix; see item 5.
 
 The FLUX.1-dev repo has no runtime manifest; the manifest is built from the
 target lists in its `config.json`. Its row uses 20 steps and guidance 3.5, with
@@ -111,9 +121,8 @@ the two-step warmup went from 87 s to 23 s.
 
 ### 2. Broaden model coverage (highest user value)
 
-3. **Verify Qwen-Image on MPS** (done for FLUX.1 and Z-Image, see above). Needs
-   about 27 GB of downloads: the INT4 checkpoint (11-12 GB) and the 15 GB
-   Qwen2.5-VL text encoder.
+3. **Verify Qwen-Image on MPS (done).** Correct at 6.2-6.8 s per steady step
+   (int4); 24 GB Macs swap on the first step.
 4. **AWQ checkpoint copy released on MPS (done).** AWQ layers run PyTorch's 4-bit
    MPS matmul (`aten._weight_int4pack_mm`). Its packed format is opaque, but the
    op itself decodes it exactly (an identity matrix with scale 1 and zero 8 gives
@@ -123,8 +132,9 @@ the two-step warmup went from 87 s to 23 s.
 5. **MLX adapters:** FLUX.1 and Z-Image are done (`z_image`, original Nunchaku
    checkpoints, which store fused `to_qkv` and SwiGLU `net.0.proj`). The MLX
    loader no longer loads the base transformer, so Qwen-Image (38 GB base
-   transformer) only needs its text encoder and VAE. A Qwen-Image adapter is
-   next, with the same download constraint as item 3.
+   transformer) only needs its text encoder and VAE. The Qwen-Image adapter
+   (`qwen_image`) is done and verified. Left: free the text encoder after
+   encoding on MLX, so Qwen-Image stops swapping on 24 GB.
 
 ### 3. Distribution
 
@@ -201,5 +211,5 @@ the two-step warmup went from 87 s to 23 s.
 
 ## Recommendation
 
-Merge PR #14 and add macOS CI (1-2). Then Qwen-Image on MPS and MLX (3, 5) once
-there is disk space for its downloads.
+Merge PR #14 (macOS CI is in). Next: free the text encoder after encoding on
+MLX so Qwen-Image fits 24 GB, then end-to-end image benchmarks.

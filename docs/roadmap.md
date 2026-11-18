@@ -92,7 +92,7 @@ kernels for M5-class Neural Accelerators, plus a portable W4A16 fallback.
   (`nunchaku_lite/shaders.py`), Hub op `qk_norm_rope_mps_` (compiled at runtime with older Hub builds); the
   earlier Hub op `svdq_qk_norm_rope_` is no longer called (kept for compatibility).
 - [x] Verify FLUX.1 (Nunchaku and Nunchaku Lite checkpoints), Z-Image, and runtime LoRA on MPS.
-- [ ] Verify Qwen-Image on MPS (needs about 27 GB of downloads).
+- [x] Verify Qwen-Image on MPS.
 - [x] Faster attention on MPS: MLX's Neural Accelerator flash attention (M5), Hub op `attention_mps`, plus
   fused FLUX.2 q/k norm + RoPE on MLX and MPS.
 - [ ] Quantized T5 (TinyChat AWQ g128) on MPS.
@@ -103,7 +103,7 @@ kernels for M5-class Neural Accelerators, plus a portable W4A16 fallback.
 - [x] MLX `load_nunchaku_pipeline` on mflux with a `flux2` adapter (FLUX.2 Klein,
   verified end to end); AWQ W4A16 layers and lazy `qweight` release on MLX.
 - [x] MLX adapters for FLUX.1 and Z-Image; base transformer weights are no longer loaded.
-- [ ] MLX adapter for Qwen-Image.
+- [x] MLX adapter for Qwen-Image (verified end to end).
 - [x] Low-rank branch as a second Neural Accelerator matmul in the GEMM epilogue.
 - [ ] End-to-end image benchmarks.
 

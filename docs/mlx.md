@@ -126,9 +126,9 @@ model = load_nunchaku_pipeline(
 image = model.generate_image(seed=42, prompt="a glass greenhouse at golden hour", num_inference_steps=8)
 ```
 
-Qwen-Image uses mflux's `QwenImage` and an original Nunchaku checkpoint
-(the adapter is unit-tested; the end-to-end check is pending) (for example
+Qwen-Image uses mflux's `QwenImage` and an original Nunchaku checkpoint (for example
 `nunchaku-tech/nunchaku-qwen-image/svdq-int4_r32-qwen-image-lightningv1.0-4steps.safetensors`).
+On 24 GB Macs it swaps: mflux keeps the 16 GB bf16 text encoder resident next to the 12 GB transformer.
 For the Lightning checkpoints, set the scheduler's time shift to `log(3)` at
 every resolution, as in the Diffusers example:
 
