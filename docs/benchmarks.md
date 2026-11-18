@@ -90,9 +90,9 @@ PyTorch MPS:
 | --- | --- | ---: | ---: | ---: |
 | FLUX.2 Klein 9B | `lite-infer/flux.2-klein-9b-nunchaku-lite-int4-r32` | 4 | 7.6 s (int8), 8.1 s (int4) | 11.5 GB (int8), 6.3 GB (int4) |
 | FLUX.1-dev | `nunchaku-tech/nunchaku-flux.1-dev` INT4 r32 | 20 | 8.5 s | 9.3 GB |
-| FLUX.1-dev | `lite-infer/flux.1-dev-nunchaku-lite-int4-r32` | 20 | 6.4 s (int4) | 13.4 GB |
+| FLUX.1-dev | `lite-infer/flux.1-dev-nunchaku-lite-int4-r32` | 20 | 5.24 s (int4) | 13.4 GB |
 | Z-Image Turbo | `nunchaku-tech/nunchaku-z-image-turbo` INT4 r128 | 8 | 4.35 s (int8) | 14.1 GB |
-| Qwen-Image Lightning | `nunchaku-tech/nunchaku-qwen-image` INT4 r32, 4-step | 4 | 6.2-6.8 s (int4) | 26.5 GB |
+| Qwen-Image Lightning | `nunchaku-tech/nunchaku-qwen-image` INT4 r32, 4-step | 4 | 4.8-7.4 s (int4, depends on swapping) | 26.7 GB |
 
 MLX (mflux pipelines; mflux q4 for comparison where it fits):
 

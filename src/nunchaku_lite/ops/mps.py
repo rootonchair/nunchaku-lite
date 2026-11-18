@@ -38,9 +38,9 @@ stored per layer as ``SVDQW4A4Linear.backend``):
 Two attention kernels come from the same ``nunchaku_lite_kernels`` build. When the installed build predates them,
 they are compiled at runtime with ``torch.mps.compile_shader`` from the same sources:
 
-* q/k RMSNorm + RoPE (:func:`qk_norm_rope_mps` for Diffusers' FLUX.2 processors, and in place on the dense qkv in
-  :func:`qkv_norm_rotary_mps` for the Nunchaku processors); op ``qk_norm_rope_mps_``. Its body is shared with the
-  MLX runtime (:data:`nunchaku_lite.shaders.QK_NORM_ROPE`).
+* q/k RMSNorm + RoPE (:func:`qk_norm_rope_mps` for Diffusers' processors and the Nunchaku Qwen-Image processor,
+  and in place on the dense qkv in :func:`qkv_norm_rotary_mps` for the other Nunchaku processors); op
+  ``qk_norm_rope_mps_``. Its body is shared with the MLX runtime (:data:`nunchaku_lite.shaders.QK_NORM_ROPE`).
 * :func:`attention_mps`: MLX's Neural Accelerator flash attention (vendored in :mod:`._mlx_steel_attention`),
   about 3.7x faster than PyTorch's MPS attention on M5-class GPUs, with lower error; op ``attention_mps``.
 """
@@ -925,13 +925,15 @@ def qk_norm_rope_mps(
     text_q_weight: torch.Tensor | None = None,
     text_k_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """q/k RMSNorm + RoPE for FLUX.2-style attention (head dim 128, batch 1) on MPS.
+    """q/k RMSNorm + interleaved-pair RoPE for attention with head dim 128 (batch 1) on MPS.
 
     Args:
         q, k, v: Image-token projections ``(1, Li, heads * 128)``. They may be column slices of one fused
             projection output; they must share the row stride.
         q_weight, k_weight: RMSNorm weights ``(128,)`` (``None``: no affine weight).
-        cos, sin: Diffusers rotary tables ``(Lt + Li, 128)`` (each pair's value repeated), text rows first.
+        cos, sin: Rotary tables, text rows first: ``(Lt + Li, 128)`` with each pair's value repeated (Diffusers'
+            FLUX tables), or ``(Lt + Li, 64)`` with one value per pair (the real / imaginary parts of a complex
+            table). Pair ``i`` is channels ``2i, 2i + 1``.
         heads: Number of attention heads.
         eps_q, eps_k: RMSNorm epsilons.
         text: Optional text-token ``(q, k, v)`` placed before the image rows (joint attention).
@@ -948,8 +950,10 @@ def qk_norm_rope_mps(
             raise ValueError("q, k and v must share dtype, width heads * 128 and row stride.")
     image, txt = groups[0], (groups[1] if text is not None else None)
     total = image[0].shape[0] + (txt[0].shape[0] if txt is not None else 0)
-    if cos.shape != (total, 128) or sin.shape != (total, 128):
-        raise ValueError(f"Rotary tables must be ({total}, 128), got {tuple(cos.shape)} and {tuple(sin.shape)}.")
+    if cos.shape != sin.shape or cos.shape not in ((total, 128), (total, 64)):
+        raise ValueError(
+            f"Rotary tables must be ({total}, 128) or ({total}, 64), got {tuple(cos.shape)} and {tuple(sin.shape)}."
+        )
     device = q.device
     wq, wk = _f32(q_weight, device), _f32(k_weight, device)
     wqt, wkt = (_f32(text_q_weight, device), _f32(text_k_weight, device)) if text is not None else (wq, wk)
@@ -957,7 +961,7 @@ def qk_norm_rope_mps(
     _launch_qk_norm_rope(
         image, txt, tuple(o.view(total, width) for o in out), (wqt, wkt, wq, wk),
         _f32(cos, device, total), _f32(sin, device, total), (eps_q, eps_k), heads,
-        rot_rows=total, cs_pair=2, out_strides=(128, width),
+        rot_rows=total, cs_pair=cos.shape[1] // 64, out_strides=(128, width),
     )  # fmt: skip
     return out
 

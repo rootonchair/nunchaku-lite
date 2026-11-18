@@ -28,6 +28,7 @@ from .common import (
     prepare_transformer_dtype,
     svdq_from_linear,
 )
+from .mps_processors import complex_rope_tables, fused_qk_norm_rope
 
 
 def _compute_text_seq_len_from_mask(
@@ -160,9 +161,46 @@ class NunchakuQwenImageAttnProcessor:
             raise ValueError("NunchakuQwenImageAttnProcessor requires encoder_hidden_states")
 
         seq_txt = encoder_hidden_states.shape[1]
-        img_query, img_key, img_value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
-        txt_query, txt_key, txt_value = attn.add_qkv_proj(encoder_hidden_states).chunk(3, dim=-1)
+        img_qkv = attn.to_qkv(hidden_states).chunk(3, dim=-1)
+        txt_qkv = attn.add_qkv_proj(encoder_hidden_states).chunk(3, dim=-1)
+        fused = None
+        if image_rotary_emb is not None and hidden_states.device.type == "mps":
+            # one MPS kernel for the q/k norms, RoPE and head layout (None when it does not apply)
+            img_freqs, txt_freqs = image_rotary_emb
+            tables = complex_rope_tables((txt_freqs, img_freqs))
+            if tables is not None and tables[0].shape[0] == seq_txt + hidden_states.shape[1]:
+                norms = (attn.norm_q, attn.norm_k, attn.norm_added_q, attn.norm_added_k)
+                fused = fused_qk_norm_rope(img_qkv, norms, *tables, attn.heads, text=txt_qkv)
+        if fused is not None:
+            joint_query, joint_key, joint_value = fused
+        else:
+            joint_query, joint_key, joint_value = self._unfused_qkv(attn, img_qkv, txt_qkv, image_rotary_emb)
+        joint_hidden_states = dispatch_attention_fn(
+            joint_query,
+            joint_key,
+            joint_value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            backend=getattr(attn, "_attention_backend", None),
+            parallel_config=getattr(attn, "_parallel_config", None),
+        )
+        joint_hidden_states = joint_hidden_states.flatten(2, 3).to(joint_query.dtype)
 
+        txt_attn_output = joint_hidden_states[:, :seq_txt]
+        img_attn_output = joint_hidden_states[:, seq_txt:]
+        img_attn_output = attn.to_out[0](img_attn_output.contiguous())
+        if len(attn.to_out) > 1:
+            img_attn_output = attn.to_out[1](img_attn_output)
+        txt_attn_output = attn.to_add_out(txt_attn_output.contiguous())
+        return img_attn_output, txt_attn_output
+
+    @staticmethod
+    def _unfused_qkv(attn, img_qkv, txt_qkv, image_rotary_emb):
+        """Joint ``(q, k, v)`` ``(B, Lt + Li, heads, head_dim)`` with q/k norms and RoPE applied separately."""
+
+        img_query, img_key, img_value = img_qkv
+        txt_query, txt_key, txt_value = txt_qkv
         img_query = img_query.unflatten(-1, (attn.heads, -1))
         img_key = img_key.unflatten(-1, (attn.heads, -1))
         img_value = img_value.unflatten(-1, (attn.heads, -1))
@@ -189,25 +227,7 @@ class NunchakuQwenImageAttnProcessor:
         joint_query = torch.cat([txt_query, img_query], dim=1)
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
-        joint_hidden_states = dispatch_attention_fn(
-            joint_query,
-            joint_key,
-            joint_value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-            backend=getattr(attn, "_attention_backend", None),
-            parallel_config=getattr(attn, "_parallel_config", None),
-        )
-        joint_hidden_states = joint_hidden_states.flatten(2, 3).to(joint_query.dtype)
-
-        txt_attn_output = joint_hidden_states[:, :seq_txt]
-        img_attn_output = joint_hidden_states[:, seq_txt:]
-        img_attn_output = attn.to_out[0](img_attn_output.contiguous())
-        if len(attn.to_out) > 1:
-            img_attn_output = attn.to_out[1](img_attn_output)
-        txt_attn_output = attn.to_add_out(txt_attn_output.contiguous())
-        return img_attn_output, txt_attn_output
+        return joint_query, joint_key, joint_value
 
 
 class NunchakuQwenAttention(nn.Module, AttentionModuleMixin):

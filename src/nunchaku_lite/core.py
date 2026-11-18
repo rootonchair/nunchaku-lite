@@ -342,15 +342,16 @@ def _load_quantized_encoder_component(
 
 
 def _install_mps_attention(transformer: torch.nn.Module) -> None:
-    """On Apple silicon: route stock FLUX.2 attention processors through the fused q/k norm + RoPE kernel, and run
-    the transformer's attention on the Neural Accelerators where supported (both fall back per call)."""
+    """On Apple silicon: route stock FLUX.1 / FLUX.2 / Qwen-Image / Z-Image attention processors through the fused
+    q/k norm + RoPE kernel, and run the transformer's attention on the Neural Accelerators where supported (both
+    fall back per call)."""
 
     if not torch.backends.mps.is_available():
         return
     from .adapters.attention_dispatch import install_mps_attention
-    from .adapters.flux2 import install_mps_flux2_processors
+    from .adapters.mps_processors import install_mps_fused_processors
 
-    install_mps_flux2_processors(transformer)
+    install_mps_fused_processors(transformer)
     install_mps_attention(transformer)
 
 

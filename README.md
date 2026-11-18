@@ -150,9 +150,9 @@ kernel copy reproduces it exactly (94 of 100 layers for `int8`, all layers for
 `int4`; AWQ modulation layers too); `state_dict()` re-packs it and
 `load_state_dict()` restores it.
 On M5-class GPUs the patched transformer's attention also runs on the Neural Accelerators (MLX's flash
-attention kernel) instead of PyTorch's MPS attention, and FLUX.2's q/k norm + RoPE is one fused kernel. Both
-come with the Hub kernels; with an older Hub build they are compiled at runtime instead. The dense BF16 row uses
-stock Diffusers.
+attention kernel) instead of PyTorch's MPS attention, and the q/k norm + RoPE of FLUX.1, FLUX.2, Qwen-Image and
+Z-Image is one fused kernel. Both come with the Hub kernels; with an older Hub build they are compiled at runtime
+instead. The dense BF16 row uses stock Diffusers.
 
 There is also an MLX runtime, `nunchaku_lite.mlx` (`pip install "nunchaku-lite[mlx]" mflux`),
 which loads the same checkpoints into [mflux](https://github.com/filipstrand/mflux)

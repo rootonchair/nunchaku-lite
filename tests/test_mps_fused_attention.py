@@ -1,18 +1,23 @@
-"""Fused FLUX.2 q/k norm + RoPE and Neural Accelerator attention on MPS: kernel numerics and the processor swap.
+"""Fused q/k norm + RoPE and Neural Accelerator attention on MPS: kernel numerics and the processor swaps.
 
 MPS tests run twice: with the ``nunchaku_lite_kernels`` ops ("hub") and with the runtime-compiled fallback.
 """
 
 import pytest
 import torch
+from diffusers.models.attention_processor import Attention
 from diffusers.models.embeddings import apply_rotary_emb
+from diffusers.models.transformers import transformer_flux as flux1
 from diffusers.models.transformers import transformer_flux2 as flux2
+from diffusers.models.transformers import transformer_qwenimage as qwen
+from diffusers.models.transformers import transformer_z_image as z_image
 
-from nunchaku_lite.adapters.flux2 import (
+from nunchaku_lite.adapters.mps_processors import (
     MPSFusedFlux2AttnProcessor,
     MPSFusedFlux2ParallelSelfAttnProcessor,
-    install_mps_flux2_processors,
+    install_mps_fused_processors,
 )
+from nunchaku_lite.adapters.qwen_image import NunchakuQwenImageAttnProcessor
 from nunchaku_lite.ops.mps import (
     attention_mps,
     attention_mps_available,
@@ -69,8 +74,8 @@ def test_install_swaps_stock_processors_and_falls_back_off_mps():
     joint, single = _modules("cpu", torch.float32)
     ref = _run(joint, single, "cpu", torch.float32)
     root = torch.nn.ModuleList([joint, single])
-    assert install_mps_flux2_processors(root) == 2
-    assert install_mps_flux2_processors(root) == 0  # already swapped
+    assert install_mps_fused_processors(root) == 2
+    assert install_mps_fused_processors(root) == 0  # already swapped
     assert isinstance(joint.processor, MPSFusedFlux2AttnProcessor)
     assert isinstance(single.processor, MPSFusedFlux2ParallelSelfAttnProcessor)
     for got, exp in zip(_run(joint, single, "cpu", torch.float32), ref):
@@ -82,10 +87,161 @@ def test_install_swaps_stock_processors_and_falls_back_off_mps():
 def test_fused_processors_match_stock_on_mps(dtype):
     joint, single = _modules("mps", dtype)
     ref = _run(joint, single, "mps", dtype)
-    install_mps_flux2_processors(torch.nn.ModuleList([joint, single]))
+    install_mps_fused_processors(torch.nn.ModuleList([joint, single]))
     for got, exp in zip(_run(joint, single, "mps", dtype), ref):
         tol = (3e-2 if dtype == torch.bfloat16 else 5e-3) * exp.float().abs().max().item()
         torch.testing.assert_close(got.float(), exp.float(), rtol=0, atol=tol)
+
+
+@pytest.fixture
+def kernel_calls(monkeypatch):
+    """Counts fused-kernel calls from the processors, so a silent fallback to the stock code fails the test."""
+    from nunchaku_lite.adapters import mps_processors
+
+    calls = []
+    real = mps_processors.qk_norm_rope_mps
+    monkeypatch.setattr(mps_processors, "qk_norm_rope_mps", lambda *a, **k: calls.append(1) or real(*a, **k))
+    return calls
+
+
+def _randomize_norms(*modules):
+    for m in modules:
+        for name, p in m.named_parameters():
+            if name.startswith("norm"):
+                p.data.uniform_(0.5, 1.5)
+
+
+def _complex_tables(n, device):
+    return torch.polar(torch.ones(n, 64), torch.rand(n, 64) * 6.28).to(device)
+
+
+def _flux1_case(device, dtype):
+    torch.manual_seed(0)
+    joint = flux1.FluxAttention(
+        query_dim=DIM, added_kv_proj_dim=DIM, dim_head=128, heads=HEADS, out_dim=DIM, context_pre_only=False, eps=1e-6
+    )
+    single = flux1.FluxAttention(query_dim=DIM, dim_head=128, heads=HEADS, out_dim=DIM, eps=1e-6, pre_only=True)
+    _randomize_norms(joint, single)
+    joint, single = joint.to(device, dtype), single.to(device, dtype)
+    x, ctx = (torch.randn(1, n, DIM, device=device, dtype=dtype) for n in (11, 5))
+    rope = _tables(16, device)
+
+    def run():
+        img, txt = joint(hidden_states=x, encoder_hidden_states=ctx, image_rotary_emb=rope)
+        return img, txt, single(hidden_states=torch.cat([ctx, x], dim=1), image_rotary_emb=rope)
+
+    return (joint, single), run, 2
+
+
+def _qwen_attention(device, dtype):
+    attn = Attention(
+        query_dim=DIM, added_kv_proj_dim=DIM, dim_head=128, heads=HEADS, out_dim=DIM, context_pre_only=False,
+        bias=True, processor=qwen.QwenDoubleStreamAttnProcessor2_0(), qk_norm="rms_norm", eps=1e-6,
+    )  # fmt: skip
+    _randomize_norms(attn)
+    return attn.to(device, dtype)
+
+
+def _qwen_case(device, dtype, mask=False):
+    torch.manual_seed(0)
+    attn = _qwen_attention(device, dtype)
+    img, txt = torch.randn(1, 11, DIM, device=device, dtype=dtype), torch.randn(1, 5, DIM, device=device, dtype=dtype)
+    rope = (_complex_tables(11, device), _complex_tables(5, device))
+    text_mask = torch.tensor([[True, True, True, False, False]], device=device) if mask else None
+
+    def run():
+        return attn(
+            hidden_states=img, encoder_hidden_states=txt, encoder_hidden_states_mask=text_mask, image_rotary_emb=rope
+        )
+
+    return (attn,), run, 1
+
+
+def _z_image_case(device, dtype):
+    torch.manual_seed(0)
+    attn = Attention(
+        query_dim=DIM, dim_head=128, heads=HEADS, qk_norm="rms_norm", eps=1e-5, bias=False, out_bias=False,
+        processor=z_image.ZSingleStreamAttnProcessor(),
+    )  # fmt: skip
+    _randomize_norms(attn)
+    attn = attn.to(device, dtype)
+    x = torch.randn(1, 13, DIM, device=device, dtype=dtype)
+    freqs = _complex_tables(13, device)[None]
+    mask = torch.tensor([[True] * 10 + [False] * 3], device=device)
+
+    def run():
+        return attn(x, freqs_cis=freqs), attn(x, attention_mask=mask, freqs_cis=freqs)
+
+    return (attn,), run, 2
+
+
+_CASES = {
+    "flux1": _flux1_case,
+    "qwen_image": _qwen_case,
+    "qwen_image_masked": lambda d, t: _qwen_case(d, t, mask=True),
+    "z_image": _z_image_case,
+}
+
+
+def _assert_matches(got, expected, dtype):
+    got = got if isinstance(got, tuple) else (got,)
+    expected = expected if isinstance(expected, tuple) else (expected,)
+    for g, e in zip(got, expected, strict=True):
+        tol = (3e-2 if dtype == torch.bfloat16 else 5e-3) * e.float().abs().max().item()
+        torch.testing.assert_close(g.float(), e.float(), rtol=0, atol=tol)
+
+
+@needs_mps
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("family", sorted(_CASES))
+def test_fused_stock_processors_match_stock_on_mps(family, dtype, kernel_calls):
+    modules, run, calls = _CASES[family]("mps", dtype)
+    with torch.no_grad():
+        expected = run()
+        assert install_mps_fused_processors(torch.nn.ModuleList(modules)) == len(modules)
+        got = run()
+    assert len(kernel_calls) == calls
+    _assert_matches(got, expected, dtype)
+
+
+@needs_mps
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_nunchaku_qwen_processor_fuses_on_mps(dtype, kernel_calls):
+    from types import SimpleNamespace
+
+    torch.manual_seed(0)
+    stock = _qwen_attention("mps", dtype)
+
+    def fuse(names):
+        layers = [getattr(stock, n) for n in names]
+        fused = torch.nn.Linear(DIM, 3 * DIM).to("mps", dtype)
+        fused.weight.data = torch.cat([layer.weight for layer in layers])
+        fused.bias.data = torch.cat([layer.bias for layer in layers])
+        return fused
+
+    attn = SimpleNamespace(
+        heads=HEADS, to_qkv=fuse(("to_q", "to_k", "to_v")), add_qkv_proj=fuse(("add_q_proj", "add_k_proj", "add_v_proj")),
+        norm_q=stock.norm_q, norm_k=stock.norm_k, norm_added_q=stock.norm_added_q, norm_added_k=stock.norm_added_k,
+        to_out=stock.to_out, to_add_out=stock.to_add_out,
+    )  # fmt: skip
+    img, txt = torch.randn(1, 11, DIM, device="mps", dtype=dtype), torch.randn(1, 5, DIM, device="mps", dtype=dtype)
+    rope = (_complex_tables(11, "mps"), _complex_tables(5, "mps"))
+    with torch.no_grad():
+        expected = stock(hidden_states=img, encoder_hidden_states=txt, image_rotary_emb=rope)
+        got = NunchakuQwenImageAttnProcessor()(attn, img, txt, image_rotary_emb=rope)
+    assert len(kernel_calls) == 1
+    _assert_matches(got, expected, dtype)
+
+
+def test_install_swaps_every_supported_family_off_mps():
+    flux_modules, _, _ = _flux1_case("cpu", torch.float32)
+    qwen_modules, _, _ = _qwen_case("cpu", torch.float32)
+    z_modules, run, _ = _z_image_case("cpu", torch.float32)
+    expected = run()
+    root = torch.nn.ModuleList([*flux_modules, *qwen_modules, *z_modules])
+    assert install_mps_fused_processors(root) == 4
+    assert install_mps_fused_processors(root) == 0
+    _assert_matches(run(), expected, torch.float32)  # CPU: the stock processor runs (bit-exact)
 
 
 @needs_mps
