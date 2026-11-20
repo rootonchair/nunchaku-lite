@@ -182,6 +182,25 @@ def test_native_hadamard_op_rotates_after_per_channel_smoothing(dtype, fp4):
 
 
 @requires_native_hadamard
+def test_native_hadamard_op_does_not_overflow_fp16_on_coherent_blocks():
+    # 64 equal channels of 1100: the rotated result (8800 in one channel) fits fp16, but unscaled
+    # butterfly partial sums would reach 70400 > 65504 and overflow to inf.
+    device = torch.device("cuda")
+    x = torch.randn(256, 1024, device=device, dtype=torch.float16)
+    x[:, :64] = 1100.0
+    smooth = torch.ones(1024, device=device, dtype=torch.float16)
+    lora_down = torch.zeros(1024, 16, device=device, dtype=torch.float16)
+
+    q_h, s_h, _ = svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda(x, lora_down=lora_down, smooth=smooth)
+    q_r, s_r, _ = svdq_quantize_w4a4_act_fuse_lora_cuda(
+        hadamard_rotate(x.float()).half(), lora_down=lora_down, smooth=smooth
+    )
+    assert torch.isfinite(s_h.float()).all()
+    torch.testing.assert_close(s_h.float(), s_r.float(), rtol=2e-2, atol=1e-3)
+    assert (q_h == q_r).float().mean().item() > 0.97
+
+
+@requires_native_hadamard
 def test_native_hadamard_op_lora_branch_sees_unrotated_input():
     device = torch.device("cuda")
     torch.manual_seed(0)
