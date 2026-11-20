@@ -9,7 +9,9 @@ from nunchaku_lite import (
     TransformerAdapter,
     list_adapters,
     load_nunchaku_pipeline,
+    load_quantized_text_encoder,
     patch_transformer,
+    quantize_text_encoder,
     register_adapter,
 )
 ```
@@ -49,6 +51,11 @@ Arguments:
   patching controls as `patch_transformer`.
 - `quantized_encoder_checkpoints`: optional mapping from Diffusers component
   name to a quantized encoder checkpoint. Currently supports T5 checkpoints.
+- `text_encoder_quantization`: quantize the pipeline's Transformers text
+  encoders at load time, weights only: `"int4"` or `"int8"` for every
+  `text_encoder*` component, or a dict such as `{"text_encoder_2": "int4"}`.
+  No quantized checkpoint is needed. See
+  [Text encoder quantization](#text-encoder-quantization).
 - Additional keyword arguments are forwarded to `pipeline_cls.from_pretrained(...)`.
 
 Quantized text encoders can be injected up front so Diffusers skips loading the
@@ -66,6 +73,83 @@ pipe = load_nunchaku_pipeline(
     torch_dtype=torch.bfloat16,
     device="cuda",
 )
+```
+
+## Text encoder quantization
+
+The text encoder is often the largest part of a pipeline after the transformer
+is quantized: FLUX.2 Klein 4B ships an 8 GB bf16 Qwen3-4B encoder, Qwen-Image a
+16 GB Qwen2.5-VL. `text_encoder_quantization` quantizes it while loading:
+
+```python
+pipe = load_nunchaku_pipeline(
+    "black-forest-labs/FLUX.2-klein-4B",
+    pipeline_cls=Flux2KleinPipeline,
+    checkpoint="lite-infer/flux.2-klein-4b-nunchaku-lite-int4-r32",
+    torch_dtype=torch.bfloat16,
+    device="cuda",  # or "mps"
+    text_encoder_quantization="int4",  # or "int8"
+)
+```
+
+- Weights are quantized round-to-nearest; activations stay in bf16/fp16.
+  `"int4"` is asymmetric with groups of 64 input channels, `"int8"` symmetric
+  per output channel.
+- The bf16 encoder is loaded onto the CPU first (Transformers memory-maps it
+  when the checkpoint dtype matches, so this costs almost no RAM) and each
+  linear layer is quantized onto `device`, so the dense encoder is never
+  resident on the GPU.
+- On CUDA, `"int4"` layers run the AWQ W4A16 kernels (`AWQW4A16Linear`). On
+  MPS and CPU they are `Int4WeightOnlyLinear`, which dequantizes one layer at a
+  time per call and runs a dense matmul. `"int8"` layers
+  (`Int8WeightOnlyLinear`) do the same.
+- Kept dense: layers whose weight is tied to another parameter (`lm_head` tied
+  to the input embeddings, as in Qwen3-4B), vision towers (`visual` in
+  Qwen2.5-VL, used by Qwen-Image-Edit), and, for `"int4"`, layers whose input
+  features are not a multiple of 64. Embeddings stay in bf16.
+- Diffusers' text encoder LoRA loading (PEFT) does not support the quantized
+  layers.
+
+On an M5 MacBook Pro, FLUX.2 Klein's Qwen3-4B encoder (512-token prompts,
+hidden states of layers 9/18/27 as the pipeline uses them):
+
+| Encoder | GPU memory | Encode | Hidden-state error vs bf16 |
+| --- | ---: | ---: | --- |
+| bf16 | 8.11 GB | 0.70 s | |
+| `"int8"` | 4.45 GB | 0.91 s | 0.85% (cosine 0.9996) |
+| `"int4"` | 2.85 GB | 1.27 s | 6.0% (cosine 0.977-0.983) |
+
+Qwen-Image's Qwen2.5-VL encoder (last hidden state, the prompt tokens the
+pipeline keeps; vision tower left in bf16):
+
+| Encoder | GPU memory | Encode | Hidden-state error vs bf16 |
+| --- | ---: | ---: | --- |
+| bf16 | about 16 GB | | |
+| `"int8"` | 9.67 GB | 1.02 s | 3.0% (cosine 0.9995) |
+| `"int4"` | 6.52 GB | 1.35 s | 21% (cosine 0.978) |
+
+`"int8"` is close to lossless on both. `"int4"` gives FLUX.2 Klein images with
+the same composition as bf16, differing in fine detail. On Qwen-Image its error
+is much larger and it has not been checked on images yet; prefer `"int8"` there.
+
+On an RTX PRO 6000 (FLUX.2 Klein 4B pipeline with the FP4 transformer, 1024x1024, 4 steps; real prompt tokens
+compared):
+
+| Encoder | Encoder size | VRAM after load | Generation peak | Embedding error vs bf16 |
+| --- | ---: | ---: | ---: | --- |
+| bf16 | 8.04 GB | 10.90 GB | 13.49 GB | |
+| `"int8"` | 4.41 GB | 7.24 GB | 9.83 GB | 0.74% (cosine 0.9996) |
+| `"int4"` (AWQ kernels) | 2.82 GB | 5.65 GB | 8.23 GB | 5.9% (cosine 0.977) |
+
+For a model you load yourself, use the functions directly:
+
+```python
+from nunchaku_lite import load_quantized_text_encoder, quantize_text_encoder
+
+text_encoder = load_quantized_text_encoder(
+    "black-forest-labs/FLUX.2-klein-4B", "int4", subfolder="text_encoder", device="cuda"
+)
+quantize_text_encoder(model, "int8", device="mps")  # any model, in place
 ```
 
 ## `NunchakuT5EncoderModel`

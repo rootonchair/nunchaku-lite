@@ -245,6 +245,20 @@ image.save(output_path)
 print(f"saved {output_path}")
 ```
 
+### Quantized text encoders
+
+After the transformer, the text encoder is often the largest part of the
+pipeline (8 GB in bf16 for FLUX.2 Klein's Qwen3-4B). `text_encoder_quantization`
+quantizes the Transformers text encoders while loading, weights only, with no
+quantized checkpoint needed. The dense encoder is never resident on the GPU:
+
+```python
+pipe = load_nunchaku_pipeline(..., device="cuda", text_encoder_quantization="int4")  # or "int8"; also on "mps"
+```
+
+On an M5 Mac this takes Klein's encoder from 8.1 GB to 2.85 GB (`"int4"`) or
+4.45 GB (`"int8"`). See [docs/api.md](docs/api.md#text-encoder-quantization).
+
 ### Runtime LoRA
 
 Pipelines loaded with `load_nunchaku_pipeline` expose Diffusers-style LoRA
@@ -322,7 +336,9 @@ from nunchaku_lite import (
     TransformerAdapter,
     list_adapters,
     load_nunchaku_pipeline,
+    load_quantized_text_encoder,
     patch_transformer,
+    quantize_text_encoder,
     register_adapter,
 )
 ```
