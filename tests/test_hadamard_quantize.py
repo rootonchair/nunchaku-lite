@@ -148,6 +148,40 @@ def test_native_hadamard_op_matches_plain_op_on_prerotated_input(dtype, tokens, 
 
 
 @requires_native_hadamard
+@pytest.mark.parametrize("fp4", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_native_hadamard_op_rotates_after_per_channel_smoothing(dtype, fp4):
+    # With a random per-channel smooth factor, smoothing and rotation do not commute, so this
+    # pins the order the weights were packed for: quantize(H64/8 @ (x / smooth)). The reference
+    # rotates the smoothed input in PyTorch and feeds the plain op with smooth = 1.
+    device = torch.device("cuda")
+    torch.manual_seed(1)
+    tokens, channels = 256, 1024
+    x = torch.randn(tokens, channels, device=device, dtype=torch.float32)
+    x[:, 7] *= 30
+    smooth = torch.empty(channels, device=device).uniform_(0.25, 4.0)
+    lora_down = torch.zeros(channels, 16, device=device, dtype=dtype)
+
+    q_h, s_h, _ = svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda(
+        x.to(dtype), lora_down=lora_down, smooth=smooth.to(dtype), fp4=fp4
+    )
+    x_ref = hadamard_rotate(x / smooth.to(dtype).float()).to(dtype)
+    ones = torch.ones(channels, device=device, dtype=dtype)
+    q_r, s_r, _ = svdq_quantize_w4a4_act_fuse_lora_cuda(x_ref, lora_down=lora_down, smooth=ones, fp4=fp4)
+    # Wrong order (rotate, then smooth) as a control: it must be clearly worse.
+    x_bad = (hadamard_rotate(x) / smooth.to(dtype).float()).to(dtype)
+    q_b, _, _ = svdq_quantize_w4a4_act_fuse_lora_cuda(x_bad, lora_down=lora_down, smooth=ones, fp4=fp4)
+
+    match = (q_h == q_r).float().mean().item()
+    assert match > (0.93 if fp4 else 0.97)
+    assert (q_h == q_b).float().mean().item() < match - 0.1
+    if fp4:  # FP8 E4M3 scales: allow one ULP (12.5%)
+        torch.testing.assert_close(s_h.float(), s_r.float(), rtol=0.13, atol=1e-3)
+    else:
+        torch.testing.assert_close(s_h.float(), s_r.float(), rtol=2e-2, atol=1e-3)
+
+
+@requires_native_hadamard
 def test_native_hadamard_op_lora_branch_sees_unrotated_input():
     device = torch.device("cuda")
     torch.manual_seed(0)

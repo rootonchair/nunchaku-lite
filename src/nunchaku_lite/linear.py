@@ -8,7 +8,7 @@ from .ops.gemm import awq_gemm_w4a16_g64_int32, awq_gemm_w4a16_g128_int16, svdq_
 from .ops.gemv import awq_gemv_w4a16_cuda
 from .ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda, svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda
 
-INPUT_ROTATIONS = (None, "hadamard64")
+INPUT_ROTATIONS = (None, "hadamard")
 
 
 class DenseRuntimeLoraLinear(nn.Linear):
@@ -90,7 +90,7 @@ class SVDQW4A4Linear(nn.Module):
             torch_dtype: Runtime dtype for floating-point buffers.
             device: Device for parameter allocation.
             input_rotation: Online activation rotation the packed weight was
-                exported for: ``None`` or ``"hadamard64"`` (blockwise H64/8,
+                exported for: ``None`` or ``"hadamard"`` (blockwise H64/8,
                 applied after smoothing; the low-rank branch stays unrotated).
                 Rotation needs a signed activation path, so it cannot be
                 combined with ``act_unsigned``.
@@ -203,7 +203,7 @@ class SVDQW4A4Linear(nn.Module):
             raise ValueError("input_rotation requires signed activations; it cannot be combined with act_unsigned")
         quantize_fn = (
             svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda
-            if self.input_rotation == "hadamard64"
+            if self.input_rotation == "hadamard"
             else svdq_quantize_w4a4_act_fuse_lora_cuda
         )
         return quantize_fn(

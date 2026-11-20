@@ -1,198 +1,177 @@
-"""Load-time resolution of online activation rotations declared by runtime manifests.
+"""Load-time binding of online activation rotations declared by checkpoints.
 
-A rotated ``svdq_w4a4`` layer carries an authoritative ``<prefix>.input_transform``
-tensor (the orthogonal blocks ``T``; the packed weight is ``Q(R @ blockdiag(T))``) plus
-rotation metadata, declared either per target in a runtime manifest
-(``op_options.rotation``) or, for checkpoints loaded through model-specific adapters,
-once in ``quantization_config["input_rotation"]``. The kernel never inspects the tensor:
-the loader decides once, here, which native transform matches it and binds the
-corresponding quantize op to the layer. Today the only native transform is the
-blockwise Sylvester Hadamard ``H64 / 8``.
+A rotated ``svdq_w4a4`` layer was exported with its residual weight packed as
+``Q(R @ blockdiag(H64 / 8))`` and must run the Hadamard quantize op. Checkpoints declare it by
+name (``{"type": "hadamard"}``, defined in :mod:`nunchaku_lite.manifest`):
+
+* per target in a runtime manifest (``op_options.rotation``), bound by the manifest adapter; or
+* once in ``quantization_config["input_rotation"]`` with the list of rotated targets, for
+  checkpoints loaded through a model-specific adapter.
+
+The kernel never decides anything at run time: the loader binds the op per layer, once, and
+refuses anything it cannot honour before the model is modified wherever possible.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Iterable
 
 import torch
 from torch import nn
 
-from .manifest import ROTATION_FORMAT_VERSION, RuntimeManifestTarget, _validate_rotation
-from .ops.quantize import HADAMARD_BLOCK_SIZE, hadamard_matrix
+from .manifest import (
+    LEGACY_INPUT_TRANSFORM_SUFFIX,
+    ROTATION_DECLARATION_KEY,
+    RuntimeManifestTarget,
+    parse_rotation_declaration,
+)
 
-INPUT_TRANSFORM_SUFFIX = ".input_transform"
-ROTATION_DECLARATION_KEY = "input_rotation"
-HADAMARD64 = "hadamard64"
-_HADAMARD_ATOL = 1e-6
+HADAMARD = "hadamard"
+HADAMARD_OP_NAME = "quantize_w4a4_act_hadamard_fuse_lora"
 # Set by adapters on the fc2 of an MLP run through ops.fused.fused_gelu_mlp, whose input is
 # quantized inside fc1's GEMM epilogue (no rotation there).
 FUSED_MLP_FC2_ATTR = "_nunchaku_lite_fused_mlp_fc2"
+# Placeholder keys that carry declared targets through an adapter's checkpoint-key renaming.
+_MARKER_SUFFIX = "._nunchaku_lite_input_rotation"
+
+__all__ = [
+    "FUSED_MLP_FC2_ATTR",
+    "HADAMARD",
+    "ROTATION_DECLARATION_KEY",
+    "bind_input_rotations",
+    "check_rotation_runtime",
+    "mark_rotated_targets",
+    "parse_rotation_declaration",
+    "refuse_legacy_transform_tensors",
+    "resolve_input_rotation",
+    "validate_declared_targets",
+]
 
 
-def resolve_input_rotation(
-    target: RuntimeManifestTarget,
-    checkpoint_state: dict[str, torch.Tensor],
-    *,
-    allow_fp4: bool = False,
-) -> str | None:
-    """Return the native input rotation for ``target`` and drop its transform tensor.
-
-    Args:
-        target: Parsed manifest target.
-        checkpoint_state: Mutable checkpoint state dict. The target's
-            ``input_transform`` tensor is removed from it, since it is metadata for
-            the loader and not a module parameter.
-        allow_fp4: Opt in to rotation on NVFP4 targets. Off by default because the
-            64-wide rotation measured slightly worse than no rotation for NVFP4.
-
-    Returns:
-        ``None`` for an unrotated target, or ``"hadamard64"``.
-
-    Raises:
-        ValueError: If the transform tensor is missing or malformed, or the target
-            is NVFP4 without ``allow_fp4``.
-        NotImplementedError: If the transform is valid but no native kernel path
-            implements it (anything other than shared ``H64 / 8``).
-    """
-
-    rotation = target.rotation
-    key = target.checkpoint_prefix + INPUT_TRANSFORM_SUFFIX
-    if rotation is None:
-        if key in checkpoint_state:
-            raise ValueError(f"Checkpoint has {key!r} but target {target.checkpoint_prefix!r} declares no rotation.")
-        return None
-
-    transform = checkpoint_state.pop(key, None)
-    if transform is None:
-        raise ValueError(f"Rotated target {target.checkpoint_prefix!r} is missing its {key!r} tensor.")
-    return _resolve_transform(
-        target.checkpoint_prefix, rotation, transform, is_fp4=target.precision == "fp4", allow_fp4=allow_fp4
-    )
-
-
-def parse_rotation_declaration(quantization_config: dict[str, Any]) -> dict[str, Any] | None:
-    """Parse ``quantization_config["input_rotation"]`` for non-manifest checkpoints.
-
-    The declaration applies to every layer that has an ``.input_transform`` tensor:
-    ``{"format_version": 2, "type": "block_matrix", "block_size": 64, "shared": True,
-    "generator": "hadamard"}`` (``generator`` optional).
-
-    Returns:
-        The rotation metadata without ``format_version``, or ``None`` if absent.
+def resolve_input_rotation(target: RuntimeManifestTarget, *, allow_fp4: bool = False) -> str | None:
+    """Return the runtime rotation for a manifest target (``None`` or ``"hadamard"``).
 
     Raises:
-        ValueError: If the declaration is malformed or has an unsupported version.
+        ValueError: If the target is NVFP4 and ``allow_fp4`` is not set.
     """
 
-    raw = quantization_config.get(ROTATION_DECLARATION_KEY)
-    if raw is None:
+    if target.rotation is None:
         return None
-    if not isinstance(raw, dict):
-        raise TypeError(f"quantization_config.{ROTATION_DECLARATION_KEY} must be a JSON object.")
-    version = raw.get("format_version")
-    if version != ROTATION_FORMAT_VERSION:
+    _check_fp4(target.checkpoint_prefix, is_fp4=target.precision == "fp4", allow_fp4=allow_fp4)
+    return HADAMARD
+
+
+def refuse_legacy_transform_tensors(checkpoint_keys: Iterable[str]) -> None:
+    """Refuse ``.input_transform`` tensors of the abandoned pre-release ``block_matrix`` format."""
+
+    legacy = [key for key in checkpoint_keys if key.endswith(LEGACY_INPUT_TRANSFORM_SUFFIX)]
+    if legacy:
         raise ValueError(
-            f"Unsupported quantization_config.{ROTATION_DECLARATION_KEY}.format_version {version!r}; "
-            f"expected {ROTATION_FORMAT_VERSION}."
+            f"Checkpoint contains {len(legacy)} .input_transform tensors (e.g. {legacy[0]!r}) from the pre-release "
+            "'block_matrix' rotation format. Convert it: drop those tensors and declare the rotation by name, "
+            "{'type': 'hadamard'} (the packed weights are unchanged)."
         )
-    rotation = {key: value for key, value in raw.items() if key != "format_version"}
-    _validate_rotation(f"quantization_config.{ROTATION_DECLARATION_KEY}", "svdq_w4a4", rotation)
-    return rotation
 
 
-def bind_input_rotations(
-    transformer: nn.Module,
+def check_rotation_runtime(device: torch.device | str | None) -> None:
+    """Refuse rotated checkpoints the target device cannot run, at load time.
+
+    Raises:
+        NotImplementedError: On MPS (its kernels apply no rotation), or on CUDA when the
+            installed kernels predate the Hadamard quantize op.
+    """
+
+    device_type = torch.device(device).type if device is not None else None
+    if device_type == "mps":
+        raise NotImplementedError(
+            "Rotated (hadamard) SVDQ checkpoints are not supported on MPS yet; use an unrotated checkpoint."
+        )
+    if device_type == "cuda":
+        from .ops.backend import get_ops
+
+        if getattr(get_ops(), HADAMARD_OP_NAME, None) is None:
+            raise NotImplementedError(
+                f"The installed Nunchaku Lite kernels have no {HADAMARD_OP_NAME} op, which rotated checkpoints "
+                'need; update the kernels or run "pip install ./nunchaku-lite-kernels".'
+            )
+
+
+def validate_declared_targets(
     checkpoint_state: dict[str, torch.Tensor],
-    rotation: dict[str, Any],
+    targets: Iterable[str],
     *,
+    is_fp4: bool,
     allow_fp4: bool = False,
-) -> list[str]:
-    """Bind the declared rotation to every layer that has an ``.input_transform`` tensor.
+) -> None:
+    """Check a model-level declaration against the checkpoint, before any model is modified.
+
+    Raises:
+        ValueError: If a declared target has no packed SVDQ weight in the checkpoint, or the
+            checkpoint is NVFP4 without ``allow_fp4``.
+    """
+
+    missing = [target for target in targets if f"{target}.qweight" not in checkpoint_state]
+    if missing:
+        raise ValueError(
+            f"quantization_config.{ROTATION_DECLARATION_KEY}.targets {missing[:3]} have no packed SVDQ weight "
+            "(<target>.qweight) in the checkpoint."
+        )
+    _check_fp4(f"quantization_config.{ROTATION_DECLARATION_KEY}", is_fp4=is_fp4, allow_fp4=allow_fp4)
+
+
+def mark_rotated_targets(checkpoint_state: dict[str, torch.Tensor], targets: Iterable[str]) -> None:
+    """Add placeholder keys so the declared targets follow the adapter's key renaming.
+
+    :func:`bind_input_rotations` consumes them after patching.
+    """
+
+    for target in targets:
+        checkpoint_state[target + _MARKER_SUFFIX] = torch.empty(0)
+
+
+def bind_input_rotations(transformer: nn.Module, checkpoint_state: dict[str, torch.Tensor]) -> list[str]:
+    """Bind ``"hadamard"`` to every layer marked by :func:`mark_rotated_targets`.
 
     Used after a model-specific adapter has patched the transformer and renamed the
-    checkpoint keys to module paths. Each transform tensor is validated, removed from
-    ``checkpoint_state``, and turned into ``input_rotation`` on its layer.
+    checkpoint keys (markers included) to module paths. The markers are removed from
+    ``checkpoint_state``. Everything that can be checked without the patched model was
+    checked before patching; what remains here depends on the patched structure, so a
+    failure here can leave the transformer patched.
 
     Returns:
         The module paths that were bound.
 
     Raises:
-        ValueError: If a transform belongs to no module, to a layer whose input is
-            unsigned or quantized inside a fused MLP epilogue, or is malformed.
-        TypeError: If a transform belongs to a module that is not an SVDQ W4A4 layer.
-        NotImplementedError: For valid transforms without a native kernel path.
+        ValueError: If a marked target maps to no module, or to a layer whose input is
+            unsigned or quantized inside a fused MLP epilogue.
+        TypeError: If a marked target maps to a module that is not an SVDQ W4A4 layer.
     """
 
     from .linear import SVDQW4A4Linear
 
     bound = []
-    for key in [key for key in checkpoint_state if key.endswith(INPUT_TRANSFORM_SUFFIX)]:
-        prefix = key[: -len(INPUT_TRANSFORM_SUFFIX)]
+    for key in [key for key in checkpoint_state if key.endswith(_MARKER_SUFFIX)]:
+        checkpoint_state.pop(key)
+        path = key[: -len(_MARKER_SUFFIX)]
         try:
-            module = transformer.get_submodule(prefix)
+            module = transformer.get_submodule(path)
         except AttributeError as exc:
-            raise ValueError(f"Rotation tensor {key!r} does not belong to any module of the patched model.") from exc
+            raise ValueError(f"Declared rotated target {path!r} is not a module of the patched model.") from exc
         if not isinstance(module, SVDQW4A4Linear):
-            raise TypeError(f"Rotation tensor {key!r} belongs to {type(module).__name__}, not an SVDQ W4A4 layer.")
+            raise TypeError(f"Declared rotated target {path!r} is a {type(module).__name__}, not an SVDQ W4A4 layer.")
         if module.act_unsigned or getattr(module, FUSED_MLP_FC2_ATTR, False):
             raise ValueError(
-                f"Layer {prefix!r} quantizes unsigned or fused-MLP activations, which cannot be rotated "
+                f"Layer {path!r} quantizes unsigned or fused-MLP activations, which cannot be rotated "
                 "(rotation needs the signed standalone quantize path)."
             )
-        kind = _resolve_transform(
-            prefix, rotation, checkpoint_state.pop(key), is_fp4=module.precision == "nvfp4", allow_fp4=allow_fp4
-        )
-        module.input_rotation = kind
-        bound.append(prefix)
+        module.input_rotation = HADAMARD
+        bound.append(path)
     return bound
 
 
-def _resolve_transform(
-    name: str, rotation: dict[str, Any], transform: torch.Tensor, *, is_fp4: bool, allow_fp4: bool
-) -> str:
+def _check_fp4(where: str, *, is_fp4: bool, allow_fp4: bool) -> None:
     if is_fp4 and not allow_fp4:
         raise ValueError(
-            f"Rotated layer {name!r} is NVFP4. Rotation on NVFP4 is refused by default "
-            "(it measured slightly worse than no rotation); pass adapter_options={'allow_fp4_rotation': True} "
-            "to load it anyway."
+            f"{where}: rotation on NVFP4 is refused by default (it measured slightly worse than no rotation); "
+            "pass adapter_options={'allow_fp4_rotation': True} to load it anyway."
         )
-    block_size = rotation["block_size"]
-    _validate_transform_shape(name, rotation, transform, block_size)
-    if _is_shared_hadamard64(rotation, transform):
-        return HADAMARD64
-    if rotation.get("generator") == "hadamard":
-        raise ValueError(
-            f"Rotated layer {name!r} declares generator='hadamard' but its input_transform "
-            f"is not the shared Sylvester H{block_size}/sqrt({block_size}) this runtime implements."
-        )
-    raise NotImplementedError(
-        f"Rotated layer {name!r} uses a general block_matrix transform "
-        f"(block_size={block_size}, shared={rotation['shared']}); only the shared Sylvester H64/8 "
-        "has a native kernel path."
-    )
-
-
-def _validate_transform_shape(name: str, rotation: dict[str, Any], transform: torch.Tensor, block_size: int) -> None:
-    shape = tuple(transform.shape)
-    if len(shape) == 2:
-        expected = (block_size, block_size)
-    elif len(shape) == 3:
-        expected = (shape[0], block_size, block_size)
-    else:
-        expected = None
-    if expected is None or shape != expected:
-        raise ValueError(
-            f"Rotated layer {name!r} input_transform has shape {shape}; expected "
-            f"[{block_size}, {block_size}] (shared) or [K/{block_size}, {block_size}, {block_size}]."
-        )
-    if (len(shape) == 2) != bool(rotation["shared"]):
-        raise ValueError(
-            f"Rotated layer {name!r} input_transform shape {shape} does not match rotation.shared={rotation['shared']}."
-        )
-
-
-def _is_shared_hadamard64(rotation: dict[str, Any], transform: torch.Tensor) -> bool:
-    if not rotation["shared"] or rotation["block_size"] != HADAMARD_BLOCK_SIZE or transform.dim() != 2:
-        return False
-    reference = hadamard_matrix(HADAMARD_BLOCK_SIZE, dtype=torch.float64)
-    return torch.allclose(transform.detach().to("cpu", torch.float64), reference, rtol=0.0, atol=_HADAMARD_ATOL)

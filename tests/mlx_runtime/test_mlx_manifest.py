@@ -596,6 +596,36 @@ def test_manifest_errors(tmp_path):
         load_nunchaku_pipeline("p", pipeline_cls=GenericPipeline, checkpoint={"proj.weight": mx.zeros((2 * D, D))})
 
 
+def _rotated(manifest):
+    manifest = {**manifest, "nunchaku_format_version": 2}
+    manifest["targets"] = [dict(t) for t in manifest["targets"]]
+    manifest["targets"][0]["op_options"] = {"rotation": {"type": "hadamard"}}
+    return manifest
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_rotated_manifest_is_refused(tmp_path, strict):
+    # MLX applies no activation rotation; loading rotated weights unrotated would be silently wrong.
+    _, _, state, manifest = _generic_checkpoint()
+    folder = _save(tmp_path / "ckpt", state, _rotated(manifest))
+    with pytest.raises(NotImplementedError, match="not supported on MLX"):
+        patch_transformer(Generic(), folder, backend="dense", strict=strict)
+    _, flux2_state, flux2_manifest = _lite_flux2_checkpoint()
+    folder = _save(tmp_path / "repo" / "transformer", flux2_state, _rotated(flux2_manifest))
+    with pytest.raises(NotImplementedError, match="not supported on MLX"):
+        load_nunchaku_pipeline("base", pipeline_cls=FakeFlux2Pipeline, checkpoint=tmp_path / "repo", backend="dense")
+
+
+def test_rotation_declaration_and_legacy_transforms_are_refused():
+    from nunchaku_lite.mlx.manifest import refuse_rotated_checkpoint
+
+    refuse_rotated_checkpoint(None, {}, ["proj.qweight"])
+    with pytest.raises(NotImplementedError, match="not supported on MLX"):
+        refuse_rotated_checkpoint(None, {"input_rotation": {"format_version": 2}}, [])
+    with pytest.raises(NotImplementedError, match="not supported on MLX"):
+        refuse_rotated_checkpoint(None, {}, ["proj.input_transform"])
+
+
 def test_quantization_config_falls_back_to_config_json(tmp_path):
     _, state, manifest = _lite_flux2_checkpoint()
     folder = _save(tmp_path / "repo" / "transformer", state)  # no safetensors metadata

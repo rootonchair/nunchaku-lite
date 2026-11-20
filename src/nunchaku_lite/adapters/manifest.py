@@ -42,7 +42,7 @@ class ManifestAdapter:
         allow_fp4_rotation = bool(options.adapter_options.get("allow_fp4_rotation", False))
         # Resolve every rotation before touching the model, so a bad checkpoint fails cleanly.
         input_rotations = {
-            target.checkpoint_prefix: resolve_input_rotation(target, checkpoint_state, allow_fp4=allow_fp4_rotation)
+            target.checkpoint_prefix: resolve_input_rotation(target, allow_fp4=allow_fp4_rotation)
             for target in manifest.targets
         }
         prepare_transformer_dtype(transformer, context)
