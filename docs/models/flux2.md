@@ -102,8 +102,10 @@ print(f"saved {output_path}")
 ## Rotated (Hadamard) Checkpoints
 
 FLUX.2 Klein INT4 checkpoints can be exported with an online Hadamard rotation, which spreads
-activation outliers before 4-bit quantization (about +1.7 dB on FLUX.2-klein INT4, for roughly
-0.1% extra transformer time). They load like any other checkpoint; nothing changes in your code.
+activation outliers before 4-bit quantization. On FLUX.2-klein INT4 it lowers quantization error per
+layer (median +1.7 dB output SQNR; about 0.82x whole-model output error) for roughly 0.1% extra
+transformer time. At 4 sampling steps, end-to-end image metrics were within run-to-run noise.
+Rotated checkpoints load like any other; nothing changes in your code.
 They need the CUDA kernels that include `quantize_w4a4_act_hadamard_fuse_lora`. MPS and MLX
 refuse them at load time.
 
