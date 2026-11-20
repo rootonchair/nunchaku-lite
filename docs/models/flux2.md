@@ -98,3 +98,30 @@ output_path.parent.mkdir(parents=True, exist_ok=True)
 image.save(output_path)
 print(f"saved {output_path}")
 ```
+
+## Rotated (Hadamard) Checkpoints
+
+FLUX.2 Klein INT4 checkpoints can be exported with an online Hadamard rotation, which spreads
+activation outliers before 4-bit quantization (about +1.7 dB on FLUX.2-klein INT4, for roughly
+0.1% extra transformer time). They load like any other checkpoint; nothing changes in your code.
+They need the CUDA kernels that include `quantize_w4a4_act_hadamard_fuse_lora`. MPS and MLX
+refuse them at load time.
+
+A checkpoint declares rotation by name in its `quantization_config`:
+
+```json
+"input_rotation": {"format_version": 2, "type": "hadamard", "targets": ["transformer_blocks.0.attn.to_qkv", "..."]}
+```
+
+Checkpoints with a runtime manifest declare it per target instead, as
+`"op_options": {"rotation": {"type": "hadamard"}}`, with `nunchaku_format_version: 2`.
+
+`"hadamard"` has exactly one meaning. For each block of 64 contiguous input channels, in logical
+channel order, the smoothed activations `x / smooth` are multiplied by the orthonormal Sylvester
+Hadamard matrix `H64 / 8`. The low-rank branch sees the unrotated input, and the residual weight
+is packed as `Q(R @ blockdiag(H64 / 8))`. `nunchaku_lite.ops.hadamard_rotate` is the reference
+transform. A different transform needs a new name.
+
+Rotation is refused on NVFP4 by default, because it measured slightly worse than no rotation there.
+Pass `adapter_options={"allow_fp4_rotation": True}` to load such a checkpoint anyway. Rotation is
+also refused on fc2 layers whose input is quantized unsigned or inside the fused GELU MLP.
