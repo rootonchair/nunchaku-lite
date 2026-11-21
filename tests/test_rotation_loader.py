@@ -437,8 +437,14 @@ def _flux2_checkpoint(
     if marker:
         state.update(MARKER)
     config = {"rank": 16}
-    if manifest:
+    if manifest in (True, "v2_rot"):
         config["runtime_manifest"] = _rotated_manifest(rotated, precision)
+    elif manifest in ("v1", "v2_unrot"):
+        unrotated = _rotated_manifest(rotated, precision)
+        unrotated["nunchaku_format_version"] = 1 if manifest == "v1" else 2
+        for target in unrotated["targets"]:
+            target["op_options"] = {}
+        config["runtime_manifest"] = unrotated
     if declaration:
         config["input_rotation"] = _declaration(rotated)
     path = tmp_path / "flux2-rotated.safetensors"
@@ -584,6 +590,22 @@ def test_failed_patch_binds_nothing_and_blocks_reuse(tmp_path):
         _load_flux2(unrotated_path, transformer)
 
 
+def test_interrupted_load_blocks_reuse(tmp_path, monkeypatch):
+    # Ctrl-C during load_state_dict (after binding) must mark the transformer like any other failure.
+    path = _flux2_checkpoint(tmp_path, [_QKV], manifest=False, marker=True)
+    transformer = _tiny_flux2()
+
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(transformer, "load_state_dict", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        _load_flux2(path, transformer)
+    monkeypatch.undo()
+    with pytest.raises(RuntimeError, match="partially patched"):
+        _load_flux2(path, transformer)
+
+
 def test_pre_patch_refusal_does_not_block_a_retry(tmp_path):
     # Refusals before patching leave the model untouched, so the same object can be loaded again.
     source = TinyModel()
@@ -704,18 +726,20 @@ def test_fused_adapters_mark_their_fused_fc2():
 
 
 def _spec(manifest, declared, marker, rotated_in_manifest):
-    """Expected rotated set, or "refuse", per the documented format rules."""
+    """Expected rotated set, or ("refuse", reason pattern), per the documented format rules."""
 
     manifest_rotated = set(rotated_in_manifest) if manifest == "v2_rot" else set()
     stored_manifest = manifest != "none"
     if marker and declared is None:
-        return "refuse"  # a marker needs a declaration
+        return ("refuse", "marker but no quantization_config.input_rotation declaration")
     if declared is None:
         return manifest_rotated
     if stored_manifest and set(declared) != manifest_rotated:
-        return "refuse"  # a declaration next to a stored manifest must match it exactly
+        if not manifest_rotated:
+            return ("refuse", "its runtime_manifest declares no rotation")
+        return ("refuse", "inconsistent")
     if not manifest_rotated and not marker:
-        return "refuse"  # a declaration needs a rotated v2 manifest or the marker
+        return ("refuse", "marker tensor")
     return manifest_rotated or set(declared)
 
 
@@ -740,8 +764,8 @@ def test_decision_table_manifest_adapter(tmp_path, manifest, declaration, marker
     expected = _spec(manifest, declared, marker, rotated_in_manifest=["proj"])
 
     model = TinyModel()
-    if expected == "refuse":
-        with pytest.raises(ValueError):
+    if isinstance(expected, tuple):
+        with pytest.raises(ValueError, match=expected[1]):
             patch_transformer(model, checkpoint, target="auto", torch_dtype=torch.bfloat16, device="cpu")
         assert isinstance(model.proj, nn.Linear) and isinstance(model.other, nn.Linear)
         assert not getattr(model, "_nunchaku_lite_patch_failed", False)
@@ -757,15 +781,15 @@ _QKV = "transformer_blocks.0.attn.to_qkv"
 
 @pytest.mark.parametrize("marker", [False, True])
 @pytest.mark.parametrize("declare", [False, True])
-@pytest.mark.parametrize("manifest", ["none", "v2_rot"])
+@pytest.mark.parametrize("manifest", ["none", "v1", "v2_unrot", "v2_rot"])
 def test_decision_table_flux2_adapter(tmp_path, manifest, declare, marker):
     declared = [_QKV] if declare else None
-    path = _flux2_checkpoint(tmp_path, [_QKV], declaration=declare, manifest=manifest == "v2_rot", marker=marker)
+    path = _flux2_checkpoint(tmp_path, [_QKV], declaration=declare, manifest=manifest, marker=marker)
     expected = _spec(manifest, declared, marker, rotated_in_manifest=[_QKV])
 
     transformer = _tiny_flux2()
-    if expected == "refuse":
-        with pytest.raises(ValueError):
+    if isinstance(expected, tuple):
+        with pytest.raises(ValueError, match=expected[1]):
             _load_flux2(path, transformer)
         assert _flux2_is_unpatched(transformer)
         assert not getattr(transformer, "_nunchaku_lite_patch_failed", False)

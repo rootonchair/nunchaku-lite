@@ -454,7 +454,7 @@ def _patch_component(
             transformer.to(device)
         configure_backend(transformer, backend)
         _install_mps_attention(transformer)
-    except Exception:
+    except BaseException:  # includes KeyboardInterrupt mid-load; only sets a flag and re-raises
         transformer._nunchaku_lite_patch_failed = True
         raise
 
