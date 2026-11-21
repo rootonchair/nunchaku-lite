@@ -257,7 +257,7 @@ def apply_runtime_manifest(
     """
 
     key_map = key_map or (lambda name: name)
-    refuse_rotated_checkpoint(manifest, {}, ())
+    refuse_rotated_checkpoint(manifest, {}, state)
     if any(target.precision != "int4" for target in manifest.targets):
         raise NotImplementedError("NVFP4 (fp4) manifest targets are not supported on MLX yet; use an INT4 checkpoint.")
     _apply_structural_patches(model, state, manifest, key_map)

@@ -822,7 +822,12 @@ def _check_rotation_support(
         )
     if declared is None and not manifest_rotated:
         return None
-    if manifest_rotated and declared is not None and set(declared) != set(manifest_rotated):
+    if stored_manifest is not None and declared is not None and set(declared) != set(manifest_rotated):
+        if not manifest_rotated:
+            raise ValueError(
+                "Checkpoint declares quantization_config.input_rotation but its runtime_manifest declares no "
+                "rotation; checkpoints with a manifest must declare rotation per target in op_options.rotation."
+            )
         raise ValueError(
             "quantization_config.input_rotation.targets do not match the runtime_manifest targets that declare "
             "op_options.rotation; the checkpoint metadata is inconsistent."

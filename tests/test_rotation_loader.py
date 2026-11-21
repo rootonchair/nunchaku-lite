@@ -22,6 +22,7 @@ from nunchaku_lite.rotation_loader import (
     mark_rotated_targets,
     parse_rotation_declaration,
     resolve_input_rotation,
+    validate_declared_targets,
 )
 
 ROTATION = {"type": "hadamard"}
@@ -244,7 +245,7 @@ def test_manifest_with_matching_declaration_loads(tmp_path):
     assert transformer.proj.input_rotation == HADAMARD
 
 
-@pytest.mark.parametrize("manifest_rotation,match", [(ROTATION, "inconsistent"), (None, "marker tensor")])
+@pytest.mark.parametrize("manifest_rotation,match", [(ROTATION, "inconsistent"), (None, "declares no rotation")])
 def test_manifest_with_inconsistent_declaration_is_refused(tmp_path, manifest_rotation, match):
     config = {"runtime_manifest": _manifest(rotation=manifest_rotation), "input_rotation": _declaration(["other"])}
     checkpoint = _write(tmp_path, config)
@@ -273,6 +274,30 @@ def test_target_list_declaration_with_marker_loads(tmp_path):
     assert transformer._nunchaku_lite_target == "manifest"
     assert transformer.proj.input_rotation == HADAMARD and transformer.other.input_rotation is None
     assert not transformer._nunchaku_lite_incompatible_keys.unexpected_keys
+
+
+@pytest.mark.parametrize("format_version", [1, 2])
+def test_declaration_beside_unrotated_manifest_is_refused_even_with_marker(tmp_path, format_version):
+    config = {
+        "runtime_manifest": _manifest(format_version=format_version, rotation=None),
+        "input_rotation": _declaration(["other"]),
+    }
+    model = TinyModel()
+    with pytest.raises(ValueError, match="declares no rotation"):
+        patch_transformer(
+            model, _write(tmp_path, config, MARKER), target="auto", torch_dtype=torch.bfloat16, device="cpu"
+        )
+    assert isinstance(model.proj, nn.Linear) and isinstance(model.other, nn.Linear)
+
+
+def test_declared_awq_target_is_refused_before_patching():
+    with pytest.raises(ValueError, match="AWQ W4A16"):
+        validate_declared_targets({"a.qweight": torch.zeros(1), "a.wzeros": torch.zeros(1)}, ["a"], is_fp4=False)
+
+
+def test_stray_placeholder_keys_are_refused():
+    with pytest.raises(ValueError, match="reserved rotation placeholder"):
+        mark_rotated_targets({"b._nunchaku_lite_input_rotation": torch.empty(0)}, ["a"])
 
 
 def test_marker_without_declaration_is_refused(tmp_path):

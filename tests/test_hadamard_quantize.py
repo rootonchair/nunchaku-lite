@@ -113,6 +113,14 @@ def test_hadamard_wrapper_reports_old_backend(monkeypatch):
         svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda(torch.randn(8, 64), lora_down=torch.zeros(64, 16))
 
 
+def test_hadamard_wrapper_refuses_fuse_glu(monkeypatch):
+    monkeypatch.setattr(quantize_mod, "get_ops", lambda: _RecordingOps())
+    with pytest.raises(NotImplementedError, match="fuse_glu"):
+        svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda(
+            torch.randn(8, 128), lora_down=torch.zeros(128, 16), fuse_glu=True
+        )
+
+
 def test_hadamard_wrapper_rejects_channels_not_multiple_of_64(monkeypatch):
     monkeypatch.setattr(quantize_mod, "get_ops", lambda: _RecordingOps())
     with pytest.raises(ValueError, match="divisible by 64"):
@@ -224,6 +232,28 @@ def test_native_hadamard_op_lora_branch_sees_unrotated_input():
     _, _, lora_h = svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda(x, lora_down=lora_down, smooth=smooth)
     _, _, lora_n = svdq_quantize_w4a4_act_fuse_lora_cuda(x, lora_down=lora_down, smooth=smooth)
     torch.testing.assert_close(lora_h, lora_n)
+
+
+@requires_native_hadamard
+def test_rotated_linear_forward_compiles_fullgraph():
+    from nunchaku_lite.linear import SVDQW4A4Linear
+
+    torch.manual_seed(0)
+    layer = SVDQW4A4Linear(256, 256, rank=16, torch_dtype=torch.bfloat16, device="cuda", input_rotation="hadamard")
+    with torch.no_grad():
+        layer.qweight.copy_(torch.randint(-128, 128, layer.qweight.shape, dtype=torch.int8, device="cuda"))
+        layer.wscales.fill_(0.01)
+        layer.smooth_factor.fill_(1.0)
+        layer.proj_down.normal_(0, 0.05)
+        layer.proj_up.normal_(0, 0.05)
+        if layer.bias is not None:
+            layer.bias.zero_()
+    x = torch.randn(1, 64, 256, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        eager = layer(x)
+        compiled = torch.compile(layer, fullgraph=True)(x)
+    assert torch.isfinite(eager).all()
+    torch.testing.assert_close(compiled, eager)
 
 
 @requires_native_hadamard

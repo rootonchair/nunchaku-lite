@@ -102,6 +102,8 @@ def svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda(
         NotImplementedError: If the active kernel backend predates this op.
     """
 
+    if fuse_glu:
+        raise NotImplementedError("Hadamard activation quantization does not support fuse_glu.")
     if input.shape[-1] % HADAMARD_BLOCK_SIZE != 0:
         raise ValueError("Hadamard activation quantization needs channels divisible by 64")
     ops = get_ops()

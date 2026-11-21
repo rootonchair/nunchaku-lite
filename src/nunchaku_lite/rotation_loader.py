@@ -105,10 +105,13 @@ def validate_declared_targets(
     """Check rotated targets against the checkpoint, before any model is modified.
 
     Raises:
-        ValueError: If a rotated target has no packed SVDQ weight in the checkpoint, or the
-            checkpoint is NVFP4 without ``allow_fp4``.
+        ValueError: If a rotated target has no packed SVDQ weight in the checkpoint (or is an
+            AWQ layer), or the checkpoint is NVFP4 without ``allow_fp4``.
     """
 
+    awq = [target for target in targets if f"{target}.wzeros" in checkpoint_state]
+    if awq:
+        raise ValueError(f"Rotated targets {awq[:3]} are AWQ W4A16 layers; only SVDQ W4A4 layers can be rotated.")
     missing = [target for target in targets if f"{target}.qweight" not in checkpoint_state]
     if missing:
         raise ValueError(
@@ -121,8 +124,15 @@ def mark_rotated_targets(checkpoint_state: dict[str, torch.Tensor], targets: Ite
     """Add placeholder keys so the rotated targets follow the adapter's key renaming.
 
     :func:`bind_input_rotations` consumes them after patching.
+
+    Raises:
+        ValueError: If the checkpoint already contains placeholder keys, which would be bound
+            as if they had been declared.
     """
 
+    stray = [key for key in checkpoint_state if key.endswith(_MARKER_SUFFIX)]
+    if stray:
+        raise ValueError(f"Checkpoint contains reserved rotation placeholder keys (e.g. {stray[0]!r}).")
     for target in targets:
         checkpoint_state[target + _MARKER_SUFFIX] = torch.empty(0)
 

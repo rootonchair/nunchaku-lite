@@ -329,6 +329,8 @@ def svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda(
     consumes the unrotated input. The matching weight must be packed as
     ``Q(R @ blockdiag(H64 / 8))``.
     """
+    if fuse_glu:
+        raise NotImplementedError("Hadamard activation quantization does not support fuse_glu.")
     if input.shape[-1] % 64 != 0:
         raise ValueError("Hadamard activation quantization needs channels divisible by 64")
     output, oscales, lora_act_out = _alloc_quantize_w4a4_act_buffers(

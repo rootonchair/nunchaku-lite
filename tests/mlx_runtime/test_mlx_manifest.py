@@ -624,6 +624,22 @@ def test_apply_runtime_manifest_refuses_rotation(tmp_path):
         apply_runtime_manifest(Generic(), state, parse_runtime_manifest({"runtime_manifest": _rotated(manifest)}))
 
 
+def test_apply_runtime_manifest_refuses_marker_in_state():
+    from nunchaku_lite.mlx import apply_runtime_manifest
+
+    _, _, state, manifest = _generic_checkpoint()
+    state = {**state, "nunchaku_lite.input_rotation": mx.zeros((0,))}
+    with pytest.raises(NotImplementedError, match="not supported on MLX"):
+        apply_runtime_manifest(Generic(), state, parse_runtime_manifest({"runtime_manifest": manifest}))
+
+
+def test_marker_checkpoint_is_refused_end_to_end(tmp_path):
+    _, _, state, manifest = _generic_checkpoint()
+    folder = _save(tmp_path / "ckpt", {**state, "nunchaku_lite.input_rotation": mx.zeros((0,))}, manifest)
+    with pytest.raises(NotImplementedError, match="not supported on MLX"):
+        patch_transformer(Generic(), folder, backend="dense", strict=False)
+
+
 def test_rotation_declaration_and_legacy_transforms_are_refused():
     from nunchaku_lite.mlx.manifest import refuse_rotated_checkpoint
 

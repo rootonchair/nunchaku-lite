@@ -47,6 +47,8 @@ def get_sm_targets() -> list[str]:
         for sm in targets:
             if sm not in ["75", "80", "86", "89", "120a", "121a"]:
                 raise RuntimeError(f"Unsupported SM {sm}")
+            if (sm == "120a" and not support_sm120) or (sm == "121a" and not support_sm121):
+                raise RuntimeError(f"SM {sm} needs a newer nvcc than {nvcc_version}")
         return targets
     if install_mode == "FAST":
         targets = []
