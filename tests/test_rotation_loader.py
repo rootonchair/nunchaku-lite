@@ -45,7 +45,7 @@ def _target(prefix, *, op="svdq_w4a4", precision="int4", rotation=None):
         "kind": "linear",
         "nunchaku_op": op,
         "precision": precision,
-        "group_size": 64 if op == "svdq_w4a4" else 128,
+        "group_size": (16 if precision == "fp4" else 64) if op == "svdq_w4a4" else 128,
         "rank": 16,
         "has_bias": True,
         "op_options": op_options,
@@ -544,13 +544,70 @@ def test_adapter_without_rotation_support_is_refused(tmp_path, monkeypatch):
     assert _flux2_is_unpatched(transformer)
 
 
-def test_every_rotated_target_must_be_bound(tmp_path, monkeypatch):
+def test_adapter_losing_markers_is_caught(tmp_path, monkeypatch):
     # Guards future adapters whose patch drops or fails to rename the target markers.
-    from nunchaku_lite import core
+    original_patch = Flux2Adapter.patch
 
-    monkeypatch.setattr(core, "bind_input_rotations", lambda transformer, state: [])
-    with pytest.raises(ValueError, match="bound 0 of 1 rotated targets"):
-        _load_flux2(_flux2_checkpoint(tmp_path, ["transformer_blocks.0.attn.to_qkv"]))
+    def dropping_patch(self, *args, **kwargs):
+        state = original_patch(self, *args, **kwargs)
+        return {k: v for k, v in state.items() if not k.endswith("._nunchaku_lite_input_rotation")}
+
+    monkeypatch.setattr(Flux2Adapter, "patch", dropping_patch)
+    transformer = _tiny_flux2()
+    with pytest.raises(ValueError, match="Found 0 of 1 rotated targets"):
+        _load_flux2(_flux2_checkpoint(tmp_path, ["transformer_blocks.0.attn.to_qkv"]), transformer)
+    assert transformer.transformer_blocks[0].attn.to_qkv.input_rotation is None
+
+
+def test_failed_patch_binds_nothing_and_blocks_reuse(tmp_path):
+    # The second review's retry scenario: a declared target that exists in the checkpoint but maps to
+    # no module fails after patching; a retry on the same object must not inherit a stale rotation.
+    from safetensors.torch import load_file
+
+    good = _flux2_checkpoint(tmp_path, ["transformer_blocks.0.attn.to_qkv"], manifest=False, marker=True)
+    state = load_file(good)
+    unrotated_path = tmp_path / "plain.safetensors"
+    save_file(
+        {k: v for k, v in state.items() if k != "nunchaku_lite.input_rotation"},
+        unrotated_path,
+        metadata={"quantization_config": json.dumps({"rank": 16})},
+    )
+    bad_path = tmp_path / "bad.safetensors"
+    config = {"rank": 16, "input_rotation": _declaration(["transformer_blocks.0.attn.to_qkv", "foo"])}
+    save_file({**state, "foo.qweight": torch.zeros(1)}, bad_path, metadata={"quantization_config": json.dumps(config)})
+
+    transformer = _tiny_flux2()
+    with pytest.raises(ValueError, match="'foo' is not a module"):
+        _load_flux2(bad_path, transformer)
+    assert transformer.transformer_blocks[0].attn.to_qkv.input_rotation is None
+    with pytest.raises(RuntimeError, match="partially patched"):
+        _load_flux2(unrotated_path, transformer)
+
+
+def test_pre_patch_refusal_does_not_block_a_retry(tmp_path):
+    # Refusals before patching leave the model untouched, so the same object can be loaded again.
+    source = TinyModel()
+    ManifestAdapter().patch(source, {}, {"runtime_manifest": _manifest(precision="fp4", rotation=None)}, _options())
+    checkpoint = tmp_path / "fp4.safetensors"
+    save_file(
+        {k: v.contiguous() for k, v in source.state_dict().items()},
+        checkpoint,
+        metadata={"quantization_config": json.dumps({"runtime_manifest": _manifest(precision="fp4")})},
+    )
+    model = TinyModel()
+    with pytest.raises(ValueError, match="allow_fp4_rotation"):
+        patch_transformer(model, checkpoint, target="auto", precision="fp4", torch_dtype=torch.bfloat16, device="cpu")
+    assert isinstance(model.proj, nn.Linear) and not getattr(model, "_nunchaku_lite_patch_failed", False)
+    patch_transformer(
+        model,
+        checkpoint,
+        target="auto",
+        precision="fp4",
+        torch_dtype=torch.bfloat16,
+        device="cpu",
+        adapter_options={"allow_fp4_rotation": True},
+    )
+    assert model.proj.input_rotation == HADAMARD
 
 
 def test_rotation_device_defaults_to_the_available_accelerator(monkeypatch):
@@ -574,12 +631,28 @@ class _BindModel(nn.Module):
         self.dense = nn.Linear(128, 128)
 
 
-def _bind(model, targets):
+def _bind(model, targets, expected=None):
     state = {"a.qweight": torch.zeros(1)}
     mark_rotated_targets(state, targets)
-    bound = bind_input_rotations(model, state)
+    bound = bind_input_rotations(model, state, targets if expected is None else expected)
     assert list(state) == ["a.qweight"]  # markers consumed
     return bound
+
+
+def test_bind_is_all_or_nothing():
+    # A later target failing must not leave earlier ones bound.
+    model = _BindModel()
+    with pytest.raises(TypeError, match="not an SVDQ"):
+        _bind(model, ["a", "dense"])
+    assert model.a.input_rotation is None
+
+
+@pytest.mark.parametrize("expected,match", [(["a", "b"], "Found 1 of 2.*lost"), ([], "Found 1 of 0.*duplicated")])
+def test_bind_checks_the_count_before_binding(expected, match):
+    model = _BindModel()
+    with pytest.raises(ValueError, match=match):
+        _bind(model, ["a"], expected=expected)
+    assert model.a.input_rotation is None
 
 
 def test_bind_input_rotations_checks_the_patched_structure():
@@ -620,3 +693,88 @@ def test_fused_adapters_mark_their_fused_fc2():
     context = SVDQPatchContext(precision="int4", rank=16, torch_dtype=torch.bfloat16)
     ff = _patch_ltx2_feed_forward(FeedForward(64, activation_fn="gelu-approximate"), context)
     assert getattr(ff.net[2], FUSED_MLP_FC2_ATTR, False)
+
+
+# --- decision table: every manifest / declaration / marker combination ------------------
+#
+# The expected outcome comes from a direct transcription of the documented rules
+# (docs/models/flux2.md), not from the loader, and every case also checks the two invariants:
+# a refused load leaves the model untouched (and reusable); a successful load rotates exactly
+# the expected layers and leaves no stray keys.
+
+
+def _spec(manifest, declared, marker, rotated_in_manifest):
+    """Expected rotated set, or "refuse", per the documented format rules."""
+
+    manifest_rotated = set(rotated_in_manifest) if manifest == "v2_rot" else set()
+    stored_manifest = manifest != "none"
+    if marker and declared is None:
+        return "refuse"  # a marker needs a declaration
+    if declared is None:
+        return manifest_rotated
+    if stored_manifest and set(declared) != manifest_rotated:
+        return "refuse"  # a declaration next to a stored manifest must match it exactly
+    if not manifest_rotated and not marker:
+        return "refuse"  # a declaration needs a rotated v2 manifest or the marker
+    return manifest_rotated or set(declared)
+
+
+_DECLARATIONS = {"none": None, "proj": ["proj"], "other": ["other"]}
+
+
+@pytest.mark.parametrize("marker", [False, True])
+@pytest.mark.parametrize("declaration", list(_DECLARATIONS))
+@pytest.mark.parametrize("manifest", ["none", "v1", "v2_unrot", "v2_rot"])
+def test_decision_table_manifest_adapter(tmp_path, manifest, declaration, marker):
+    declared = _DECLARATIONS[declaration]
+    if manifest == "none":
+        config = _target_list_config()  # Diffusers-style target lists: synthesized v1 manifest
+    else:
+        version = 1 if manifest == "v1" else 2
+        config = {
+            "runtime_manifest": _manifest(format_version=version, rotation=ROTATION if manifest == "v2_rot" else None)
+        }
+    if declared is not None:
+        config["input_rotation"] = _declaration(declared)
+    checkpoint = _write(tmp_path, config, MARKER if marker else None)
+    expected = _spec(manifest, declared, marker, rotated_in_manifest=["proj"])
+
+    model = TinyModel()
+    if expected == "refuse":
+        with pytest.raises(ValueError):
+            patch_transformer(model, checkpoint, target="auto", torch_dtype=torch.bfloat16, device="cpu")
+        assert isinstance(model.proj, nn.Linear) and isinstance(model.other, nn.Linear)
+        assert not getattr(model, "_nunchaku_lite_patch_failed", False)
+        return
+    patch_transformer(model, checkpoint, target="auto", torch_dtype=torch.bfloat16, device="cpu")
+    rotated = {name for name in ("proj", "other") if getattr(model, name).input_rotation == HADAMARD}
+    assert rotated == expected
+    assert not model._nunchaku_lite_incompatible_keys.unexpected_keys
+
+
+_QKV = "transformer_blocks.0.attn.to_qkv"
+
+
+@pytest.mark.parametrize("marker", [False, True])
+@pytest.mark.parametrize("declare", [False, True])
+@pytest.mark.parametrize("manifest", ["none", "v2_rot"])
+def test_decision_table_flux2_adapter(tmp_path, manifest, declare, marker):
+    declared = [_QKV] if declare else None
+    path = _flux2_checkpoint(tmp_path, [_QKV], declaration=declare, manifest=manifest == "v2_rot", marker=marker)
+    expected = _spec(manifest, declared, marker, rotated_in_manifest=[_QKV])
+
+    transformer = _tiny_flux2()
+    if expected == "refuse":
+        with pytest.raises(ValueError):
+            _load_flux2(path, transformer)
+        assert _flux2_is_unpatched(transformer)
+        assert not getattr(transformer, "_nunchaku_lite_patch_failed", False)
+        return
+    _load_flux2(path, transformer)
+    rotated = {
+        name
+        for name, module in transformer.named_modules()
+        if isinstance(module, SVDQW4A4Linear) and module.input_rotation == HADAMARD
+    }
+    assert rotated == expected
+    assert not transformer._nunchaku_lite_incompatible_keys.unexpected_keys

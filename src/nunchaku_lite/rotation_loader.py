@@ -17,7 +17,7 @@ refuses anything it cannot honour before the model is modified wherever possible
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 import torch
 from torch import nn
@@ -137,31 +137,42 @@ def mark_rotated_targets(checkpoint_state: dict[str, torch.Tensor], targets: Ite
         checkpoint_state[target + _MARKER_SUFFIX] = torch.empty(0)
 
 
-def bind_input_rotations(transformer: nn.Module, checkpoint_state: dict[str, torch.Tensor]) -> list[str]:
-    """Bind ``"hadamard"`` to every layer marked by :func:`mark_rotated_targets`.
+def bind_input_rotations(
+    transformer: nn.Module, checkpoint_state: dict[str, torch.Tensor], expected_targets: Sequence[str]
+) -> list[str]:
+    """Bind ``"hadamard"`` to every layer marked by :func:`mark_rotated_targets`, all or nothing.
 
-    Used after a model-specific adapter has patched the transformer and renamed the
-    checkpoint keys (markers included) to module paths. The markers are removed from
-    ``checkpoint_state``. Everything that can be checked without the patched model was
-    checked before patching; what remains here depends on the patched structure, so a
-    failure here can leave the transformer patched.
+    Used after an adapter has patched the transformer and renamed the checkpoint keys (markers
+    included) to module paths. The markers are removed from ``checkpoint_state``. Every marked
+    layer is resolved and checked first, and the count is compared with ``expected_targets``;
+    only if all of that passes is any layer bound, so a failure binds nothing.
 
     Returns:
         The module paths that were bound.
 
     Raises:
-        ValueError: If a marked target maps to no module, or to a layer whose input is
-            unsigned or quantized inside a fused MLP epilogue.
+        ValueError: If the number of markers found differs from ``expected_targets`` (the
+            adapter dropped, renamed away or duplicated some), a marked target maps to no
+            module, or to a layer whose input is unsigned or quantized inside a fused MLP
+            epilogue.
         TypeError: If a marked target maps to a module that is not an SVDQ W4A4 layer.
     """
 
     from .linear import SVDQW4A4Linear
     from .ops.fused import FUSED_MLP_FC2_ATTR
 
-    bound = []
-    for key in [key for key in checkpoint_state if key.endswith(_MARKER_SUFFIX)]:
-        checkpoint_state.pop(key)
-        path = key[: -len(_MARKER_SUFFIX)]
+    paths = [key[: -len(_MARKER_SUFFIX)] for key in checkpoint_state if key.endswith(_MARKER_SUFFIX)]
+    for path in paths:
+        checkpoint_state.pop(path + _MARKER_SUFFIX)
+    if len(paths) != len(expected_targets):
+        what = "lost" if len(paths) < len(expected_targets) else "duplicated"
+        raise ValueError(
+            f"Found {len(paths)} of {len(expected_targets)} rotated targets after patching; the adapter {what} some, "
+            "and loading them with the wrong rotation would give wrong outputs."
+        )
+
+    modules = []
+    for path in paths:
         try:
             module = transformer.get_submodule(path)
         except AttributeError as exc:
@@ -173,9 +184,10 @@ def bind_input_rotations(transformer: nn.Module, checkpoint_state: dict[str, tor
                 f"Layer {path!r} quantizes unsigned or fused-MLP activations, which cannot be rotated "
                 "(rotation needs the signed standalone quantize path)."
             )
+        modules.append(module)
+    for module in modules:
         module.input_rotation = HADAMARD
-        bound.append(path)
-    return bound
+    return paths
 
 
 def _check_fp4(where: str, *, is_fp4: bool, allow_fp4: bool) -> None:

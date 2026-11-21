@@ -18,6 +18,7 @@ from .rotation_loader import (
     mark_rotated_targets,
     parse_rotation_declaration,
     refuse_legacy_transform_tensors,
+    resolve_input_rotation,
     validate_declared_targets,
 )
 from .utils import fetch_or_download, get_precision, load_state_dict_in_safetensors
@@ -386,6 +387,11 @@ def _patch_component(
         )
     _ensure_builtin_adapters()
 
+    if getattr(transformer, "_nunchaku_lite_patch_failed", False):
+        raise RuntimeError(
+            "This transformer was partially patched by a load that failed after it started modifying the model; "
+            "its layers and forward may be in an inconsistent state. Create a new transformer and load again."
+        )
     existing_target = getattr(transformer, "_nunchaku_lite_target", None)
     if getattr(transformer, "_nunchaku_lite_patched", False):
         if target == "auto" or target == existing_target:
@@ -429,26 +435,28 @@ def _patch_component(
         backend=backend,
     )
 
-    maybe_state_dict = adapter.patch(transformer, state_dict, quantization_config, options)
-    if maybe_state_dict is not None:
-        state_dict = maybe_state_dict
-    if rotation_targets is not None:
-        # The adapter has renamed the target markers to module paths along with the checkpoint keys.
-        bound = bind_input_rotations(transformer, state_dict)
-        if len(bound) != len(rotation_targets):
-            raise ValueError(
-                f"Adapter {adapter.target!r} bound {len(bound)} of {len(rotation_targets)} rotated targets; the rest "
-                "were lost while patching, and loading them unrotated would give wrong outputs."
-            )
+    # Everything above only reads; from here on the transformer is modified. If anything fails,
+    # mark it so a retry on the same object is refused instead of building on a half-patched model
+    # (stale layers, rotations or forward wrappers).
+    try:
+        maybe_state_dict = adapter.patch(transformer, state_dict, quantization_config, options)
+        if maybe_state_dict is not None:
+            state_dict = maybe_state_dict
+        if rotation_targets is not None:
+            # The adapter has renamed the target markers to module paths along with the checkpoint keys.
+            bind_input_rotations(transformer, state_dict, rotation_targets)
 
-    if assign:
-        _coerce_state_dict_for_assign(transformer, state_dict)
-    incompatible = transformer.load_state_dict(state_dict, strict=strict, assign=assign)
-    _materialize_known_meta_tensors(transformer)
-    if device is not None:
-        transformer.to(device)
-    configure_backend(transformer, backend)
-    _install_mps_attention(transformer)
+        if assign:
+            _coerce_state_dict_for_assign(transformer, state_dict)
+        incompatible = transformer.load_state_dict(state_dict, strict=strict, assign=assign)
+        _materialize_known_meta_tensors(transformer)
+        if device is not None:
+            transformer.to(device)
+        configure_backend(transformer, backend)
+        _install_mps_attention(transformer)
+    except Exception:
+        transformer._nunchaku_lite_patch_failed = True
+        raise
 
     transformer._nunchaku_lite_patched = True
     transformer._nunchaku_lite_target = adapter.target
@@ -843,8 +851,11 @@ def _check_rotation_support(
     check_rotation_runtime(_rotation_device(device, transformer))
 
     if adapter.target == "manifest" and manifest_rotated:
+        # The manifest adapter binds these per target itself; refuse NVFP4 here, before patching.
+        for rotated in stored_manifest.rotated_targets:
+            resolve_input_rotation(rotated, allow_fp4=allow_fp4)
         state_dict.pop(ROTATION_MARKER_KEY, None)
-        return None  # binds manifest rotations per target itself, after resolving every one
+        return None
     if not getattr(adapter, "supports_input_rotation", False):
         raise ValueError(f"Checkpoint uses activation rotation, which adapter {adapter.target!r} does not support.")
     validate_declared_targets(state_dict, targets, is_fp4=precision == "nvfp4", allow_fp4=allow_fp4)

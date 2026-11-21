@@ -120,9 +120,7 @@ def svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda(
     return output, oscales, lora_act_out
 
 
-def hadamard_matrix(
-    size: int = HADAMARD_BLOCK_SIZE, dtype: torch.dtype = torch.float32, device=None
-) -> torch.Tensor:
+def hadamard_matrix(size: int = HADAMARD_BLOCK_SIZE, dtype: torch.dtype = torch.float32, device=None) -> torch.Tensor:
     """Return the orthonormal Sylvester Hadamard matrix ``H_size / sqrt(size)``.
 
     This is the exact matrix the Hadamard quantize op applies per 64-channel block
@@ -143,6 +141,9 @@ def hadamard_rotate(x: torch.Tensor, block_size: int = HADAMARD_BLOCK_SIZE) -> t
 
     Reference for the kernel's activation rotation, and the transform an exporter
     applies to the weight residual: ``qweight = Q(hadamard_rotate(R))``.
+
+    The matmul runs in ``x.dtype``. Pass a float32 (or float64) residual when packing
+    weights, so the rotated values are not rounded to half precision before quantization.
     """
 
     channels = x.shape[-1]
