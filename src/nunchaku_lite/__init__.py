@@ -14,7 +14,7 @@ from .__version__ import __version__
 
 if TYPE_CHECKING:
     from .core import TransformerAdapter, list_adapters, load_nunchaku_pipeline, patch_transformer, register_adapter
-    from .text_encoders import NunchakuT5EncoderModel
+    from .text_encoders import NunchakuT5EncoderModel, load_quantized_text_encoder, quantize_text_encoder
 
 _LAZY = {
     "TransformerAdapter": ".core",
@@ -23,6 +23,8 @@ _LAZY = {
     "patch_transformer": ".core",
     "register_adapter": ".core",
     "NunchakuT5EncoderModel": ".text_encoders",
+    "load_quantized_text_encoder": ".text_encoders",
+    "quantize_text_encoder": ".text_encoders",
 }
 
 __all__ = [
@@ -31,7 +33,9 @@ __all__ = [
     "__version__",
     "list_adapters",
     "load_nunchaku_pipeline",
+    "load_quantized_text_encoder",
     "patch_transformer",
+    "quantize_text_encoder",
     "register_adapter",
 ]
 

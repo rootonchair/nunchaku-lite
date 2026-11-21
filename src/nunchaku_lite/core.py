@@ -204,6 +204,7 @@ def load_nunchaku_pipeline(
     adapter_options: dict[str, Any] | None = None,
     quantized_encoder_checkpoints: dict[str, str | Path] | None = None,
     backend: str = "auto",
+    text_encoder_quantization: str | dict[str, str] | None = None,
     **pipeline_kwargs,
 ):
     """Load a Diffusers pipeline with its Nunchaku component installed up front.
@@ -233,6 +234,14 @@ def load_nunchaku_pipeline(
             supports T5-compatible Nunchaku checkpoints.
         backend: Quantized-kernel backend for SVDQ layers (``"auto"``,
             ``"int8"``, ``"int4"``, ``"dense"``); see :func:`patch_transformer`.
+        text_encoder_quantization: Quantize the pipeline's Transformers text
+            encoders at load time, weights only (round-to-nearest, no
+            quantized checkpoint needed): ``"int4"`` (groups of 64) or
+            ``"int8"`` (per output channel). A string applies to every
+            ``text_encoder*`` component; a dict maps component names to a
+            mode. The dense encoder is memory-mapped on the CPU and quantized
+            one layer at a time on ``device``. See
+            :func:`nunchaku_lite.text_encoders.quantize_text_encoder`.
         **pipeline_kwargs: Additional keyword arguments forwarded to
             ``pipeline_cls.from_pretrained``.
 
@@ -260,6 +269,17 @@ def load_nunchaku_pipeline(
         component_name=component_name,
         torch_dtype=torch_dtype,
         device=device,
+    )
+    quantized_encoders.update(
+        _load_runtime_quantized_text_encoders(
+            text_encoder_quantization,
+            pretrained_model_name_or_path,
+            pipeline_config=pipeline_config,
+            pipeline_kwargs=pipeline_kwargs,
+            skip=set(quantized_encoders),
+            torch_dtype=torch_dtype,
+            device=device,
+        )
     )
 
     component_cls = _resolve_pipeline_component_class(pipeline_config, component_name)
@@ -324,6 +344,73 @@ def _load_quantized_encoder_components(
             encoder_checkpoint,
             torch_dtype=_resolve_component_torch_dtype(torch_dtype, encoder_component),
             device=device,
+        )
+    return components
+
+
+def _load_runtime_quantized_text_encoders(
+    text_encoder_quantization: str | dict[str, str] | None,
+    pretrained_model_name_or_path: str | os.PathLike,
+    *,
+    pipeline_config: dict[str, Any],
+    pipeline_kwargs: dict[str, Any],
+    skip: set[str],
+    torch_dtype: torch.dtype | dict[str, torch.dtype] | None,
+    device: str | torch.device | None,
+) -> dict[str, torch.nn.Module]:
+    if not text_encoder_quantization:
+        return {}
+
+    from .text_encoders.quantize import load_quantized_text_encoder, validate_text_encoder_quantization
+
+    def is_transformers_component(name: str) -> bool:
+        spec = pipeline_config.get(name)
+        if not (isinstance(spec, (list, tuple)) and len(spec) >= 2 and spec[0] == "transformers" and spec[1]):
+            return False
+        return issubclass(_resolve_pipeline_component_class(pipeline_config, name), torch.nn.Module)
+
+    if isinstance(text_encoder_quantization, str):
+        validate_text_encoder_quantization(text_encoder_quantization)
+        requested = {
+            name: text_encoder_quantization
+            for name in sorted(pipeline_config)
+            if name.startswith("text_encoder")
+            and is_transformers_component(name)
+            and name not in skip
+            and name not in pipeline_kwargs
+        }
+        if not requested:
+            raise ValueError("text_encoder_quantization found no Transformers text_encoder* component to quantize.")
+    elif isinstance(text_encoder_quantization, dict):
+        requested = dict(text_encoder_quantization)
+        for name, weights in requested.items():
+            validate_text_encoder_quantization(weights)
+            if name in skip:
+                raise ValueError(
+                    f"{name!r} is in both quantized_encoder_checkpoints and text_encoder_quantization; pick one."
+                )
+            if name in pipeline_kwargs:
+                raise ValueError(
+                    f"pipeline_kwargs already contains {name!r}; remove it or omit it from text_encoder_quantization."
+                )
+            if not is_transformers_component(name):
+                raise ValueError(f"Pipeline component {name!r} is not a Transformers model and cannot be quantized.")
+    else:
+        raise TypeError("text_encoder_quantization must be a string, a dict, or None.")
+
+    hub_kwargs = _extract_config_loading_kwargs(pipeline_kwargs)
+    hub_kwargs.pop("user_agent", None)
+    hub_kwargs.pop("mirror", None)
+    components = {}
+    for name, weights in requested.items():
+        components[name] = load_quantized_text_encoder(
+            pretrained_model_name_or_path,
+            weights,
+            model_cls=_resolve_pipeline_component_class(pipeline_config, name),
+            subfolder=name,
+            torch_dtype=_resolve_component_torch_dtype(torch_dtype, name) or torch.bfloat16,
+            device=device,
+            **hub_kwargs,
         )
     return components
 
