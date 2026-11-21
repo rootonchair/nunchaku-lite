@@ -1006,8 +1006,9 @@ public:
                         // grow up to 64x and could overflow fp16 even when the result fits.
                         // Channel-bit layout of the mma C fragment:
                         //   bit0 = half2 element (x/y)   bits1-2 = laneId bits 0-1
-                        //   bit3 = data[0/2] vs data[1/3] pair   bits4-5 = tmp[j] index
-                        // (data[k] bit0 selects the token row, not a channel.)
+                        //   bit3 = data[k] bit 1 (data[0/1] vs data[2/3], smoothed by ws1 / ws2)
+                        //   bits4-5 = tmp[j] index
+                        // (data[k] bit 0 selects the token row, not a channel.)
                         const half2_t hnorm = half2_t(half_t(0.125f), half_t(0.125f));
 #pragma unroll
                         for (int j = 0; j < NUM_PACKS; j++) {

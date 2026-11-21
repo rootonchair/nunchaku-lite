@@ -25,6 +25,16 @@ requires_native_hadamard = pytest.mark.skipif(
 )
 
 
+def _skip_unsupported(dtype=None, fp4=False):
+    """Skip kernel paths the GPU cannot run: they trap on the device and poison the CUDA context."""
+
+    major = torch.cuda.get_device_capability()[0]
+    if fp4 and major < 12:
+        pytest.skip("NVFP4 needs a Blackwell GPU (compute capability 12.x)")
+    if dtype is torch.bfloat16 and major < 8:
+        pytest.skip("bf16 W4A4 kernels need compute capability 8.0+")
+
+
 # --- reference matrix (CPU) -------------------------------------------------------------
 
 
@@ -134,6 +144,7 @@ def test_hadamard_wrapper_rejects_channels_not_multiple_of_64(monkeypatch):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tokens,channels", [(256, 3072), (300, 1024)])
 def test_native_hadamard_op_matches_plain_op_on_prerotated_input(dtype, tokens, channels):
+    _skip_unsupported(dtype)
     # With a uniform smooth factor (layout-independent), rotating inside the kernel must
     # equal feeding the plain op an input rotated in PyTorch. Small differences come only
     # from fp16/bf16 rounding of the in-register FWHT vs the fp32 reference.
@@ -173,6 +184,7 @@ def test_pack_smooth_inverts_the_runtime_unpacker():
 @pytest.mark.parametrize("fp4", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_native_hadamard_op_rotates_after_per_channel_smoothing(dtype, fp4):
+    _skip_unsupported(dtype, fp4=fp4)
     # With a random per-channel smooth factor, smoothing and rotation do not commute, so this
     # pins the order the weights were packed for: quantize(H64/8 @ (x / smooth)). The reference
     # rotates the smoothed input in PyTorch and feeds the plain op with smooth = 1.
@@ -236,6 +248,7 @@ def test_native_hadamard_op_lora_branch_sees_unrotated_input():
 
 @requires_native_hadamard
 def test_rotated_linear_forward_compiles_fullgraph():
+    _skip_unsupported(torch.bfloat16)
     from nunchaku_lite.linear import SVDQW4A4Linear
 
     torch.manual_seed(0)
@@ -258,6 +271,7 @@ def test_rotated_linear_forward_compiles_fullgraph():
 
 @requires_native_hadamard
 def test_native_hadamard_op_compiles_fullgraph():
+    _skip_unsupported(torch.bfloat16)
     device = torch.device("cuda")
     x = torch.randn(256, 1024, device=device, dtype=torch.bfloat16)
     smooth = torch.ones(1024, device=device, dtype=torch.bfloat16)

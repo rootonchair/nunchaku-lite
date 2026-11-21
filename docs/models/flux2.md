@@ -105,9 +105,11 @@ FLUX.2 Klein INT4 checkpoints can be exported with an online Hadamard rotation, 
 activation outliers before 4-bit quantization. On FLUX.2-klein INT4 it lowers quantization error per
 layer (median +1.7 dB output SQNR; about 0.82x whole-model output error) for roughly 0.1% extra
 transformer time. At 4 sampling steps, end-to-end image metrics were within run-to-run noise.
-Rotated checkpoints load like any other; nothing changes in your code.
-They need the CUDA kernels that include `quantize_w4a4_act_hadamard_fuse_lora`. MPS and MLX
-refuse them at load time.
+Rotated INT4 checkpoints load with the usual `patch_transformer` / pipeline calls. They need CUDA
+kernels that include `quantize_w4a4_act_hadamard_fuse_lora`; the prebuilt Hub kernels gain it with
+the first kernel release after this format, and until then such checkpoints are refused at load.
+MPS and MLX refuse them at load time too. Rotated NVFP4 checkpoints also need an explicit opt-in
+(see below).
 
 A checkpoint declares rotation by name, `{"type": "hadamard"}`, in one of two ways. Both make
 Nunchaku Lite versions older than this format refuse the checkpoint instead of silently loading it

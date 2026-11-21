@@ -118,6 +118,19 @@ def test_format_v1_without_rotation_still_parses():
     assert _parse(_manifest(format_version=1, rotation=None)).rotated_targets == ()
 
 
+def test_null_rotation_counts_as_absent():
+    manifest = _manifest(format_version=1, rotation=None)
+    manifest["targets"][0]["op_options"] = {"rotation": None}
+    parsed = _parse(manifest)
+    assert parsed.rotated_targets == () and parsed.targets[0].rotation is None
+
+
+def test_legacy_format_version_constant_is_kept():
+    from nunchaku_lite.manifest import SUPPORTED_FORMAT_VERSION, SUPPORTED_FORMAT_VERSIONS
+
+    assert SUPPORTED_FORMAT_VERSION == 1 and SUPPORTED_FORMAT_VERSION in SUPPORTED_FORMAT_VERSIONS
+
+
 def test_rotation_requires_format_v2():
     with pytest.raises(ValueError, match="nunchaku_format_version >= 2"):
         _parse(_manifest(format_version=1))
@@ -167,7 +180,7 @@ def test_rotation_declaration_parses():
     [
         ({**_declaration(["a"]), "format_version": 1}, ValueError, "format_version"),
         ({"format_version": 2, "type": "hadamard"}, TypeError, "targets"),
-        (_declaration([]), TypeError, "targets"),
+        (_declaration([]), ValueError, "must not be empty"),
         (_declaration(["a", 3]), TypeError, "targets"),
         (_declaration(["a", "a"]), ValueError, "more than once"),
         ({**_declaration(["a"]), "type": "block_matrix"}, ValueError, "pre-release"),

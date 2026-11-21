@@ -13,6 +13,7 @@ from typing import Any
 SCHEMA = "nunchaku_lite.runtime_manifest"
 SUPPORTED_VERSION = 1
 SUPPORTED_FORMAT_VERSIONS = (1, 2)
+SUPPORTED_FORMAT_VERSION = 1  # pre-rotation name for the baseline version, kept for importers
 # Format version 2 adds online activation rotation, per target ``op_options.rotation``. Loaders
 # that predate rotation refuse version 2 instead of silently producing wrong outputs. Checkpoints
 # without a manifest (loaded through a model-specific adapter) declare rotation in
@@ -292,7 +293,7 @@ def _parse_target(index: int, raw: Any) -> RuntimeManifestTarget:
     if not all(isinstance(item, str) for item in roles):
         raise ValueError(f"runtime_manifest target {checkpoint_prefix!r} roles must be strings.")
 
-    if "rotation" in op_options:
+    if op_options.get("rotation") is not None:  # null means absent, as in RuntimeManifestTarget.rotation
         _validate_rotation(f"runtime_manifest target {checkpoint_prefix!r}", nunchaku_op, op_options["rotation"])
 
     if nunchaku_op == "adanorm_awq_w4a16":
@@ -363,8 +364,10 @@ def parse_rotation_declaration(quantization_config: dict[str, Any]) -> tuple[str
     if version != ROTATION_FORMAT_VERSION:
         raise ValueError(f"Unsupported {where}.format_version {version!r}; expected {ROTATION_FORMAT_VERSION}.")
     targets = raw.get("targets")
-    if not isinstance(targets, list) or not targets or not all(isinstance(t, str) and t for t in targets):
-        raise TypeError(f"{where}.targets must be a non-empty list of checkpoint prefixes.")
+    if not isinstance(targets, list) or not all(isinstance(t, str) and t for t in targets):
+        raise TypeError(f"{where}.targets must be a list of checkpoint prefixes.")
+    if not targets:
+        raise ValueError(f"{where}.targets must not be empty.")
     if len(set(targets)) != len(targets):
         raise ValueError(f"{where}.targets lists a target more than once.")
     _validate_rotation(where, "svdq_w4a4", {k: v for k, v in raw.items() if k not in ("format_version", "targets")})
