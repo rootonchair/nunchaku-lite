@@ -13,11 +13,12 @@ from typing import Any
 SCHEMA = "nunchaku_lite.runtime_manifest"
 SUPPORTED_VERSION = 1
 SUPPORTED_FORMAT_VERSIONS = (1, 2)
-# Format version 2 adds online activation rotation, per target ``op_options.rotation``. Rotated
-# checkpoints must carry such a manifest (an optional model-level
-# ``quantization_config.input_rotation`` declaration must list the same targets): loaders that
-# predate rotation refuse version 2 instead of silently producing wrong outputs, but they ignore
-# a model-level declaration on its own.
+# Format version 2 adds online activation rotation, per target ``op_options.rotation``. Loaders
+# that predate rotation refuse version 2 instead of silently producing wrong outputs. Checkpoints
+# without a manifest (loaded through a model-specific adapter) declare rotation in
+# ``quantization_config.input_rotation`` instead, which older loaders ignore, so they also carry
+# the empty ``ROTATION_MARKER_KEY`` tensor, which older loaders reject as an unexpected key under
+# strict loading.
 ROTATION_FORMAT_VERSION = 2
 # ``hadamard``: per contiguous 64-channel block (logical channel order) of the smoothed
 # activations, multiply by the orthonormal Sylvester Hadamard matrix ``H64 / 8``; the low-rank
@@ -25,6 +26,7 @@ ROTATION_FORMAT_VERSION = 2
 # The name is fixed to that definition: a different transform needs a new name.
 SUPPORTED_ROTATION_TYPES = {"hadamard"}
 ROTATION_DECLARATION_KEY = "input_rotation"
+ROTATION_MARKER_KEY = "nunchaku_lite.input_rotation"
 # Tensors of the abandoned pre-release ``block_matrix`` format, refused with a conversion hint.
 LEGACY_INPUT_TRANSFORM_SUFFIX = ".input_transform"
 SUPPORTED_OPS = {"svdq_w4a4", "awq_w4a16", "adanorm_awq_w4a16"}
@@ -340,8 +342,9 @@ def parse_rotation_declaration(quantization_config: dict[str, Any]) -> tuple[str
     """Parse the model-level ``quantization_config["input_rotation"]`` declaration.
 
     ``{"format_version": 2, "type": "hadamard", "targets": [<checkpoint prefix>, ...]}`` lists the
-    rotated ``svdq_w4a4`` layers. It is optional and only valid alongside a version 2 runtime
-    manifest declaring rotation on the same targets.
+    rotated ``svdq_w4a4`` layers. Checkpoints without manifest rotation need it together with the
+    ``ROTATION_MARKER_KEY`` tensor; alongside a version 2 manifest it is optional and must list the
+    manifest's rotated targets.
 
     Returns:
         The declared checkpoint prefixes, or ``None`` when there is no declaration.

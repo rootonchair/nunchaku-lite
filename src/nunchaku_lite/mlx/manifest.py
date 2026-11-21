@@ -17,6 +17,7 @@ from mlx import nn
 from ..manifest import (
     LEGACY_INPUT_TRANSFORM_SUFFIX,
     ROTATION_DECLARATION_KEY,
+    ROTATION_MARKER_KEY,
     RuntimeManifest,
     RuntimeManifestTarget,
     parse_runtime_manifest,
@@ -50,7 +51,7 @@ def refuse_rotated_checkpoint(
     rotated = (
         (manifest is not None and manifest.rotated_targets)
         or quantization_config.get(ROTATION_DECLARATION_KEY) is not None
-        or any(key.endswith(LEGACY_INPUT_TRANSFORM_SUFFIX) for key in checkpoint_keys)
+        or any(key == ROTATION_MARKER_KEY or key.endswith(LEGACY_INPUT_TRANSFORM_SUFFIX) for key in checkpoint_keys)
     )
     if rotated:
         raise NotImplementedError(

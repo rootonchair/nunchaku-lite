@@ -11,7 +11,7 @@ from typing import Any, Protocol
 
 import torch
 
-from .manifest import RuntimeManifest, parse_runtime_manifest, with_target_list_manifest
+from .manifest import ROTATION_MARKER_KEY, RuntimeManifest, parse_runtime_manifest, with_target_list_manifest
 from .rotation import (
     bind_input_rotations,
     check_rotation_runtime,
@@ -797,48 +797,55 @@ def _check_rotation_support(
 ) -> tuple[str, ...] | None:
     """Refuse checkpoints whose activation rotation cannot be honoured, before patching.
 
-    Rotated checkpoints must carry a ``nunchaku_format_version`` 2 runtime manifest stored in the
-    checkpoint (``stored_manifest``; not one synthesized from target lists), so that loaders which
-    predate rotation refuse them. Its rotated targets are authoritative; a model-level
-    ``input_rotation`` declaration is optional and must list the same targets.
+    Rotation is declared either per target in a ``nunchaku_format_version`` 2 runtime manifest
+    stored in the checkpoint (``stored_manifest``; not one synthesized from target lists), or in
+    the model-level ``input_rotation`` declaration together with the ``ROTATION_MARKER_KEY``
+    tensor. Both make loaders that predate rotation refuse the checkpoint. When both a manifest
+    and a declaration are present they must agree.
 
     Loading rotated weights without binding the rotation would silently give wrong outputs, so
-    every check that does not need the patched model runs here. For a model-specific adapter,
-    marks the rotated targets in ``state_dict`` and returns them; the caller binds them with
-    :func:`~nunchaku_lite.rotation.bind_input_rotations` after patching. Returns ``None`` when
-    there is nothing to bind outside the manifest adapter.
+    every check that does not need the patched model runs here. Unless the manifest adapter binds
+    manifest rotations itself, marks the rotated targets in ``state_dict`` and returns them; the
+    caller binds them with :func:`~nunchaku_lite.rotation.bind_input_rotations` after patching.
     """
 
     refuse_legacy_transform_tensors(state_dict)
     declared = parse_rotation_declaration(quantization_config)
+    has_marker = ROTATION_MARKER_KEY in state_dict
     manifest_rotated = (
         tuple(target.checkpoint_prefix for target in stored_manifest.rotated_targets) if stored_manifest else ()
     )
+    if has_marker and declared is None:
+        raise ValueError(
+            f"Checkpoint has the {ROTATION_MARKER_KEY!r} rotation marker but no quantization_config.input_rotation "
+            "declaration listing the rotated targets."
+        )
     if declared is None and not manifest_rotated:
         return None
-    if not manifest_rotated:
-        raise ValueError(
-            "Checkpoint declares quantization_config.input_rotation but has no runtime_manifest "
-            "(nunchaku_format_version 2) with op_options.rotation on its rotated targets. Rotated checkpoints must "
-            "carry one, so that older Nunchaku Lite versions refuse them instead of loading them without rotation."
-        )
-    if declared is not None and set(declared) != set(manifest_rotated):
+    if manifest_rotated and declared is not None and set(declared) != set(manifest_rotated):
         raise ValueError(
             "quantization_config.input_rotation.targets do not match the runtime_manifest targets that declare "
             "op_options.rotation; the checkpoint metadata is inconsistent."
         )
+    if not manifest_rotated and not has_marker:
+        raise ValueError(
+            "Checkpoint declares quantization_config.input_rotation without a runtime_manifest "
+            f"(nunchaku_format_version 2) declaring the rotation or the {ROTATION_MARKER_KEY!r} marker tensor. "
+            "One of them is required, so that older Nunchaku Lite versions refuse the checkpoint instead of "
+            "loading it without rotation."
+        )
+    targets = manifest_rotated or declared
     check_rotation_runtime(_rotation_device(device, transformer))
 
-    if adapter.target == "manifest":
-        return None  # binds per target itself, after resolving every rotation
+    if adapter.target == "manifest" and manifest_rotated:
+        state_dict.pop(ROTATION_MARKER_KEY, None)
+        return None  # binds manifest rotations per target itself, after resolving every one
     if not getattr(adapter, "supports_input_rotation", False):
-        raise ValueError(
-            f"Checkpoint uses activation rotation, which adapter {adapter.target!r} does not support; "
-            "load it with target='manifest' (or 'auto')."
-        )
-    validate_declared_targets(state_dict, manifest_rotated, is_fp4=precision == "nvfp4", allow_fp4=allow_fp4)
-    mark_rotated_targets(state_dict, manifest_rotated)
-    return manifest_rotated
+        raise ValueError(f"Checkpoint uses activation rotation, which adapter {adapter.target!r} does not support.")
+    validate_declared_targets(state_dict, targets, is_fp4=precision == "nvfp4", allow_fp4=allow_fp4)
+    state_dict.pop(ROTATION_MARKER_KEY, None)
+    mark_rotated_targets(state_dict, targets)
+    return targets
 
 
 def _rotation_device(device: str | torch.device | None, transformer: torch.nn.Module) -> torch.device:

@@ -18,6 +18,8 @@ class ManifestAdapter:
     """Generic adapter driven by ``quantization_config.runtime_manifest``."""
 
     target = "manifest"
+    # Rotations declared at model level (target-list checkpoints) are bound by core after patching.
+    supports_input_rotation = True
 
     def matches(self, transformer: torch.nn.Module) -> bool:
         """The manifest adapter is selected from checkpoint metadata, not model type."""

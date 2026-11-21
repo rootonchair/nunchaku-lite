@@ -245,7 +245,7 @@ def test_manifest_with_matching_declaration_loads(tmp_path):
     assert transformer.proj.input_rotation == HADAMARD
 
 
-@pytest.mark.parametrize("manifest_rotation,match", [(ROTATION, "inconsistent"), (None, "has no runtime_manifest")])
+@pytest.mark.parametrize("manifest_rotation,match", [(ROTATION, "inconsistent"), (None, "marker tensor")])
 def test_manifest_with_inconsistent_declaration_is_refused(tmp_path, manifest_rotation, match):
     config = {"runtime_manifest": _manifest(rotation=manifest_rotation), "input_rotation": _declaration(["other"])}
     checkpoint = _write(tmp_path, config)
@@ -255,12 +255,31 @@ def test_manifest_with_inconsistent_declaration_is_refused(tmp_path, manifest_ro
     assert isinstance(model.proj, nn.Linear)
 
 
-def test_target_list_declaration_without_stored_manifest_is_refused(tmp_path):
+MARKER = {"nunchaku_lite.input_rotation": torch.empty(0)}
+
+
+def test_target_list_declaration_without_marker_is_refused(tmp_path):
+    # Older loaders synthesize a v1 manifest from the target lists and ignore the declaration.
     checkpoint = _write(tmp_path, _target_list_config(_declaration(["proj"])))
     model = TinyModel()
-    with pytest.raises(ValueError, match="older Nunchaku Lite versions refuse them"):
+    with pytest.raises(ValueError, match="marker tensor"):
         patch_transformer(model, checkpoint, target="auto", torch_dtype=torch.bfloat16, device="cpu")
     assert isinstance(model.proj, nn.Linear)
+
+
+def test_target_list_declaration_with_marker_loads(tmp_path):
+    checkpoint = _write(tmp_path, _target_list_config(_declaration(["proj"])), MARKER)
+    transformer = TinyModel()
+    patch_transformer(transformer, checkpoint, target="auto", torch_dtype=torch.bfloat16, device="cpu")
+    assert transformer._nunchaku_lite_target == "manifest"
+    assert transformer.proj.input_rotation == HADAMARD and transformer.other.input_rotation is None
+    assert not transformer._nunchaku_lite_incompatible_keys.unexpected_keys
+
+
+def test_marker_without_declaration_is_refused(tmp_path):
+    checkpoint = _write(tmp_path, {"runtime_manifest": _manifest(rotation=None)}, MARKER)
+    with pytest.raises(ValueError, match="no quantization_config.input_rotation declaration"):
+        patch_transformer(TinyModel(), checkpoint, target="auto", torch_dtype=torch.bfloat16, device="cpu")
 
 
 def test_pre_release_input_transform_tensors_are_refused(tmp_path):
@@ -369,13 +388,17 @@ def _rotated_manifest(prefixes, precision="int4"):
     return manifest
 
 
-def _flux2_checkpoint(tmp_path, rotated, *, declaration=True, manifest=True, precision="int4", rename=None):
+def _flux2_checkpoint(
+    tmp_path, rotated, *, declaration=True, manifest=True, marker=False, precision="int4", rename=None
+):
     source = _tiny_flux2()
     Flux2Adapter().patch(source, {}, {"rank": 16}, _options())
     state = {k: v.contiguous() for k, v in source.state_dict().items()}
     if rename is not None:
         old, new = rename
         state = {(new + k[len(old) :] if k.startswith(old) else k): v for k, v in state.items()}
+    if marker:
+        state.update(MARKER)
     config = {"rank": 16}
     if manifest:
         config["runtime_manifest"] = _rotated_manifest(rotated, precision)
@@ -398,7 +421,14 @@ def _flux2_is_unpatched(transformer):
     )
 
 
-@pytest.mark.parametrize("declaration", [True, False])
+@pytest.mark.parametrize(
+    "source",
+    [
+        {"declaration": True},  # manifest + matching declaration
+        {"declaration": False},  # manifest only
+        {"manifest": False, "marker": True},  # no manifest: declaration + marker (klein)
+    ],
+)
 @pytest.mark.parametrize(
     "qkv_target,rename",
     [
@@ -407,9 +437,9 @@ def _flux2_is_unpatched(transformer):
         ("transformer_blocks.0.qkv_proj", ("transformer_blocks.0.attn.to_qkv.", "transformer_blocks.0.qkv_proj.")),
     ],
 )
-def test_flux2_adapter_binds_manifest_rotated_targets(tmp_path, qkv_target, rename, declaration):
+def test_flux2_adapter_binds_rotated_targets(tmp_path, qkv_target, rename, source):
     rotated = [qkv_target, "single_transformer_blocks.0.attn.mlp_fc2"]
-    transformer = _load_flux2(_flux2_checkpoint(tmp_path, rotated, declaration=declaration, rename=rename))
+    transformer = _load_flux2(_flux2_checkpoint(tmp_path, rotated, rename=rename, **source))
 
     assert transformer.transformer_blocks[0].attn.to_qkv.input_rotation == HADAMARD
     assert transformer.single_transformer_blocks[0].attn.mlp_fc2.input_rotation == HADAMARD
@@ -418,13 +448,24 @@ def test_flux2_adapter_binds_manifest_rotated_targets(tmp_path, qkv_target, rena
     assert not transformer._nunchaku_lite_incompatible_keys.unexpected_keys
 
 
-def test_flux2_declaration_without_stored_manifest_is_refused(tmp_path):
+def test_flux2_declaration_without_manifest_or_marker_is_refused(tmp_path):
     # Older loaders ignore a model-level declaration and would load these weights unrotated.
     path = _flux2_checkpoint(tmp_path, ["transformer_blocks.0.attn.to_qkv"], manifest=False)
     transformer = _tiny_flux2()
-    with pytest.raises(ValueError, match="older Nunchaku Lite versions refuse them"):
+    with pytest.raises(ValueError, match="marker tensor"):
         _load_flux2(path, transformer)
     assert _flux2_is_unpatched(transformer)
+
+
+def test_flux2_marker_checkpoint_loads_with_auto(tmp_path):
+    # No manifest, so target="auto" picks the FLUX.2 adapter from the model class, as for unrotated klein.
+    path = _flux2_checkpoint(tmp_path, ["transformer_blocks.0.attn.to_qkv"], manifest=False, marker=True)
+    transformer = patch_transformer(
+        _tiny_flux2(), path, target="auto", precision="int4", torch_dtype=torch.bfloat16, device="cpu"
+    )
+    assert transformer._nunchaku_lite_target == "flux2"
+    assert transformer.transformer_blocks[0].attn.to_qkv.input_rotation == HADAMARD
+    assert not transformer._nunchaku_lite_incompatible_keys.unexpected_keys
 
 
 def test_flux2_declaration_must_match_manifest(tmp_path):

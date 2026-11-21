@@ -109,18 +109,22 @@ Rotated checkpoints load like any other; nothing changes in your code.
 They need the CUDA kernels that include `quantize_w4a4_act_hadamard_fuse_lora`. MPS and MLX
 refuse them at load time.
 
-A rotated checkpoint must carry a runtime manifest with `nunchaku_format_version: 2` in its
-`quantization_config`, declaring the rotation by name on each rotated target:
+A checkpoint declares rotation by name, `{"type": "hadamard"}`, in one of two ways. Both make
+Nunchaku Lite versions older than this format refuse the checkpoint instead of silently loading it
+without its rotation.
 
-```json
-"op_options": {"rotation": {"type": "hadamard"}}
-```
+- **Checkpoints with a runtime manifest** (loaded by the generic manifest adapter): each rotated
+  target carries `"op_options": {"rotation": {"type": "hadamard"}}`, and the manifest has
+  `nunchaku_format_version: 2`. Older versions refuse version 2 manifests.
+- **Checkpoints without a manifest** (loaded by a model adapter, as FLUX.2 Klein is): the
+  `quantization_config` lists the rotated layers in
+  `"input_rotation": {"format_version": 2, "type": "hadamard", "targets": [...]}`, and the checkpoint
+  contains one empty marker tensor named `nunchaku_lite.input_rotation`. Older versions ignore the
+  declaration but reject the unknown marker tensor under the default `strict=True`.
 
-Versions of Nunchaku Lite older than this format refuse version 2 manifests, so they can't
-silently load a rotated checkpoint without its rotation. An optional model-level declaration
-`"input_rotation": {"format_version": 2, "type": "hadamard", "targets": [...]}` must list the same
-targets. A declaration without such a manifest is refused, because older versions would ignore it.
-The manifest's rotated targets also load through `target="flux2"`.
+A declaration without a v2 manifest or the marker is refused, and so is a marker without a
+declaration. If a manifest and a declaration are both present, they must list the same targets.
+Layers that aren't listed run unrotated.
 
 `"hadamard"` has exactly one meaning. For each block of 64 contiguous input channels, in logical
 channel order, the smoothed activations `x / smooth` are multiplied by the orthonormal Sylvester

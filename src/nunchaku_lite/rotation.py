@@ -2,11 +2,14 @@
 
 A rotated ``svdq_w4a4`` layer was exported with its residual weight packed as
 ``Q(R @ blockdiag(H64 / 8))`` and must run the Hadamard quantize op. Checkpoints declare it by
-name, ``{"type": "hadamard"}`` (defined in :mod:`nunchaku_lite.manifest`), per target in a
-``nunchaku_format_version`` 2 runtime manifest stored in the checkpoint, which loaders that
-predate rotation refuse. An optional model-level ``quantization_config["input_rotation"]``
-declaration must list the same targets. The manifest adapter binds the rotated targets itself;
-model-specific adapters that support rotation get them bound by :func:`bind_input_rotations`.
+name, ``{"type": "hadamard"}`` (defined in :mod:`nunchaku_lite.manifest`):
+
+* per target in a ``nunchaku_format_version`` 2 runtime manifest stored in the checkpoint; or
+* for checkpoints without a manifest, in ``quantization_config["input_rotation"]`` listing the
+  rotated targets, together with the empty ``nunchaku_lite.input_rotation`` marker tensor.
+
+Both make loaders that predate rotation refuse the checkpoint. The manifest adapter binds
+manifest rotations itself; every other case is bound by :func:`bind_input_rotations`.
 
 The kernel never decides anything at run time: the loader binds the op per layer, once, and
 refuses anything it cannot honour before the model is modified wherever possible.

@@ -633,6 +633,8 @@ def test_rotation_declaration_and_legacy_transforms_are_refused():
         refuse_rotated_checkpoint(None, {"input_rotation": {"format_version": 2}}, [])
     with pytest.raises(NotImplementedError, match="not supported on MLX"):
         refuse_rotated_checkpoint(None, {}, ["proj.input_transform"])
+    with pytest.raises(NotImplementedError, match="not supported on MLX"):
+        refuse_rotated_checkpoint(None, {}, ["proj.qweight", "nunchaku_lite.input_rotation"])
 
 
 def test_quantization_config_falls_back_to_config_json(tmp_path):
