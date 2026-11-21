@@ -18,6 +18,7 @@ from torch import nn
 from ..core import PatchOptions, register_adapter
 from ..linear import AWQW4A16Linear, SVDQW4A4Linear
 from ..ops.fused import (
+    FUSED_MLP_FC2_ATTR,
     fused_affine_modulate,
     fused_cross_head_qk_norm_rope,
     fused_gelu_mlp,
@@ -41,6 +42,7 @@ def _patch_ltx2_feed_forward(ff: FeedForward, context: SVDQPatchContext) -> Feed
     )
     if len(ff.net) > 2 and isinstance(ff.net[2], SVDQW4A4Linear):
         ff.net[2].act_unsigned = False
+        setattr(ff.net[2], FUSED_MLP_FC2_ATTR, True)
     ff._nunchaku_lite_ltx2_original_forward = ff.forward
     ff.forward = types.MethodType(_ltx2_feed_forward, ff)
     return ff

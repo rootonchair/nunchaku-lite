@@ -10,7 +10,7 @@ import mlx.core as mx
 from mlx import nn
 
 from .linear import AWQW4A16Linear, SVDQW4A4Linear, resolve_backend
-from .manifest import apply_runtime_manifest, parse_runtime_manifest
+from .manifest import apply_runtime_manifest, parse_runtime_manifest, refuse_rotated_checkpoint
 
 __all__ = ["configure_backend", "load_checkpoint", "load_dense_weights", "patch_transformer", "svdq_layer_from_state"]
 
@@ -216,6 +216,7 @@ def patch_transformer(
     state, quantization_config = load_checkpoint(checkpoint, return_quantization_config=True)
     key_map = key_map or (lambda key: key)
     manifest = parse_runtime_manifest(quantization_config, checkpoint_keys=state)
+    refuse_rotated_checkpoint(manifest, quantization_config, state)
     if manifest is not None:
         consumed = apply_runtime_manifest(model, state, manifest, key_map=key_map, dtype=dtype)
         load_dense_weights(model, [(key_map(k), v) for k, v in state.items() if k not in consumed], strict)

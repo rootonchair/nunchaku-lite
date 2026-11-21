@@ -12,7 +12,24 @@ from typing import Any
 
 SCHEMA = "nunchaku_lite.runtime_manifest"
 SUPPORTED_VERSION = 1
-SUPPORTED_FORMAT_VERSION = 1
+SUPPORTED_FORMAT_VERSIONS = (1, 2)
+SUPPORTED_FORMAT_VERSION = 1  # pre-rotation name for the baseline version, kept for importers
+# Format version 2 adds online activation rotation, per target ``op_options.rotation``. Loaders
+# that predate rotation refuse version 2 instead of silently producing wrong outputs. Checkpoints
+# without a manifest (loaded through a model-specific adapter) declare rotation in
+# ``quantization_config.input_rotation`` instead, which older loaders ignore, so they also carry
+# the empty ``ROTATION_MARKER_KEY`` tensor, which older loaders reject as an unexpected key under
+# strict loading.
+ROTATION_FORMAT_VERSION = 2
+# ``hadamard``: per contiguous 64-channel block (logical channel order) of the smoothed
+# activations, multiply by the orthonormal Sylvester Hadamard matrix ``H64 / 8``; the low-rank
+# branch sees the unrotated input and the packed residual weight is ``Q(R @ blockdiag(H64 / 8))``.
+# The name is fixed to that definition: a different transform needs a new name.
+SUPPORTED_ROTATION_TYPES = {"hadamard"}
+ROTATION_DECLARATION_KEY = "input_rotation"
+ROTATION_MARKER_KEY = "nunchaku_lite.input_rotation"
+# Tensors of the abandoned pre-release ``block_matrix`` format, refused with a conversion hint.
+LEGACY_INPUT_TRANSFORM_SUFFIX = ".input_transform"
 SUPPORTED_OPS = {"svdq_w4a4", "awq_w4a16", "adanorm_awq_w4a16"}
 SUPPORTED_PRECISIONS = {"int4", "fp4"}
 SUPPORTED_KINDS = {"linear"}
@@ -34,6 +51,13 @@ class RuntimeManifestTarget:
     has_bias: bool
     op_options: dict[str, Any] = field(default_factory=dict)
     activation: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def rotation(self) -> dict[str, Any] | None:
+        """Return the validated ``op_options.rotation`` metadata, or ``None``."""
+
+        rotation = self.op_options.get("rotation")
+        return dict(rotation) if isinstance(rotation, dict) else None
 
     @property
     def runtime_precision(self) -> str:
@@ -79,6 +103,12 @@ class RuntimeManifest:
 
         return int(self.requirements.get("rank", 32))
 
+    @property
+    def rotated_targets(self) -> tuple[RuntimeManifestTarget, ...]:
+        """Return the targets that declare an online activation rotation."""
+
+        return tuple(target for target in self.targets if target.rotation is not None)
+
 
 def parse_runtime_manifest(
     quantization_config: dict[str, Any], checkpoint_keys: Iterable[str] | None = None
@@ -108,10 +138,10 @@ def parse_runtime_manifest(
         raise ValueError(f"Unsupported runtime_manifest version {version}; expected {SUPPORTED_VERSION}.")
 
     nunchaku_format_version = _required(raw, "nunchaku_format_version", int)
-    if nunchaku_format_version != SUPPORTED_FORMAT_VERSION:
+    if nunchaku_format_version not in SUPPORTED_FORMAT_VERSIONS:
         raise ValueError(
             "Unsupported runtime_manifest nunchaku_format_version "
-            f"{nunchaku_format_version}; expected {SUPPORTED_FORMAT_VERSION}."
+            f"{nunchaku_format_version}; expected one of {SUPPORTED_FORMAT_VERSIONS}."
         )
 
     component = _required(raw, "component", str)
@@ -128,6 +158,14 @@ def parse_runtime_manifest(
     if precision not in (*SUPPORTED_PRECISIONS, "mixed"):
         raise ValueError(f"Unsupported runtime_manifest requirements.precision {precision!r}.")
 
+    targets = tuple(_parse_target(index, target) for index, target in enumerate(targets_raw))
+    rotated = [target.checkpoint_prefix for target in targets if target.rotation is not None]
+    if rotated and nunchaku_format_version < ROTATION_FORMAT_VERSION:
+        raise ValueError(
+            f"runtime_manifest targets {rotated[:3]} declare op_options.rotation, which requires "
+            f"nunchaku_format_version >= {ROTATION_FORMAT_VERSION}; got {nunchaku_format_version}."
+        )
+
     return RuntimeManifest(
         schema=schema,
         version=version,
@@ -136,7 +174,7 @@ def parse_runtime_manifest(
         producer=dict(producer),
         requirements=dict(requirements),
         structural_patches=tuple(_validate_structural_patch(patch) for patch in structural_patches),
-        targets=tuple(_parse_target(index, target) for index, target in enumerate(targets_raw)),
+        targets=targets,
     )
 
 
@@ -197,7 +235,7 @@ def _manifest_from_target_lists(quantization_config: dict[str, Any], keys: set[s
         "schema": SCHEMA,
         "version": SUPPORTED_VERSION,
         "component": "transformer",
-        "nunchaku_format_version": SUPPORTED_FORMAT_VERSION,
+        "nunchaku_format_version": 1,  # synthesized targets never carry rotation
         "producer": {"name": "nunchaku_lite.config_target_lists", "version": "1"},
         "requirements": {
             "method": "svdquant",
@@ -255,6 +293,9 @@ def _parse_target(index: int, raw: Any) -> RuntimeManifestTarget:
     if not all(isinstance(item, str) for item in roles):
         raise ValueError(f"runtime_manifest target {checkpoint_prefix!r} roles must be strings.")
 
+    if op_options.get("rotation") is not None:  # null means absent, as in RuntimeManifestTarget.rotation
+        _validate_rotation(f"runtime_manifest target {checkpoint_prefix!r}", nunchaku_op, op_options["rotation"])
+
     if nunchaku_op == "adanorm_awq_w4a16":
         splits = op_options.get("adanorm_splits")
         if splits not in {3, 6}:
@@ -276,6 +317,61 @@ def _parse_target(index: int, raw: Any) -> RuntimeManifestTarget:
         op_options=dict(op_options),
         activation=dict(activation),
     )
+
+
+def _validate_rotation(where: str, nunchaku_op: str, rotation: Any) -> None:
+    """Validate one rotation object, ``{"type": "hadamard"}``; ``where`` names it in errors."""
+
+    if not isinstance(rotation, dict):
+        raise TypeError(f"{where}: rotation must be a JSON object like {{'type': 'hadamard'}}.")
+    if nunchaku_op != "svdq_w4a4":
+        raise ValueError(f"{where}: rotation is only supported for svdq_w4a4.")
+    rotation_type = rotation.get("type")
+    if rotation_type == "block_matrix":
+        raise ValueError(
+            f"{where} uses the pre-release {{'type': 'block_matrix'}} rotation format; replace it with "
+            "{'type': 'hadamard'} and drop the .input_transform tensors (the packed weights are unchanged)."
+        )
+    if rotation_type not in SUPPORTED_ROTATION_TYPES:
+        raise ValueError(f"{where} has unsupported rotation type {rotation_type!r}; expected 'hadamard'.")
+    unknown = sorted(set(rotation) - {"type"})
+    if unknown:
+        raise ValueError(f"{where}: unknown rotation fields {unknown}; 'hadamard' takes none.")
+
+
+def parse_rotation_declaration(quantization_config: dict[str, Any]) -> tuple[str, ...] | None:
+    """Parse the model-level ``quantization_config["input_rotation"]`` declaration.
+
+    ``{"format_version": 2, "type": "hadamard", "targets": [<checkpoint prefix>, ...]}`` lists the
+    rotated ``svdq_w4a4`` layers. Checkpoints without manifest rotation need it together with the
+    ``ROTATION_MARKER_KEY`` tensor; alongside a version 2 manifest it is optional and must list the
+    manifest's rotated targets.
+
+    Returns:
+        The declared checkpoint prefixes, or ``None`` when there is no declaration.
+
+    Raises:
+        TypeError, ValueError: If the declaration is malformed or has an unsupported version.
+    """
+
+    raw = quantization_config.get(ROTATION_DECLARATION_KEY)
+    if raw is None:
+        return None
+    where = f"quantization_config.{ROTATION_DECLARATION_KEY}"
+    if not isinstance(raw, dict):
+        raise TypeError(f"{where} must be a JSON object.")
+    version = raw.get("format_version")
+    if version != ROTATION_FORMAT_VERSION:
+        raise ValueError(f"Unsupported {where}.format_version {version!r}; expected {ROTATION_FORMAT_VERSION}.")
+    targets = raw.get("targets")
+    if not isinstance(targets, list) or not all(isinstance(t, str) and t for t in targets):
+        raise TypeError(f"{where}.targets must be a list of checkpoint prefixes.")
+    if not targets:
+        raise ValueError(f"{where}.targets must not be empty.")
+    if len(set(targets)) != len(targets):
+        raise ValueError(f"{where}.targets lists a target more than once.")
+    _validate_rotation(where, "svdq_w4a4", {k: v for k, v in raw.items() if k not in ("format_version", "targets")})
+    return tuple(targets)
 
 
 def _validate_structural_patch(raw: Any) -> dict[str, Any]:

@@ -40,6 +40,18 @@ def get_sm_targets() -> list[str]:
     support_sm121 = packaging_version.parse(nvcc_version) >= packaging_version.parse("13.0")
 
     install_mode = os.getenv("NUNCHAKU_INSTALL_MODE", "FAST")
+    if install_mode not in ("FAST", "ALL"):
+        raise RuntimeError("NUNCHAKU_INSTALL_MODE must be FAST or ALL")
+    explicit_sm = os.getenv("NUNCHAKU_BUILD_SM")
+    if explicit_sm:
+        # Explicit SM list (comma-separated), e.g. for building on a GPU-less node.
+        targets = [sm.strip() for sm in explicit_sm.split(",") if sm.strip()]
+        for sm in targets:
+            if sm not in ["75", "80", "86", "89", "120a", "121a"]:
+                raise RuntimeError(f"Unsupported SM {sm}")
+            if (sm == "120a" and not support_sm120) or (sm == "121a" and not support_sm121):
+                raise RuntimeError(f"SM {sm} needs a newer nvcc than {nvcc_version}")
+        return targets
     if install_mode == "FAST":
         targets = []
         for index in range(torch.cuda.device_count()):
@@ -54,8 +66,6 @@ def get_sm_targets() -> list[str]:
             if sm not in targets:
                 targets.append(sm)
     else:
-        if install_mode != "ALL":
-            raise RuntimeError("NUNCHAKU_INSTALL_MODE must be FAST or ALL")
         targets = ["75", "80", "86", "89"]
         if support_sm120:
             targets.append("120a")

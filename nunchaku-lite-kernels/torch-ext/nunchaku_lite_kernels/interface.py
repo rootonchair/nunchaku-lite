@@ -59,6 +59,20 @@ def _fake_quantize_w4a4_act_fuse_lora(
     return None
 
 
+@torch.library.register_fake(add_op_namespace_prefix("quantize_w4a4_act_hadamard_fuse_lora"))
+def _fake_quantize_w4a4_act_hadamard_fuse_lora(
+    input,
+    output,
+    oscales,
+    lora_down,
+    lora_act_out,
+    smooth,
+    fuse_glu: bool,
+    fp4: bool,
+) -> None:
+    return None
+
+
 @torch.library.register_fake(add_op_namespace_prefix("fused_rms_norm_modulate"))
 def _fake_fused_rms_norm_modulate(x, norm_weight, scale, shift, eps: float):
     return torch.empty_like(x)
@@ -153,6 +167,7 @@ ops = _get_ops()
 
 gemm_w4a4 = ops.gemm_w4a4
 quantize_w4a4_act_fuse_lora = ops.quantize_w4a4_act_fuse_lora
+quantize_w4a4_act_hadamard_fuse_lora = ops.quantize_w4a4_act_hadamard_fuse_lora
 fused_rms_norm_modulate = ops.fused_rms_norm_modulate
 fused_affine_modulate = ops.fused_affine_modulate
 fused_cross_head_qk_norm_rope = ops.fused_cross_head_qk_norm_rope
@@ -247,16 +262,14 @@ def svdq_gemm_w4a4_cuda(
     )
 
 
-def svdq_quantize_w4a4_act_fuse_lora_cuda(
+def _alloc_quantize_w4a4_act_buffers(
     input: torch.Tensor,
-    output: torch.Tensor | None = None,
-    oscales: torch.Tensor | None = None,
-    lora_down: torch.Tensor | None = None,
-    lora_act_out: torch.Tensor | None = None,
-    smooth: torch.Tensor | None = None,
-    fuse_glu: bool = False,
-    fp4: bool = False,
-    pad_size: int = 256,
+    output: torch.Tensor | None,
+    oscales: torch.Tensor | None,
+    lora_down: torch.Tensor | None,
+    lora_act_out: torch.Tensor | None,
+    fp4: bool,
+    pad_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if lora_down is None:
         raise ValueError("lora_down is required")
@@ -277,8 +290,53 @@ def svdq_quantize_w4a4_act_fuse_lora_cuda(
             oscales = torch.empty(channels // 64, batch_size_pad, dtype=input.dtype, device=input.device)
     if lora_act_out is None:
         lora_act_out = torch.empty(batch_size_pad, rank, dtype=torch.float32, device=input.device)
+    return output, oscales, lora_act_out
 
+
+def svdq_quantize_w4a4_act_fuse_lora_cuda(
+    input: torch.Tensor,
+    output: torch.Tensor | None = None,
+    oscales: torch.Tensor | None = None,
+    lora_down: torch.Tensor | None = None,
+    lora_act_out: torch.Tensor | None = None,
+    smooth: torch.Tensor | None = None,
+    fuse_glu: bool = False,
+    fp4: bool = False,
+    pad_size: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    output, oscales, lora_act_out = _alloc_quantize_w4a4_act_buffers(
+        input, output, oscales, lora_down, lora_act_out, fp4, pad_size
+    )
     ops.quantize_w4a4_act_fuse_lora(input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4)
+    return output, oscales, lora_act_out
+
+
+def svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda(
+    input: torch.Tensor,
+    output: torch.Tensor | None = None,
+    oscales: torch.Tensor | None = None,
+    lora_down: torch.Tensor | None = None,
+    lora_act_out: torch.Tensor | None = None,
+    smooth: torch.Tensor | None = None,
+    fuse_glu: bool = False,
+    fp4: bool = False,
+    pad_size: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Like ``svdq_quantize_w4a4_act_fuse_lora_cuda``, with a blockwise Hadamard rotation.
+
+    Each 64-channel block of the smoothed activations is multiplied by the orthonormal
+    Sylvester Hadamard matrix ``H64 / 8`` before quantization. The low-rank branch still
+    consumes the unrotated input. The matching weight must be packed as
+    ``Q(R @ blockdiag(H64 / 8))``.
+    """
+    if fuse_glu:
+        raise NotImplementedError("Hadamard activation quantization does not support fuse_glu.")
+    if input.shape[-1] % 64 != 0:
+        raise ValueError("Hadamard activation quantization needs channels divisible by 64")
+    output, oscales, lora_act_out = _alloc_quantize_w4a4_act_buffers(
+        input, output, oscales, lora_down, lora_act_out, fp4, pad_size
+    )
+    ops.quantize_w4a4_act_hadamard_fuse_lora(input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4)
     return output, oscales, lora_act_out
 
 
@@ -332,10 +390,12 @@ __all__ = [
     "ops",
     "qk_norm_rope_mps_",
     "quantize_w4a4_act_fuse_lora",
+    "quantize_w4a4_act_hadamard_fuse_lora",
     "svdq_gemm_w4a4_cuda",
     "svdq_gemm_w4a8",
     "svdq_gemm_w8a8",
     "svdq_qk_norm_rope_",
     "svdq_quantize_act_int8",
     "svdq_quantize_w4a4_act_fuse_lora_cuda",
+    "svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda",
 ]

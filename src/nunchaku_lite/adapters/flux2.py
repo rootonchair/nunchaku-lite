@@ -519,6 +519,9 @@ class Flux2Adapter:
     """Adapter for Diffusers ``Flux2Transformer2DModel`` checkpoints."""
 
     target = "flux2"
+    # Flux2 runs every SVDQ layer through the standalone (signed) quantize path; no MLP is
+    # fused through fused_gelu_mlp, so any layer may carry an input rotation.
+    supports_input_rotation = True
 
     def matches(self, transformer: torch.nn.Module) -> bool:
         """Return whether ``transformer`` is a Diffusers Flux2 transformer.

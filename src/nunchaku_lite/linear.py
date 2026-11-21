@@ -6,7 +6,9 @@ from torch import nn
 
 from .ops.gemm import awq_gemm_w4a16_g64_int32, awq_gemm_w4a16_g128_int16, svdq_gemm_w4a4_cuda
 from .ops.gemv import awq_gemv_w4a16_cuda
-from .ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
+from .ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda, svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda
+
+INPUT_ROTATIONS = (None, "hadamard")
 
 
 class DenseRuntimeLoraLinear(nn.Linear):
@@ -72,6 +74,7 @@ class SVDQW4A4Linear(nn.Module):
         act_unsigned: bool = False,
         torch_dtype: torch.dtype = torch.bfloat16,
         device: str | torch.device | None = None,
+        input_rotation: str | None = None,
     ):
         """Allocate SVDQ parameter buffers for a quantized linear projection.
 
@@ -86,9 +89,15 @@ class SVDQW4A4Linear(nn.Module):
                 unsigned activations.
             torch_dtype: Runtime dtype for floating-point buffers.
             device: Device for parameter allocation.
+            input_rotation: Online activation rotation the packed weight was
+                exported for: ``None`` or ``"hadamard"`` (blockwise H64/8,
+                applied after smoothing; the low-rank branch stays unrotated).
+                Rotation needs a signed activation path, so it cannot be
+                combined with ``act_unsigned``.
 
         Raises:
-            ValueError: If ``precision`` is unsupported.
+            ValueError: If ``precision`` or ``input_rotation`` is unsupported,
+                or rotation is combined with unsigned activations.
 
         Returns:
             None.
@@ -142,7 +151,12 @@ class SVDQW4A4Linear(nn.Module):
             self.wtscale = None
             self.wcscales = None
 
+        if input_rotation not in INPUT_ROTATIONS:
+            raise ValueError(f"Invalid input_rotation: {input_rotation!r}; expected one of {INPUT_ROTATIONS}")
+        if input_rotation is not None and act_unsigned:
+            raise ValueError("input_rotation requires signed activations; it cannot be combined with act_unsigned")
         self.act_unsigned = act_unsigned
+        self.input_rotation = input_rotation
         # Quantized-kernel backend on Apple silicon ("auto", "int8", "int4", "dense"); set by patch_transformer.
         self.backend = "auto"
 
@@ -184,7 +198,15 @@ class SVDQW4A4Linear(nn.Module):
             activation output.
         """
 
-        return svdq_quantize_w4a4_act_fuse_lora_cuda(
+        if self.input_rotation is not None and self.act_unsigned:
+            # act_unsigned is often set by adapters after construction, so re-check here.
+            raise ValueError("input_rotation requires signed activations; it cannot be combined with act_unsigned")
+        quantize_fn = (
+            svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda
+            if self.input_rotation == "hadamard"
+            else svdq_quantize_w4a4_act_fuse_lora_cuda
+        )
+        return quantize_fn(
             x,
             lora_down=self.proj_down,
             smooth=self.smooth_factor,
@@ -273,7 +295,8 @@ class SVDQW4A4Linear(nn.Module):
 
         return (
             f"SVDQW4A4Linear(in_features={self.in_features}, out_features={self.out_features}, "
-            f"rank={self.rank}, precision={self.precision}, act_unsigned={self.act_unsigned})"
+            f"rank={self.rank}, precision={self.precision}, act_unsigned={self.act_unsigned}, "
+            f"input_rotation={self.input_rotation})"
         )
 
 

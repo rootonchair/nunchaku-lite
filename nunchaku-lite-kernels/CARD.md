@@ -58,13 +58,14 @@ CUDA:
 |---|---|
 | `gemm_w4a4` | SVDQuant W4A4 GEMM (INT4 or NVFP4) with the low-rank branch and fused epilogues (q/k norm, RoPE, GELU) |
 | `quantize_w4a4_act_fuse_lora` | Activation quantization fused with the low-rank down projection |
+| `quantize_w4a4_act_hadamard_fuse_lora` | Same, with an in-register blockwise Hadamard rotation (orthonormal Sylvester `H64 / 8` per 64 channels) of the smoothed activations, for weights packed as `Q(R @ blockdiag(H64 / 8))` |
 | `awq_gemm_w4a16_g128_int16`, `awq_gemm_w4a16_g64_int32`, `gemv_awq` | AWQ W4A16 GEMM / GEMV |
 | `fused_rms_norm_modulate`, `fused_affine_modulate` | AdaLN modulation |
 | `fused_cross_head_qk_norm_rope` | q/k RMSNorm + RoPE |
 | `attention_fp16` | FP16 attention |
 
-Python helpers: `svdq_gemm_w4a4_cuda`, `svdq_quantize_w4a4_act_fuse_lora_cuda`, `awq_gemv_w4a16_cuda`,
-`attention_fp16_cuda`.
+Python helpers: `svdq_gemm_w4a4_cuda`, `svdq_quantize_w4a4_act_fuse_lora_cuda`,
+`svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda`, `awq_gemv_w4a16_cuda`, `attention_fp16_cuda`.
 
 Metal (MPS):
 
