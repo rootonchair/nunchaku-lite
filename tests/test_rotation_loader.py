@@ -190,16 +190,12 @@ def _target_list_config(declaration=None):
     return config
 
 
-def test_target_list_manifest_carries_the_declaration():
-    keys = _tiny_state().keys()
-    synthesized = with_target_list_manifest(_target_list_config(_declaration(["proj"])), keys)
+def test_synthesized_target_list_manifest_never_carries_rotation():
+    # Older loaders synthesize the same v1 manifest and drop the declaration, so the declaration
+    # must not turn a target-list checkpoint into a rotated one.
+    synthesized = with_target_list_manifest(_target_list_config(_declaration(["proj"])), _tiny_state().keys())
     parsed = parse_runtime_manifest(synthesized)
-    assert parsed.nunchaku_format_version == 2
-    assert [t.checkpoint_prefix for t in parsed.rotated_targets] == ["proj"]
-    unrotated = parse_runtime_manifest(with_target_list_manifest(_target_list_config(), keys))
-    assert unrotated.nunchaku_format_version == 1 and unrotated.rotated_targets == ()
-    with pytest.raises(ValueError, match="not svdq_w4a4 targets"):
-        with_target_list_manifest(_target_list_config(_declaration(["missing"])), keys)
+    assert parsed.nunchaku_format_version == 1 and parsed.rotated_targets == ()
 
 
 # --- resolve / runtime checks -----------------------------------------------------------
@@ -249,22 +245,22 @@ def test_manifest_with_matching_declaration_loads(tmp_path):
     assert transformer.proj.input_rotation == HADAMARD
 
 
-@pytest.mark.parametrize("manifest_rotation", [ROTATION, None])
-def test_manifest_with_inconsistent_declaration_is_refused(tmp_path, manifest_rotation):
+@pytest.mark.parametrize("manifest_rotation,match", [(ROTATION, "inconsistent"), (None, "has no runtime_manifest")])
+def test_manifest_with_inconsistent_declaration_is_refused(tmp_path, manifest_rotation, match):
     config = {"runtime_manifest": _manifest(rotation=manifest_rotation), "input_rotation": _declaration(["other"])}
     checkpoint = _write(tmp_path, config)
     model = TinyModel()
-    with pytest.raises(ValueError, match="inconsistent"):
+    with pytest.raises(ValueError, match=match):
         patch_transformer(model, checkpoint, target="auto", torch_dtype=torch.bfloat16, device="cpu")
     assert isinstance(model.proj, nn.Linear)
 
 
-def test_target_list_checkpoint_with_declaration_loads(tmp_path):
+def test_target_list_declaration_without_stored_manifest_is_refused(tmp_path):
     checkpoint = _write(tmp_path, _target_list_config(_declaration(["proj"])))
-    transformer = TinyModel()
-    patch_transformer(transformer, checkpoint, target="auto", torch_dtype=torch.bfloat16, device="cpu")
-    assert transformer._nunchaku_lite_target == "manifest"
-    assert transformer.proj.input_rotation == HADAMARD and transformer.other.input_rotation is None
+    model = TinyModel()
+    with pytest.raises(ValueError, match="older Nunchaku Lite versions refuse them"):
+        patch_transformer(model, checkpoint, target="auto", torch_dtype=torch.bfloat16, device="cpu")
+    assert isinstance(model.proj, nn.Linear)
 
 
 def test_pre_release_input_transform_tensors_are_refused(tmp_path):
@@ -283,7 +279,7 @@ def test_rotated_checkpoint_on_mps_is_refused_at_load(tmp_path):
     assert isinstance(model.proj, nn.Linear)
 
 
-def test_model_specific_adapter_refuses_manifest_rotation(tmp_path, monkeypatch):
+def test_adapter_without_rotation_support_refuses_rotated_manifest(tmp_path, monkeypatch):
     from nunchaku_lite import core
 
     class FakeAdapter:
@@ -297,7 +293,7 @@ def test_model_specific_adapter_refuses_manifest_rotation(tmp_path, monkeypatch)
 
     checkpoint = _write(tmp_path, {"runtime_manifest": _manifest()})
     monkeypatch.setitem(core._ADAPTERS, FakeAdapter.target, FakeAdapter())
-    with pytest.raises(ValueError, match="only target='manifest'"):
+    with pytest.raises(ValueError, match="does not support"):
         patch_transformer(TinyModel(), checkpoint, target=FakeAdapter.target, torch_dtype=torch.bfloat16, device="cpu")
 
 
@@ -350,7 +346,7 @@ def test_mps_path_refuses_rotated_layer():
         svdq_linear_mps(layer, torch.zeros(4, 128))
 
 
-# --- model-specific adapters (quantization_config.input_rotation) -----------------------
+# --- model-specific adapters (FLUX.2) ---------------------------------------------------
 
 
 def _tiny_flux2():
@@ -367,16 +363,33 @@ def _tiny_flux2():
     )
 
 
-def _flux2_checkpoint(tmp_path, quantization_config, *, rename=None):
+def _rotated_manifest(prefixes, precision="int4"):
+    manifest = _manifest(precision=precision)
+    manifest["targets"] = [_target(prefix, precision=precision, rotation=ROTATION) for prefix in prefixes]
+    return manifest
+
+
+def _flux2_checkpoint(tmp_path, rotated, *, declaration=True, manifest=True, precision="int4", rename=None):
     source = _tiny_flux2()
     Flux2Adapter().patch(source, {}, {"rank": 16}, _options())
     state = {k: v.contiguous() for k, v in source.state_dict().items()}
     if rename is not None:
         old, new = rename
         state = {(new + k[len(old) :] if k.startswith(old) else k): v for k, v in state.items()}
+    config = {"rank": 16}
+    if manifest:
+        config["runtime_manifest"] = _rotated_manifest(rotated, precision)
+    if declaration:
+        config["input_rotation"] = _declaration(rotated)
     path = tmp_path / "flux2-rotated.safetensors"
-    save_file(state, path, metadata={"quantization_config": json.dumps({"rank": 16, **quantization_config})})
+    save_file(state, path, metadata={"quantization_config": json.dumps(config)})
     return path
+
+
+def _load_flux2(path, transformer=None, **kwargs):
+    transformer = transformer if transformer is not None else _tiny_flux2()
+    kwargs = {"precision": "int4", "torch_dtype": torch.bfloat16, "device": "cpu", **kwargs}
+    return patch_transformer(transformer, path, target="flux2", **kwargs)
 
 
 def _flux2_is_unpatched(transformer):
@@ -385,6 +398,7 @@ def _flux2_is_unpatched(transformer):
     )
 
 
+@pytest.mark.parametrize("declaration", [True, False])
 @pytest.mark.parametrize(
     "qkv_target,rename",
     [
@@ -393,11 +407,9 @@ def _flux2_is_unpatched(transformer):
         ("transformer_blocks.0.qkv_proj", ("transformer_blocks.0.attn.to_qkv.", "transformer_blocks.0.qkv_proj.")),
     ],
 )
-def test_flux2_adapter_binds_declared_targets(tmp_path, qkv_target, rename):
-    targets = [qkv_target, "single_transformer_blocks.0.attn.mlp_fc2"]
-    path = _flux2_checkpoint(tmp_path, {"input_rotation": _declaration(targets)}, rename=rename)
-    transformer = _tiny_flux2()
-    patch_transformer(transformer, path, target="flux2", precision="int4", torch_dtype=torch.bfloat16)
+def test_flux2_adapter_binds_manifest_rotated_targets(tmp_path, qkv_target, rename, declaration):
+    rotated = [qkv_target, "single_transformer_blocks.0.attn.mlp_fc2"]
+    transformer = _load_flux2(_flux2_checkpoint(tmp_path, rotated, declaration=declaration, rename=rename))
 
     assert transformer.transformer_blocks[0].attn.to_qkv.input_rotation == HADAMARD
     assert transformer.single_transformer_blocks[0].attn.mlp_fc2.input_rotation == HADAMARD
@@ -406,29 +418,75 @@ def test_flux2_adapter_binds_declared_targets(tmp_path, qkv_target, rename):
     assert not transformer._nunchaku_lite_incompatible_keys.unexpected_keys
 
 
-def test_flux2_unknown_declared_target_fails_before_patching(tmp_path):
-    path = _flux2_checkpoint(tmp_path, {"input_rotation": _declaration(["transformer_blocks.0.missing"])})
+def test_flux2_declaration_without_stored_manifest_is_refused(tmp_path):
+    # Older loaders ignore a model-level declaration and would load these weights unrotated.
+    path = _flux2_checkpoint(tmp_path, ["transformer_blocks.0.attn.to_qkv"], manifest=False)
+    transformer = _tiny_flux2()
+    with pytest.raises(ValueError, match="older Nunchaku Lite versions refuse them"):
+        _load_flux2(path, transformer)
+    assert _flux2_is_unpatched(transformer)
+
+
+def test_flux2_declaration_must_match_manifest(tmp_path):
+    path = _flux2_checkpoint(tmp_path, ["transformer_blocks.0.attn.to_qkv"], declaration=False)
+    checkpoint_config = {
+        "rank": 16,
+        "runtime_manifest": _rotated_manifest(["transformer_blocks.0.attn.to_qkv"]),
+        "input_rotation": _declaration(["single_transformer_blocks.0.attn.mlp_fc2"]),
+    }
+    from safetensors.torch import load_file
+
+    save_file(load_file(path), path, metadata={"quantization_config": json.dumps(checkpoint_config)})
+    transformer = _tiny_flux2()
+    with pytest.raises(ValueError, match="inconsistent"):
+        _load_flux2(path, transformer)
+    assert _flux2_is_unpatched(transformer)
+
+
+def test_flux2_unknown_rotated_target_fails_before_patching(tmp_path):
     transformer = _tiny_flux2()
     with pytest.raises(ValueError, match="no packed SVDQ weight"):
-        patch_transformer(transformer, path, target="flux2", precision="int4")
+        _load_flux2(_flux2_checkpoint(tmp_path, ["transformer_blocks.0.missing"]), transformer)
     assert _flux2_is_unpatched(transformer)
 
 
 def test_flux2_nvfp4_rotation_fails_before_patching(tmp_path):
-    path = _flux2_checkpoint(tmp_path, {"input_rotation": _declaration(["transformer_blocks.0.attn.to_qkv"])})
+    path = _flux2_checkpoint(tmp_path, ["transformer_blocks.0.attn.to_qkv"], precision="fp4")
     transformer = _tiny_flux2()
     with pytest.raises(ValueError, match="allow_fp4_rotation"):
-        patch_transformer(transformer, path, target="flux2", precision="fp4", device="cpu")
+        _load_flux2(path, transformer, precision="fp4")
     assert _flux2_is_unpatched(transformer)
 
 
 def test_adapter_without_rotation_support_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(Flux2Adapter, "supports_input_rotation", False)
-    path = _flux2_checkpoint(tmp_path, {"input_rotation": _declaration(["transformer_blocks.0.attn.to_qkv"])})
     transformer = _tiny_flux2()
     with pytest.raises(ValueError, match="does not support"):
-        patch_transformer(transformer, path, target="flux2", precision="int4")
+        _load_flux2(_flux2_checkpoint(tmp_path, ["transformer_blocks.0.attn.to_qkv"]), transformer)
     assert _flux2_is_unpatched(transformer)
+
+
+def test_every_rotated_target_must_be_bound(tmp_path, monkeypatch):
+    # Guards future adapters whose patch drops or fails to rename the target markers.
+    from nunchaku_lite import core
+
+    monkeypatch.setattr(core, "bind_input_rotations", lambda transformer, state: [])
+    with pytest.raises(ValueError, match="bound 0 of 1 rotated targets"):
+        _load_flux2(_flux2_checkpoint(tmp_path, ["transformer_blocks.0.attn.to_qkv"]))
+
+
+def test_rotation_device_defaults_to_the_available_accelerator(monkeypatch):
+    from nunchaku_lite.core import _rotation_device
+
+    model = nn.Linear(2, 2)
+    assert _rotation_device("cpu", model).type == "cpu"  # explicit device wins
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert _rotation_device(None, model).type == "cuda"
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    assert _rotation_device(None, model).type == "mps"
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    assert _rotation_device(None, model).type == "cpu"
 
 
 class _BindModel(nn.Module):

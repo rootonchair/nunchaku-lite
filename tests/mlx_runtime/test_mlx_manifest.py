@@ -616,10 +616,19 @@ def test_rotated_manifest_is_refused(tmp_path, strict):
         load_nunchaku_pipeline("base", pipeline_cls=FakeFlux2Pipeline, checkpoint=tmp_path / "repo", backend="dense")
 
 
+def test_apply_runtime_manifest_refuses_rotation(tmp_path):
+    from nunchaku_lite.mlx import apply_runtime_manifest
+
+    _, _, state, manifest = _generic_checkpoint()
+    with pytest.raises(NotImplementedError, match="not supported on MLX"):
+        apply_runtime_manifest(Generic(), state, parse_runtime_manifest({"runtime_manifest": _rotated(manifest)}))
+
+
 def test_rotation_declaration_and_legacy_transforms_are_refused():
     from nunchaku_lite.mlx.manifest import refuse_rotated_checkpoint
 
     refuse_rotated_checkpoint(None, {}, ["proj.qweight"])
+    refuse_rotated_checkpoint(None, {"input_rotation": None}, [])  # null means absent, as in torch
     with pytest.raises(NotImplementedError, match="not supported on MLX"):
         refuse_rotated_checkpoint(None, {"input_rotation": {"format_version": 2}}, [])
     with pytest.raises(NotImplementedError, match="not supported on MLX"):

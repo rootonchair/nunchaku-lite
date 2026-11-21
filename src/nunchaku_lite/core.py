@@ -396,6 +396,9 @@ def _patch_component(
     quantization_config = _parse_json_metadata(metadata, "quantization_config") or _sibling_quantization_config(
         checkpoint
     )
+    # Rotation needs a manifest stored in the checkpoint: loaders that predate rotation ignore
+    # model-level declarations and synthesize v1 manifests from target lists themselves.
+    has_stored_manifest = "runtime_manifest" in quantization_config
     quantization_config = with_target_list_manifest(quantization_config, state_dict.keys())
     runtime_manifest = parse_runtime_manifest(quantization_config)
     if "rank" not in quantization_config:
@@ -406,17 +409,17 @@ def _patch_component(
             quantization_config = {**quantization_config, "rank": int(rank)}
     adapter = _select_adapter_for_checkpoint(transformer, target, runtime_manifest)
     normalized_precision = _normalize_precision(precision, device, checkpoint, runtime_manifest)
+    _validate_quantization_compatibility(quantization_config, normalized_precision, device, checkpoint)
     rotation_targets = _check_rotation_support(
         adapter,
         transformer,
         state_dict,
         quantization_config,
-        runtime_manifest,
+        runtime_manifest if has_stored_manifest else None,
         precision=normalized_precision,
         device=device,
         allow_fp4=bool((adapter_options or {}).get("allow_fp4_rotation", False)),
     )
-    _validate_quantization_compatibility(quantization_config, normalized_precision, device, checkpoint)
     options = PatchOptions(
         precision=normalized_precision,
         torch_dtype=torch_dtype,
@@ -431,7 +434,12 @@ def _patch_component(
         state_dict = maybe_state_dict
     if rotation_targets is not None:
         # The adapter has renamed the target markers to module paths along with the checkpoint keys.
-        bind_input_rotations(transformer, state_dict)
+        bound = bind_input_rotations(transformer, state_dict)
+        if len(bound) != len(rotation_targets):
+            raise ValueError(
+                f"Adapter {adapter.target!r} bound {len(bound)} of {len(rotation_targets)} rotated targets; the rest "
+                "were lost while patching, and loading them unrotated would give wrong outputs."
+            )
 
     if assign:
         _coerce_state_dict_for_assign(transformer, state_dict)
@@ -781,7 +789,7 @@ def _check_rotation_support(
     transformer: torch.nn.Module,
     state_dict: dict[str, torch.Tensor],
     quantization_config: dict[str, Any],
-    runtime_manifest: RuntimeManifest | None,
+    stored_manifest: RuntimeManifest | None,
     *,
     precision: str,
     device: str | torch.device | None,
@@ -789,9 +797,14 @@ def _check_rotation_support(
 ) -> tuple[str, ...] | None:
     """Refuse checkpoints whose activation rotation cannot be honoured, before patching.
 
+    Rotated checkpoints must carry a ``nunchaku_format_version`` 2 runtime manifest stored in the
+    checkpoint (``stored_manifest``; not one synthesized from target lists), so that loaders which
+    predate rotation refuse them. Its rotated targets are authoritative; a model-level
+    ``input_rotation`` declaration is optional and must list the same targets.
+
     Loading rotated weights without binding the rotation would silently give wrong outputs, so
     every check that does not need the patched model runs here. For a model-specific adapter,
-    marks the declared targets in ``state_dict`` and returns them; the caller binds them with
+    marks the rotated targets in ``state_dict`` and returns them; the caller binds them with
     :func:`~nunchaku_lite.rotation.bind_input_rotations` after patching. Returns ``None`` when
     there is nothing to bind outside the manifest adapter.
     """
@@ -799,32 +812,52 @@ def _check_rotation_support(
     refuse_legacy_transform_tensors(state_dict)
     declared = parse_rotation_declaration(quantization_config)
     manifest_rotated = (
-        {target.checkpoint_prefix for target in runtime_manifest.rotated_targets} if runtime_manifest else set()
+        tuple(target.checkpoint_prefix for target in stored_manifest.rotated_targets) if stored_manifest else ()
     )
     if declared is None and not manifest_rotated:
         return None
-    if device is None:
-        device = next(iter(transformer.parameters()), torch.empty(0)).device
-    check_rotation_runtime(device)
+    if not manifest_rotated:
+        raise ValueError(
+            "Checkpoint declares quantization_config.input_rotation but has no runtime_manifest "
+            "(nunchaku_format_version 2) with op_options.rotation on its rotated targets. Rotated checkpoints must "
+            "carry one, so that older Nunchaku Lite versions refuse them instead of loading them without rotation."
+        )
+    if declared is not None and set(declared) != set(manifest_rotated):
+        raise ValueError(
+            "quantization_config.input_rotation.targets do not match the runtime_manifest targets that declare "
+            "op_options.rotation; the checkpoint metadata is inconsistent."
+        )
+    check_rotation_runtime(_rotation_device(device, transformer))
 
     if adapter.target == "manifest":
-        # Exporters may also write the model-level declaration; it must agree with the manifest.
-        if declared is not None and set(declared) != manifest_rotated:
-            raise ValueError(
-                "quantization_config.input_rotation.targets do not match the runtime_manifest targets that declare "
-                "op_options.rotation; the checkpoint metadata is inconsistent."
-            )
-        return None
-    if manifest_rotated:
-        raise ValueError(
-            f"Checkpoint's runtime_manifest declares rotation on {len(manifest_rotated)} targets, "
-            f"which only target='manifest' (or 'auto') supports; got target={adapter.target!r}."
-        )
+        return None  # binds per target itself, after resolving every rotation
     if not getattr(adapter, "supports_input_rotation", False):
-        raise ValueError(f"Checkpoint uses activation rotation, which adapter {adapter.target!r} does not support yet.")
-    validate_declared_targets(state_dict, declared, is_fp4=precision == "nvfp4", allow_fp4=allow_fp4)
-    mark_rotated_targets(state_dict, declared)
-    return declared
+        raise ValueError(
+            f"Checkpoint uses activation rotation, which adapter {adapter.target!r} does not support; "
+            "load it with target='manifest' (or 'auto')."
+        )
+    validate_declared_targets(state_dict, manifest_rotated, is_fp4=precision == "nvfp4", allow_fp4=allow_fp4)
+    mark_rotated_targets(state_dict, manifest_rotated)
+    return manifest_rotated
+
+
+def _rotation_device(device: str | torch.device | None, transformer: torch.nn.Module) -> torch.device:
+    """Device a rotated checkpoint will run on, for the load-time support check.
+
+    With no explicit ``device``, a transformer still on CPU or meta is assumed to run on the
+    available accelerator, which is where the quantized kernels run.
+    """
+
+    if device is not None:
+        return torch.device(device)
+    current = next(iter(transformer.parameters()), torch.empty(0)).device
+    if current.type not in ("cpu", "meta"):
+        return current
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return current
 
 
 def _select_adapter_for_checkpoint(

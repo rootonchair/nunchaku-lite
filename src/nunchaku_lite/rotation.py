@@ -2,11 +2,11 @@
 
 A rotated ``svdq_w4a4`` layer was exported with its residual weight packed as
 ``Q(R @ blockdiag(H64 / 8))`` and must run the Hadamard quantize op. Checkpoints declare it by
-name (``{"type": "hadamard"}``, defined in :mod:`nunchaku_lite.manifest`):
-
-* per target in a runtime manifest (``op_options.rotation``), bound by the manifest adapter; or
-* once in ``quantization_config["input_rotation"]`` with the list of rotated targets, for
-  checkpoints loaded through a model-specific adapter.
+name, ``{"type": "hadamard"}`` (defined in :mod:`nunchaku_lite.manifest`), per target in a
+``nunchaku_format_version`` 2 runtime manifest stored in the checkpoint, which loaders that
+predate rotation refuse. An optional model-level ``quantization_config["input_rotation"]``
+declaration must list the same targets. The manifest adapter binds the rotated targets itself;
+model-specific adapters that support rotation get them bound by :func:`bind_input_rotations`.
 
 The kernel never decides anything at run time: the loader binds the op per layer, once, and
 refuses anything it cannot honour before the model is modified wherever possible.
@@ -103,24 +103,23 @@ def validate_declared_targets(
     is_fp4: bool,
     allow_fp4: bool = False,
 ) -> None:
-    """Check a model-level declaration against the checkpoint, before any model is modified.
+    """Check rotated targets against the checkpoint, before any model is modified.
 
     Raises:
-        ValueError: If a declared target has no packed SVDQ weight in the checkpoint, or the
+        ValueError: If a rotated target has no packed SVDQ weight in the checkpoint, or the
             checkpoint is NVFP4 without ``allow_fp4``.
     """
 
     missing = [target for target in targets if f"{target}.qweight" not in checkpoint_state]
     if missing:
         raise ValueError(
-            f"quantization_config.{ROTATION_DECLARATION_KEY}.targets {missing[:3]} have no packed SVDQ weight "
-            "(<target>.qweight) in the checkpoint."
+            f"Rotated targets {missing[:3]} have no packed SVDQ weight (<target>.qweight) in the checkpoint."
         )
-    _check_fp4(f"quantization_config.{ROTATION_DECLARATION_KEY}", is_fp4=is_fp4, allow_fp4=allow_fp4)
+    _check_fp4("Rotated checkpoint", is_fp4=is_fp4, allow_fp4=allow_fp4)
 
 
 def mark_rotated_targets(checkpoint_state: dict[str, torch.Tensor], targets: Iterable[str]) -> None:
-    """Add placeholder keys so the declared targets follow the adapter's key renaming.
+    """Add placeholder keys so the rotated targets follow the adapter's key renaming.
 
     :func:`bind_input_rotations` consumes them after patching.
     """
@@ -156,9 +155,9 @@ def bind_input_rotations(transformer: nn.Module, checkpoint_state: dict[str, tor
         try:
             module = transformer.get_submodule(path)
         except AttributeError as exc:
-            raise ValueError(f"Declared rotated target {path!r} is not a module of the patched model.") from exc
+            raise ValueError(f"Rotated target {path!r} is not a module of the patched model.") from exc
         if not isinstance(module, SVDQW4A4Linear):
-            raise TypeError(f"Declared rotated target {path!r} is a {type(module).__name__}, not an SVDQ W4A4 layer.")
+            raise TypeError(f"Rotated target {path!r} is a {type(module).__name__}, not an SVDQ W4A4 layer.")
         if module.act_unsigned or getattr(module, FUSED_MLP_FC2_ATTR, False):
             raise ValueError(
                 f"Layer {path!r} quantizes unsigned or fused-MLP activations, which cannot be rotated "

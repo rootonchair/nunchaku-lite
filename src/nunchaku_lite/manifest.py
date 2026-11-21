@@ -13,11 +13,11 @@ from typing import Any
 SCHEMA = "nunchaku_lite.runtime_manifest"
 SUPPORTED_VERSION = 1
 SUPPORTED_FORMAT_VERSIONS = (1, 2)
-# Format version 2 adds online activation rotation: per target ``op_options.rotation``, or for
-# checkpoints loaded through a model-specific adapter a model-level
-# ``quantization_config.input_rotation`` declaration listing the rotated targets. Version 1
-# checkpoints must not use it, so loaders that predate rotation refuse rotated checkpoints
-# instead of silently producing wrong outputs.
+# Format version 2 adds online activation rotation, per target ``op_options.rotation``. Rotated
+# checkpoints must carry such a manifest (an optional model-level
+# ``quantization_config.input_rotation`` declaration must list the same targets): loaders that
+# predate rotation refuse version 2 instead of silently producing wrong outputs, but they ignore
+# a model-level declaration on its own.
 ROTATION_FORMAT_VERSION = 2
 # ``hadamard``: per contiguous 64-channel block (logical channel order) of the smoothed
 # activations, multiply by the orthonormal Sylvester Hadamard matrix ``H64 / 8``; the low-rank
@@ -227,13 +227,12 @@ def _manifest_from_target_lists(quantization_config: dict[str, Any], keys: set[s
         )
     if not targets:
         return None
-    rotated = _apply_target_list_rotation(quantization_config, targets)
     precision = precisions.pop() if len(precisions) == 1 else "mixed"
     return {
         "schema": SCHEMA,
         "version": SUPPORTED_VERSION,
         "component": "transformer",
-        "nunchaku_format_version": ROTATION_FORMAT_VERSION if rotated else 1,
+        "nunchaku_format_version": 1,  # synthesized targets never carry rotation
         "producer": {"name": "nunchaku_lite.config_target_lists", "version": "1"},
         "requirements": {
             "method": "svdquant",
@@ -340,9 +339,9 @@ def _validate_rotation(where: str, nunchaku_op: str, rotation: Any) -> None:
 def parse_rotation_declaration(quantization_config: dict[str, Any]) -> tuple[str, ...] | None:
     """Parse the model-level ``quantization_config["input_rotation"]`` declaration.
 
-    ``{"format_version": 2, "type": "hadamard", "targets": [<checkpoint prefix>, ...]}`` declares
-    which ``svdq_w4a4`` layers were exported rotated, for checkpoints without per-target manifest
-    metadata (model-specific adapters, Diffusers-style target lists).
+    ``{"format_version": 2, "type": "hadamard", "targets": [<checkpoint prefix>, ...]}`` lists the
+    rotated ``svdq_w4a4`` layers. It is optional and only valid alongside a version 2 runtime
+    manifest declaring rotation on the same targets.
 
     Returns:
         The declared checkpoint prefixes, or ``None`` when there is no declaration.
@@ -367,24 +366,6 @@ def parse_rotation_declaration(quantization_config: dict[str, Any]) -> tuple[str
         raise ValueError(f"{where}.targets lists a target more than once.")
     _validate_rotation(where, "svdq_w4a4", {k: v for k, v in raw.items() if k not in ("format_version", "targets")})
     return tuple(targets)
-
-
-def _apply_target_list_rotation(quantization_config: dict[str, Any], targets: list[dict[str, Any]]) -> bool:
-    """Carry a model-level rotation declaration onto synthesized target-list manifest targets."""
-
-    declared = parse_rotation_declaration(quantization_config)
-    if declared is None:
-        return False
-    by_name = {target["checkpoint_prefix"]: target for target in targets}
-    unknown = [name for name in declared if by_name.get(name, {}).get("nunchaku_op") != "svdq_w4a4"]
-    if unknown:
-        raise ValueError(
-            f"quantization_config.{ROTATION_DECLARATION_KEY}.targets {unknown[:3]} are not svdq_w4a4 targets "
-            "of this checkpoint."
-        )
-    for name in declared:
-        by_name[name]["op_options"] = {"rotation": {"type": "hadamard"}}
-    return True
 
 
 def _validate_structural_patch(raw: Any) -> dict[str, Any]:

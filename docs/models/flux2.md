@@ -109,14 +109,18 @@ Rotated checkpoints load like any other; nothing changes in your code.
 They need the CUDA kernels that include `quantize_w4a4_act_hadamard_fuse_lora`. MPS and MLX
 refuse them at load time.
 
-A checkpoint declares rotation by name in its `quantization_config`:
+A rotated checkpoint must carry a runtime manifest with `nunchaku_format_version: 2` in its
+`quantization_config`, declaring the rotation by name on each rotated target:
 
 ```json
-"input_rotation": {"format_version": 2, "type": "hadamard", "targets": ["transformer_blocks.0.attn.to_qkv", "..."]}
+"op_options": {"rotation": {"type": "hadamard"}}
 ```
 
-Checkpoints with a runtime manifest declare it per target instead, as
-`"op_options": {"rotation": {"type": "hadamard"}}`, with `nunchaku_format_version: 2`.
+Versions of Nunchaku Lite older than this format refuse version 2 manifests, so they can't
+silently load a rotated checkpoint without its rotation. An optional model-level declaration
+`"input_rotation": {"format_version": 2, "type": "hadamard", "targets": [...]}` must list the same
+targets. A declaration without such a manifest is refused, because older versions would ignore it.
+The manifest's rotated targets also load through `target="flux2"`.
 
 `"hadamard"` has exactly one meaning. For each block of 64 contiguous input channels, in logical
 channel order, the smoothed activations `x / smooth` are multiplied by the orthonormal Sylvester
