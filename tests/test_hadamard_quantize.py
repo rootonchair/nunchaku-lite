@@ -147,6 +147,20 @@ def test_native_hadamard_op_matches_plain_op_on_prerotated_input(dtype, tokens, 
     assert not torch.allclose(s_h.float(), s_n.float(), rtol=2e-2, atol=1e-3)
 
 
+def _pack_smooth(smooth: torch.Tensor) -> torch.Tensor:
+    """Logical per-channel smooth factor -> Nunchaku's packed vector layout, which the kernels read."""
+
+    n = smooth.numel()
+    return smooth.reshape(n // 128, 1, 8, 2, 4, 2, 1).permute(0, 6, 1, 2, 4, 3, 5).reshape(-1).contiguous()
+
+
+def test_pack_smooth_inverts_the_runtime_unpacker():
+    from nunchaku_lite.ops.mps import unpack_svdq_scale
+
+    smooth = torch.rand(1024)
+    assert torch.equal(unpack_svdq_scale(_pack_smooth(smooth), 1024).reshape(-1), smooth)
+
+
 @requires_native_hadamard
 @pytest.mark.parametrize("fp4", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -163,7 +177,7 @@ def test_native_hadamard_op_rotates_after_per_channel_smoothing(dtype, fp4):
     lora_down = torch.zeros(channels, 16, device=device, dtype=dtype)
 
     q_h, s_h, _ = svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda(
-        x.to(dtype), lora_down=lora_down, smooth=smooth.to(dtype), fp4=fp4
+        x.to(dtype), lora_down=lora_down, smooth=_pack_smooth(smooth.to(dtype)), fp4=fp4
     )
     x_ref = hadamard_rotate(x / smooth.to(dtype).float()).to(dtype)
     ones = torch.ones(channels, device=device, dtype=dtype)
