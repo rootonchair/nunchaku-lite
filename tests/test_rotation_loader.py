@@ -14,9 +14,8 @@ from nunchaku_lite.adapters.flux2 import Flux2Adapter
 from nunchaku_lite.adapters.manifest import ManifestAdapter
 from nunchaku_lite.linear import SVDQW4A4Linear
 from nunchaku_lite.manifest import parse_runtime_manifest, with_target_list_manifest
-from nunchaku_lite.ops.fused import fused_gelu_mlp
-from nunchaku_lite.rotation import (
-    FUSED_MLP_FC2_ATTR,
+from nunchaku_lite.ops.fused import FUSED_MLP_FC2_ATTR, fused_gelu_mlp
+from nunchaku_lite.rotation_loader import (
     HADAMARD,
     bind_input_rotations,
     check_rotation_runtime,

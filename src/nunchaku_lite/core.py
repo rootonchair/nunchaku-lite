@@ -12,7 +12,7 @@ from typing import Any, Protocol
 import torch
 
 from .manifest import ROTATION_MARKER_KEY, RuntimeManifest, parse_runtime_manifest, with_target_list_manifest
-from .rotation import (
+from .rotation_loader import (
     bind_input_rotations,
     check_rotation_runtime,
     mark_rotated_targets,
@@ -806,7 +806,7 @@ def _check_rotation_support(
     Loading rotated weights without binding the rotation would silently give wrong outputs, so
     every check that does not need the patched model runs here. Unless the manifest adapter binds
     manifest rotations itself, marks the rotated targets in ``state_dict`` and returns them; the
-    caller binds them with :func:`~nunchaku_lite.rotation.bind_input_rotations` after patching.
+    caller binds them with :func:`~nunchaku_lite.rotation_loader.bind_input_rotations` after patching.
     """
 
     refuse_legacy_transform_tensors(state_dict)

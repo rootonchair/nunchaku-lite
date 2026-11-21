@@ -19,8 +19,7 @@ from torch import nn
 
 from ..core import PatchOptions, register_adapter
 from ..linear import AWQW4A16Linear, SVDQW4A4Linear
-from ..ops.fused import fused_gelu_mlp
-from ..rotation import FUSED_MLP_FC2_ATTR
+from ..ops.fused import FUSED_MLP_FC2_ATTR, fused_gelu_mlp
 from .common import (
     SVDQPatchContext,
     build_svdq_context,

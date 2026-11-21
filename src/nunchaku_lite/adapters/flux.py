@@ -21,8 +21,7 @@ from torch.nn import GELU as TorchGELU
 
 from ..core import PatchOptions, register_adapter
 from ..linear import DenseRuntimeLoraLinear, SVDQW4A4Linear
-from ..ops.fused import fused_gelu_mlp, fused_qkv_norm_rotary
-from ..rotation import FUSED_MLP_FC2_ATTR
+from ..ops.fused import FUSED_MLP_FC2_ATTR, fused_gelu_mlp, fused_qkv_norm_rotary
 from .attention_dispatch import dispatch_lite_attention_fn
 from .common import (
     SVDQPatchContext,

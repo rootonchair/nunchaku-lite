@@ -9,6 +9,10 @@ from ..utils import ceil_divide
 from .backend import get_ops
 from .gemm import svdq_gemm_w4a4_cuda
 
+# Set by adapters on the fc2 of an MLP they run through fused_gelu_mlp: its input is quantized
+# inside fc1's GEMM epilogue (unsigned for INT4, never rotated), not by fc2's own quantize step.
+FUSED_MLP_FC2_ATTR = "_nunchaku_lite_fused_mlp_fc2"
+
 
 def fused_gelu_mlp(x: torch.Tensor, fc1: SVDQW4A4Linear, fc2: SVDQW4A4Linear, pad_size: int = 256) -> torch.Tensor:
     """Run a two-layer GELU MLP while keeping the intermediate activation quantized.

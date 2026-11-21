@@ -18,12 +18,12 @@ from torch import nn
 from ..core import PatchOptions, register_adapter
 from ..linear import AWQW4A16Linear, SVDQW4A4Linear
 from ..ops.fused import (
+    FUSED_MLP_FC2_ATTR,
     fused_affine_modulate,
     fused_cross_head_qk_norm_rope,
     fused_gelu_mlp,
     fused_rms_norm_modulate,
 )
-from ..rotation import FUSED_MLP_FC2_ATTR
 from .attention_dispatch import dispatch_lite_attention_fn
 from .common import (
     SVDQPatchContext,

@@ -31,14 +31,10 @@ from .manifest import (
 
 HADAMARD = "hadamard"
 HADAMARD_OP_NAME = "quantize_w4a4_act_hadamard_fuse_lora"
-# Set by adapters on the fc2 of an MLP run through ops.fused.fused_gelu_mlp, whose input is
-# quantized inside fc1's GEMM epilogue (no rotation there).
-FUSED_MLP_FC2_ATTR = "_nunchaku_lite_fused_mlp_fc2"
 # Placeholder keys that carry declared targets through an adapter's checkpoint-key renaming.
 _MARKER_SUFFIX = "._nunchaku_lite_input_rotation"
 
 __all__ = [
-    "FUSED_MLP_FC2_ATTR",
     "HADAMARD",
     "ROTATION_DECLARATION_KEY",
     "bind_input_rotations",
@@ -150,6 +146,7 @@ def bind_input_rotations(transformer: nn.Module, checkpoint_state: dict[str, tor
     """
 
     from .linear import SVDQW4A4Linear
+    from .ops.fused import FUSED_MLP_FC2_ATTR
 
     bound = []
     for key in [key for key in checkpoint_state if key.endswith(_MARKER_SUFFIX)]:

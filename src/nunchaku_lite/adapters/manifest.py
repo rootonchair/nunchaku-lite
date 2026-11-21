@@ -10,7 +10,7 @@ from torch import nn
 from ..core import PatchOptions, register_adapter
 from ..linear import AWQW4A16Linear, SVDQW4A4Linear
 from ..manifest import RuntimeManifest, RuntimeManifestTarget, parse_runtime_manifest
-from ..rotation import resolve_input_rotation
+from ..rotation_loader import resolve_input_rotation
 from .common import SVDQPatchContext, _mark_patched_module, finalize_svdq_checkpoint, prepare_transformer_dtype
 
 
