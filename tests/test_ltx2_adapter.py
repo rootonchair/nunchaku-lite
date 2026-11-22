@@ -1,7 +1,10 @@
+import inspect
 import json
+import types
 from types import SimpleNamespace
 from typing import ClassVar
 
+import pytest
 import torch
 from diffusers import LTX2VideoTransformer3DModel
 from safetensors.torch import save_file
@@ -248,3 +251,113 @@ def test_ltx2_residual_gate_torch_path_broadcasts_batch_channel_gate():
     output = ltx2_adapter._residual_gate(residual, gate, branch)
 
     torch.testing.assert_close(output, residual + gate.unsqueeze(1) * branch)
+
+
+# --- LTX-2.5 compatibility and INT4 fused-MLP routing --------------------------------------
+
+_LTX25_SUPPORTED = {"ff_bias", "use_prompt_adaln_single", "use_keyframes_abs_pos_embedding"} <= set(
+    inspect.signature(LTX2VideoTransformer3DModel.__init__).parameters
+)
+requires_ltx25_diffusers = pytest.mark.skipif(not _LTX25_SUPPORTED, reason="needs a diffusers version with LTX-2.5")
+
+
+def _ltx25_style_config(use_prompt_adaln_single):
+    # Small version of the LTX-2.5 transformer: prompt cross-attention modulation, no FF biases,
+    # keyframe embedding, with or without the cacheable (static-table) prompt modulation.
+    return {
+        "in_channels": 4,
+        "out_channels": 4,
+        "patch_size": 1,
+        "patch_size_t": 1,
+        "num_attention_heads": 2,
+        "attention_head_dim": 8,
+        "cross_attention_dim": 16,
+        "audio_in_channels": 4,
+        "audio_out_channels": 4,
+        "audio_num_attention_heads": 2,
+        "audio_attention_head_dim": 4,
+        "audio_cross_attention_dim": 8,
+        "num_layers": 2,
+        "qk_norm": "rms_norm_across_heads",
+        "caption_channels": 16,
+        "rope_double_precision": False,
+        "cross_attn_mod": True,
+        "audio_cross_attn_mod": True,
+        "ff_bias": False,
+        "audio_ff_bias": False,
+        "use_prompt_adaln_single": use_prompt_adaln_single,
+        "use_keyframes_abs_pos_embedding": True,
+    }
+
+
+def _ltx2_dummy_inputs(generator):
+    batch, frames, height, width, audio_frames, seq = 2, 2, 16, 16, 9, 16
+    return {
+        "hidden_states": torch.randn((batch, frames * height * width, 4), generator=generator),
+        "audio_hidden_states": torch.randn((batch, audio_frames, 4), generator=generator),
+        "encoder_hidden_states": torch.randn((batch, seq, 16), generator=generator),
+        "audio_encoder_hidden_states": torch.randn((batch, seq, 16), generator=generator),
+        "timestep": torch.rand((batch,), generator=generator) * 1000,
+        "sigma": torch.rand((batch,), generator=generator),
+        "audio_sigma": torch.rand((batch,), generator=generator),
+        "encoder_attention_mask": torch.ones((batch, seq)).bool(),
+        "num_frames": frames,
+        "height": height,
+        "width": width,
+        "audio_num_frames": audio_frames,
+        "fps": 25.0,
+    }
+
+
+@requires_ltx25_diffusers
+@pytest.mark.parametrize("use_prompt_adaln_single", [True, False])
+def test_lite_block_forward_matches_diffusers_for_ltx25_config(use_prompt_adaln_single):
+    # The adapter replaces the block forward with its own copy; it must match diffusers' block,
+    # including the static prompt modulation used when `use_prompt_adaln_single=False`.
+    torch.manual_seed(0)
+    model = LTX2VideoTransformer3DModel(**_ltx25_style_config(use_prompt_adaln_single)).eval()
+    with torch.no_grad():
+        for table in ("prompt_scale_shift_table", "audio_prompt_scale_shift_table"):
+            for block in model.transformer_blocks:
+                getattr(block, table).normal_()  # zero-init by default; make the static table matter
+    inputs = _ltx2_dummy_inputs(torch.Generator().manual_seed(1))
+    with torch.no_grad():
+        expected = model(**inputs, return_dict=False)
+        for block in model.transformer_blocks:
+            block.forward = types.MethodType(_ltx2_block_forward, block)
+        actual = model(**inputs, return_dict=False)
+    for exp, act in zip(expected, actual):
+        torch.testing.assert_close(act, exp, rtol=1e-5, atol=1e-5)
+
+
+@requires_ltx25_diffusers
+def test_ltx25_bias_free_feed_forward_patches_and_loads(tmp_path):
+    rank = 4
+    source = make_tiny_ltx2_transformer(ff_bias=False, audio_ff_bias=False)
+    LTX2Adapter().patch(source, {}, {"rank": rank}, _patch_options(rank))
+    assert source.transformer_blocks[0].ff.net[0].proj.bias is None
+    assert source.transformer_blocks[0].ff.net[2].bias is None
+    checkpoint = tmp_path / "ltx25-lite.safetensors"
+    save_file(source.state_dict(), checkpoint, metadata={"quantization_config": json.dumps({"rank": rank})})
+
+    transformer = make_tiny_ltx2_transformer(ff_bias=False, audio_ff_bias=False)
+    patch_transformer(transformer, checkpoint, target="ltx2", precision="int4", torch_dtype=torch.bfloat16)
+    incompatible = transformer._nunchaku_lite_incompatible_keys
+    assert not incompatible.missing_keys and not incompatible.unexpected_keys
+
+
+@pytest.mark.parametrize("precision,fused", [("nvfp4", True), ("int4", False)])
+def test_ltx2_feed_forward_uses_fused_mlp_only_for_nvfp4(precision, fused):
+    # INT4 LTX exports are unshifted; the fused GELU epilogue assumes a +0.171875 shift folded into
+    # fc2's bias, so INT4 must run unfused. NVFP4 has no shift and keeps the fused kernel.
+    from diffusers.models.attention import FeedForward
+
+    from nunchaku_lite.adapters.common import SVDQPatchContext
+    from nunchaku_lite.adapters.ltx2 import _patch_ltx2_feed_forward, _use_fused_gelu_mlp
+
+    context = SVDQPatchContext(precision=precision, rank=16, torch_dtype=torch.bfloat16)
+    ff = _patch_ltx2_feed_forward(FeedForward(64, activation_fn="gelu-approximate"), context)
+    cuda_like = SimpleNamespace(is_cuda=True)
+    with torch.no_grad():
+        assert _use_fused_gelu_mlp(ff, cuda_like, (), {}) is fused
+    assert not _use_fused_gelu_mlp(ff, SimpleNamespace(is_cuda=False), (), {})
