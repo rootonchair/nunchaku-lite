@@ -90,8 +90,12 @@ nix run github:huggingface/kernels#kernel-builder -- build-and-copy -L .
   without it the configure step fails silently.
 - C++ headers in the Metal kernel are `.hpp`: kernel-builder treats `.h` files as
   shader sources. Shaders are compiled at runtime from source strings.
-- New ops are backward compatible, so they go to the existing `v2` branch and
-  `HF_KERNEL_VERSION` stays unchanged.
+- Builds are published to the Hub branch named after `version` in `build.toml`
+  (`v3` today), and `HF_KERNEL_VERSION` in `src/nunchaku_lite/ops/backend.py` must
+  match it. A version branch must contain every torch/CUDA/Metal variant before the
+  runtime points at it: unlike adding ops to an existing branch, a new branch has no
+  older builds to fall back to. Released nunchaku-lite versions keep loading their
+  own version branch (`v2` for 0.3.x), so never remove or rewrite an older branch.
 
 ## Repository Layout
 
