@@ -6,6 +6,10 @@ tensor, and the file metadata (ltx-core reads the model ``config`` from it), is 
 ComfyUI see the official model except for the quantized layers. ``quantization_config`` goes into the metadata;
 rotated checkpoints also get the root ``nunchaku_lite.input_rotation`` marker.
 
+``targets`` splices only some of the quantized layers (for example the layer set of another quantization recipe); the
+others keep the official bf16 tensors, and ``quantization_config`` (target and rotation lists) names only the
+spliced layers.
+
 The SVDQ tensors come from any checkpoint :func:`nunchaku_lite.loader.read_checkpoint_spec` accepts (typically a
 Diffusers-layout export). Quantized layer names are the same in both layouts, so no other key is renamed.
 """
@@ -15,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Collection
 from pathlib import Path
 
 import torch
@@ -31,8 +36,11 @@ def splice_native(
     out: str | os.PathLike,
     *,
     allow_fp4_rotation: bool = False,
+    targets: Collection[str] | None = None,
 ) -> dict[str, int]:
-    """Write ``out``: ``official`` with the SVDQ layers of ``quantized`` spliced in. Returns a small report."""
+    """Write ``out``: ``official`` with the SVDQ layers of ``quantized`` (all, or only ``targets``) spliced in.
+
+    Returns a small report."""
 
     from safetensors import safe_open
     from safetensors.torch import save_file
@@ -42,6 +50,9 @@ def splice_native(
         raise ValueError("Refusing to overwrite an input file.")
     spec = read_checkpoint_spec(quantized, allow_fp4_rotation=allow_fp4_rotation)
     raw_config = _quantization_config(_metadata(quantized), quantized, native=spec.layout == "native")
+    layers = spec.layers
+    if targets is not None:
+        raw_config, layers = _select_targets(raw_config, spec, targets)
 
     tensors: dict[str, torch.Tensor] = {}
     with safe_open(str(official), framework="pt") as f:
@@ -52,7 +63,7 @@ def splice_native(
         if "quantization_config" in metadata or ROTATION_MARKER_KEY in keys:
             raise ValueError(f"{official} is already quantized; splice into the official bf16 file.")
         replaced = set()
-        for name, layer in spec.layers.items():
+        for name, layer in layers.items():
             weight_key = f"{NATIVE_PREFIX}{name}.weight"
             bias_key = f"{NATIVE_PREFIX}{name}.bias"
             if weight_key not in keys:
@@ -69,10 +80,10 @@ def splice_native(
             tensors[key] = f.get_tensor(key)
 
     with safe_open(str(quantized), framework="pt") as q:
-        for name, layer in spec.layers.items():
+        for name, layer in layers.items():
             for suffix in layer.tensors:
                 tensors[f"{NATIVE_PREFIX}{name}.{suffix}"] = q.get_tensor(spec.file_key(name, suffix))
-    if spec.rotated:
+    if any(layer.input_rotation is not None for layer in layers.values()):
         tensors[ROTATION_MARKER_KEY] = torch.empty(0)
 
     metadata["quantization_config"] = json.dumps(raw_config, sort_keys=True)
@@ -80,18 +91,48 @@ def splice_native(
     tmp = out.with_suffix(out.suffix + ".partial")
     save_file(tensors, str(tmp), metadata=metadata)
     os.replace(tmp, out)
-    return {"layers": len(spec.layers), "replaced_official_tensors": len(replaced), "tensors": len(tensors)}
+    return {"layers": len(layers), "replaced_official_tensors": len(replaced), "tensors": len(tensors)}
 
 
-def verify_native_splice(official: str | os.PathLike, spliced: str | os.PathLike, quantized: str | os.PathLike) -> None:
-    """Check a spliced file: non-target tensors and metadata byte-identical to ``official``, SVDQ tensors to ``quantized``."""
+def _select_targets(raw_config: dict, spec, targets: Collection[str]) -> tuple[dict, dict]:
+    """``raw_config`` and ``spec.layers`` restricted to ``targets`` (a non-empty subset of the quantized layers)."""
+
+    selected = set(targets)
+    if not selected:
+        raise ValueError("targets is empty; splice at least one quantized layer.")
+    unknown = sorted(selected - set(spec.layers))
+    if unknown:
+        raise ValueError(f"{len(unknown)} targets are not quantized layers of the source, e.g. {unknown[0]!r}.")
+    section = raw_config.get("svdq_w4a4")
+    if "runtime_manifest" in raw_config or not isinstance(section, dict) or not isinstance(section.get("targets"), list):
+        raise ValueError("Splicing a subset needs a target-list quantization_config (svdq_w4a4.targets).")
+    config = {**raw_config, "svdq_w4a4": {**section, "targets": sorted(n for n in section["targets"] if n in selected)}}
+    rotation = raw_config.get("input_rotation")
+    if isinstance(rotation, dict):
+        kept = sorted(n for n in rotation.get("targets", []) if n in selected)
+        if kept:
+            config["input_rotation"] = {**rotation, "targets": kept}
+        else:
+            del config["input_rotation"]
+    return config, {name: layer for name, layer in spec.layers.items() if name in selected}
+
+
+def verify_native_splice(
+    official: str | os.PathLike,
+    spliced: str | os.PathLike,
+    quantized: str | os.PathLike,
+    *,
+    targets: Collection[str] | None = None,
+) -> None:
+    """Check a spliced file: non-target tensors and metadata byte-identical to ``official``, SVDQ tensors to
+    ``quantized``, and exactly ``targets`` (default: every quantized layer of ``quantized``) spliced."""
 
     from safetensors import safe_open
 
     spec = read_checkpoint_spec(spliced)
     source = read_checkpoint_spec(quantized)
-    if set(spec.layers) != set(source.layers):
-        raise AssertionError("Spliced file has different quantization targets than its source.")
+    if set(spec.layers) != (set(source.layers) if targets is None else set(targets)):
+        raise AssertionError("Spliced file has different quantization targets than requested.")
     for name, layer in spec.layers.items():
         if layer != _relocated(source.layers[name], layer):
             raise AssertionError(f"Layer {name!r} differs between the spliced file and its source.")

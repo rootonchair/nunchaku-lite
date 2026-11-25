@@ -25,6 +25,9 @@ python tools/ltx2_native_splice.py \
     --out       ltx-2.5-22b-distilled-transformer-nunchaku-nvfp4-r32.safetensors
 ```
 
+`--targets-regex` splices only the quantized layers whose full name matches; the others keep the official bf16
+weights, and the file's `quantization_config` names only the spliced layers.
+
 ## Command line
 
 Any `ltx_pipelines` entry point runs through the wrapper; pass our file as `--transformer-path` and leave out

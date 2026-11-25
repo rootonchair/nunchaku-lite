@@ -8,6 +8,7 @@ attention replacements, and their fallbacks.
 from __future__ import annotations
 
 import json
+import re
 import warnings
 
 import pytest
@@ -30,7 +31,7 @@ from nunchaku_lite.integrations import ltx_core as integration  # noqa: E402
 from nunchaku_lite.integrations.ltx_core import build_nunchaku_policy  # noqa: E402
 from nunchaku_lite.linear import SVDQW4A4Linear  # noqa: E402
 from nunchaku_lite.loader import NATIVE_PREFIX, read_checkpoint_spec  # noqa: E402
-from nunchaku_lite.native_export import splice_native, verify_native_splice  # noqa: E402
+from nunchaku_lite.native_export import _select_targets, splice_native, verify_native_splice  # noqa: E402
 from nunchaku_lite.ops.fused import FUSED_MLP_FC2_ATTR  # noqa: E402
 from svdq_files import WTSCALE, quant_config, svdq_tensors, write_checkpoint  # noqa: E402
 
@@ -134,6 +135,82 @@ def test_splice_refuses_quantized_official(tmp_path):
     official, quantized, out, _ = _spliced(tmp_path, "int4")
     with pytest.raises(ValueError, match="already quantized"):
         splice_native(out, quantized, tmp_path / "again.safetensors")
+
+
+# Lightricks' nvfp4 layer set (ltx_core.quantization.nvfp4.convert): video-side linears only.
+LIGHTRICKS_SET = re.compile(
+    r"transformer_blocks\.\d+\.(attn1\.to_(q|k|v|out\.0)|attn2\.to_(q|out\.0)|audio_to_video_attn\.to_(q|out\.0)"
+    r"|video_to_audio_attn\.to_(k|v)|ff\.net\.(0\.proj|2))"
+)
+
+
+@pytest.mark.parametrize("rotate", [(), ("",), ("audio_ff.net.2",)])
+def test_subset_splice(tmp_path, rotate):
+    official, model = _official(tmp_path)
+    quantized, layers = _quantized(tmp_path, model, "int4", rotate)
+    subset = sorted(n for n in layers if LIGHTRICKS_SET.fullmatch(n))
+    assert len(subset) == 2 * 12
+    out = tmp_path / "subset.safetensors"
+    report = splice_native(official, quantized, out, targets=subset)
+    assert report["layers"] == len(subset)
+    verify_native_splice(official, out, quantized, targets=subset)
+    with pytest.raises(AssertionError, match="targets"):
+        verify_native_splice(official, out, quantized)  # not every layer: the default check must fail
+    with pytest.raises(AssertionError, match="targets"):
+        verify_native_splice(official, out, quantized, targets=subset[:-1])  # one more spliced than requested
+    spec = read_checkpoint_spec(out)
+    assert sorted(spec.layers) == subset
+    rotated_in_subset = sorted(n for n in subset if any(n.endswith(r) for r in rotate))
+    assert sorted(n for n, la in spec.layers.items() if la.input_rotation is not None) == rotated_in_subset
+    off, got = load_file(str(official)), load_file(str(out))
+    with safe_open(str(out), framework="pt") as f:
+        config = json.loads(f.metadata()["quantization_config"])
+    assert config["svdq_w4a4"]["targets"] == subset
+    assert config.get("input_rotation", {}).get("targets", []) == rotated_in_subset
+    assert ("nunchaku_lite.input_rotation" in got) == bool(rotated_in_subset)
+    for name in set(layers) - set(subset):  # left out: official bf16 tensors, byte for byte
+        for p in ("weight", "bias"):
+            key = f"{NATIVE_PREFIX}{name}.{p}"
+            assert (key in got) == (key in off) and (key not in off or torch.equal(got[key], off[key]))
+        assert f"{NATIVE_PREFIX}{name}.qweight" not in got
+    built = _build(out, build_nunchaku_policy(out, fused_attention=False))
+    for name, module in built.named_modules():
+        if name in layers:
+            assert isinstance(module, SVDQW4A4Linear) == (name in subset), name
+
+
+def test_subset_splice_refusals(tmp_path):
+    official, model = _official(tmp_path)
+    quantized, layers = _quantized(tmp_path, model, "int4")
+    out = tmp_path / "subset.safetensors"
+    with pytest.raises(ValueError, match="empty"):
+        splice_native(official, quantized, out, targets=[])
+    with pytest.raises(ValueError, match="not quantized layers"):
+        splice_native(official, quantized, out, targets=[*sorted(layers)[:2], "transformer_blocks.0.nope"])
+    with safe_open(str(quantized), framework="pt") as f:
+        config = json.loads(f.metadata()["quantization_config"])
+    with pytest.raises(ValueError, match="target-list"):  # runtime manifests are not rewritten
+        _select_targets({**config, "runtime_manifest": {}}, read_checkpoint_spec(quantized), sorted(layers)[:1])
+    assert not out.exists()
+
+
+def test_subset_cli(tmp_path, monkeypatch, capsys):
+    import importlib.util
+    import pathlib
+
+    official, model = _official(tmp_path)
+    quantized, layers = _quantized(tmp_path, model, "nvfp4")
+    out = tmp_path / "cli.safetensors"
+    tool = pathlib.Path(__file__).resolve().parents[1] / "tools" / "ltx2_native_splice.py"
+    mod_spec = importlib.util.spec_from_file_location("splice_tool", tool)
+    mod = importlib.util.module_from_spec(mod_spec)
+    mod_spec.loader.exec_module(mod)
+    monkeypatch.setattr("sys.argv", ["x", "--official", str(official), "--quantized", str(quantized), "--out", str(out),
+                                     "--targets-regex", LIGHTRICKS_SET.pattern])
+    mod.main()
+    report = json.loads(capsys.readouterr().out)
+    assert report == {**report, "layers": 24, "verified": True}
+    assert sorted(read_checkpoint_spec(out).layers) == sorted(n for n in layers if LIGHTRICKS_SET.fullmatch(n))
 
 
 def test_verify_catches_tampering(tmp_path):
