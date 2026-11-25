@@ -202,17 +202,22 @@ def test_per_head_qk_norm_rope3d_matches_eager_chain(dtype, head_dim, heads, gri
             norm_k.weight.uniform_(0.5, 1.5)
     scale = head_dim**-0.5
     with torch.no_grad():
-        ref_q = _rope3d_reference(norm_q(q) * scale, tables, split)
-        ref_k = _rope3d_reference(norm_k(k), tables, split)
+        pre_q, pre_k = norm_q(q) * scale, norm_k(k)
+        ref_q = _rope3d_reference(pre_q, tables, split)
+        ref_k = _rope3d_reference(pre_k, tables, split)
     got_q, got_k = q.clone(), k.clone()
     wq = norm_q.weight.detach() if with_weight else None
     wk = norm_k.weight.detach() if with_weight else None
     assert ops.per_head_qk_norm_rope3d_(got_q, got_k, wq, wk, *tables, scale, 1e-6) is None
-    for got, ref in ((got_q, ref_q), (got_k, ref_k)):
+    for got, ref, pre in ((got_q, ref_q, pre_q), (got_k, ref_k, pre_k)):
         diff = (got.float() - ref.float()).abs()
-        # Only the sum-of-squares reduction order differs from eager PyTorch: at most one-ulp flips, rarely.
-        ulp = ref.float().abs().clamp_min(1e-3) * (2**-7 if dtype == torch.bfloat16 else 2**-10)
-        assert (diff <= ulp * 1.01).all(), diff.max()
+        # Only the sum-of-squares reduction order differs from eager PyTorch, so the normalized (e, o) pair can be one
+        # ulp off before the rotation; e*c - o*s then moves by up to ulp * (|e| + |o|), which for an output near zero
+        # is far more than one ulp of the output itself. Bound by the pair's magnitude plus the final rounding.
+        u = 2**-7 if dtype == torch.bfloat16 else 2**-10
+        pair = pre.float().abs().reshape(*pre.shape[:-1], -1, 2).sum(-1).repeat_interleave(2, dim=-1)
+        bound = u * (pair + ref.float().abs())
+        assert (diff <= bound * 1.01).all(), (diff - bound).max()
         assert (diff == 0).float().mean() > 0.97
 
 
@@ -303,4 +308,4 @@ def test_silu_mul_matches_eager(dtype, shape):
     ref = torch.nn.functional.silu(gate) * up
     got = ops.silu_mul(gate_up)
     assert got.shape == ref.shape
-    assert (got == ref).float().mean() == 1.0, (got.float() - ref.float()).abs().max()
+    assert torch.equal(got, ref), (got.float() - ref.float()).abs().max()
