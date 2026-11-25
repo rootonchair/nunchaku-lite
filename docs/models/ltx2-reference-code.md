@@ -86,6 +86,20 @@ between rows is what matters.
 The fused Q/K norm + RoPE kernel matches ltx-core's own path to bf16 rounding (relative difference 1.7e-3) and saves
 about 3% of transformer time; `--nunchaku-stock-attention` gives the same quality.
 
+Our NVFP4 flickers more than Lightricks' in this pipeline. Restricting it to Lightricks' layer set (video-side linears
+only) does not change that, so the difference lies in how the shared layers are quantized. Our quantized path is
+also not bit-reproducible from run to run, and the ancestral sampler amplifies that: repeated runs of the same file
+differ by about 0.3 dB PSNR.
+
+## Results (L40S, INT4)
+
+Same setup on a 48 GB L40S (Ada), INT4 r32 with Hadamard rotation (smooth exponent 0, every quantized layer rotated):
+
+| transformer | PSNR (dB) | SSIM | flicker (bf16: 7.53) | transformer s/clip | s/clip | peak VRAM | file |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| bf16 (Lightricks) | - | - | - | 7.32 | 19.87 | 36.2 GB | 39.1 GB |
+| **Nunchaku Lite INT4 r32, rotated** | 17.87 | 0.550 | 9.94 | 4.85 | 14.17 | 24.2 GB | 15.4 GB |
+
 ## For integrators: `nunchaku_lite.loader`
 
 The framework-agnostic core used here (and meant for other runtimes such as ComfyUI) needs only torch:
