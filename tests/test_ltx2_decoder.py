@@ -11,8 +11,8 @@ import torch.nn.functional as F
 
 ltx2_decoder = pytest.importorskip("diffusers.models.autoencoders.ltx2_diffusion_decoder")
 
-from nunchaku_lite.adapters import ltx2_decoder as adapter  # noqa: E402
-from nunchaku_lite.ops import fused  # noqa: E402
+from nunchaku_lite.adapters import ltx2_decoder as adapter
+from nunchaku_lite.ops import fused
 
 
 def _reference_op(q, k, q_weight, k_weight, cos_t, sin_t, cos_h, sin_h, cos_w, sin_w, q_scale, eps):
