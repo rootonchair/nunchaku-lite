@@ -505,3 +505,86 @@ def _per_head_qk_norm_rope3d(q, k, norm_q, norm_k, rope, q_scale, ops):
     tables = rope3d_axis_tables(rope, q.shape[1], q.shape[2], q.shape[3], q.device)
     ops.per_head_qk_norm_rope3d_(q, k, wq, wk, *tables, float(q_scale), float(eps_q))
     return q, k
+
+
+def has_ltx2_decoder_block_ops() -> bool:
+    try:
+        ops = get_ops()
+    except Exception:  # noqa: BLE001 - no kernels available at all
+        return False
+    return hasattr(ops, "add_rmsnorm_modulate_") and hasattr(ops, "silu_mul")
+
+
+def _fits_add_rmsnorm_modulate(x, residual, weight, one_plus_scale, shift) -> bool:
+    channels = x.shape[-1]
+    tensors = [x, residual, one_plus_scale, shift] + ([weight] if weight is not None else [])
+    return (
+        x.device.type == "cuda"
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and x.dim() >= 2
+        and residual.shape == x.shape
+        and channels % 8 == 0
+        and channels <= 1024
+        and one_plus_scale.numel() == shift.numel() == x.shape[0] * channels
+        and (weight is None or weight.numel() == channels)
+        and all(t.device == x.device and t.dtype == x.dtype and t.is_contiguous() and t.data_ptr() % 16 == 0
+                for t in tensors)
+    )
+
+
+def add_rmsnorm_modulate_(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    norm: torch.nn.Module,
+    one_plus_scale: torch.Tensor,
+    shift: torch.Tensor,
+    ops=None,
+) -> torch.Tensor:
+    """``x += residual`` in place, then return ``norm(x) * one_plus_scale + shift``.
+
+    ``one_plus_scale`` and ``shift`` are per batch item, ``(B, 1, ..., 1, C)`` as diffusers builds them, with
+    ``one_plus_scale`` already ``1 + scale`` in the storage dtype. Matches the eager chain
+    ``x = x + residual; norm(x) * one_plus_scale + shift`` (rounding included). Uses the nunchaku-lite kernel when
+    the inputs fit it, the eager chain otherwise. ``ops`` overrides the kernel backend (tests).
+    """
+    eps = getattr(norm, "eps", None)
+    weight = getattr(norm, "weight", None)
+    batch, channels = x.shape[0], x.shape[-1]
+    scale2 = one_plus_scale.reshape(batch, channels) if one_plus_scale.numel() == batch * channels else None
+    shift2 = shift.reshape(batch, channels) if shift.numel() == batch * channels else None
+    if eps is not None and scale2 is not None and shift2 is not None:
+        w = weight.detach() if weight is not None else None
+        if x.device.type == "cuda" and not residual.is_contiguous():
+            residual = residual.contiguous()  # one copy beats the eager chain's four passes
+        if ops is None and _fits_add_rmsnorm_modulate(x, residual, w, scale2, shift2):
+            try:
+                ops = get_ops()
+            except Exception:  # noqa: BLE001 - fall back to eager below
+                ops = None
+        if ops is not None and hasattr(ops, "add_rmsnorm_modulate_"):
+            return ops.add_rmsnorm_modulate_(x, residual, w, scale2.contiguous(), shift2.contiguous(), float(eps))
+    x.add_(residual)
+    return norm(x) * one_plus_scale + shift
+
+
+def _fits_silu_mul(gate_up: torch.Tensor) -> bool:
+    return (
+        gate_up.device.type == "cuda"
+        and gate_up.dtype in (torch.float16, torch.bfloat16)
+        and gate_up.is_contiguous()
+        and gate_up.data_ptr() % 16 == 0
+        and gate_up.shape[-1] % 16 == 0
+    )
+
+
+def silu_mul(gate_up: torch.Tensor, ops=None) -> torch.Tensor:
+    """``silu(gate) * up`` for ``gate_up = [gate | up]`` on the last dim, as ``F.silu(gate) * up`` rounds it."""
+    if ops is None and _fits_silu_mul(gate_up):
+        try:
+            ops = get_ops()
+        except Exception:  # noqa: BLE001 - fall back to eager below
+            ops = None
+    if ops is not None and hasattr(ops, "silu_mul"):
+        return ops.silu_mul(gate_up)
+    gate, up = gate_up.chunk(2, dim=-1)
+    return torch.nn.functional.silu(gate) * up

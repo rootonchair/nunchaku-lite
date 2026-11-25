@@ -129,6 +129,16 @@ def _fake_per_head_qk_norm_rope3d_(
     return None
 
 
+@torch.library.register_fake(add_op_namespace_prefix("add_rmsnorm_modulate_"))
+def _fake_add_rmsnorm_modulate_(x, residual, weight, one_plus_scale, shift, eps: float):
+    return torch.empty_like(x)
+
+
+@torch.library.register_fake(add_op_namespace_prefix("silu_mul"))
+def _fake_silu_mul(gate_up):
+    return gate_up.new_empty((*gate_up.shape[:-1], gate_up.shape[-1] // 2))
+
+
 @torch.library.register_fake(add_op_namespace_prefix("svdq_quantize_act_int8"))
 def _fake_svdq_quantize_act_int8(x, inv_smooth, shift: float):
     return x.new_empty(x.shape, dtype=torch.int8), x.new_empty(x.shape[:1], dtype=torch.float32)
@@ -179,6 +189,8 @@ fused_rms_norm_modulate = ops.fused_rms_norm_modulate
 fused_affine_modulate = ops.fused_affine_modulate
 fused_cross_head_qk_norm_rope = ops.fused_cross_head_qk_norm_rope
 per_head_qk_norm_rope3d_ = ops.per_head_qk_norm_rope3d_
+add_rmsnorm_modulate_ = ops.add_rmsnorm_modulate_
+silu_mul = ops.silu_mul
 gemv_awq = ops.gemv_awq
 attention_fp16 = ops.attention_fp16
 # MPS (Metal) SVDQ ops; implemented for the MPS device only.
@@ -384,6 +396,7 @@ def attention_fp16_cuda(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, o: to
 
 
 __all__ = [
+    "add_rmsnorm_modulate_",
     "attention_fp16",
     "attention_fp16_cuda",
     "attention_mps",
@@ -400,6 +413,7 @@ __all__ = [
     "qk_norm_rope_mps_",
     "quantize_w4a4_act_fuse_lora",
     "quantize_w4a4_act_hadamard_fuse_lora",
+    "silu_mul",
     "svdq_gemm_w4a4_cuda",
     "svdq_gemm_w4a8",
     "svdq_gemm_w8a8",

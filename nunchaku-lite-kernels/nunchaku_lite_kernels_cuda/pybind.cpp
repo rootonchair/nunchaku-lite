@@ -12,6 +12,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("gemv_awq", nunchaku_lite::ops::gemv_awq)
         .def("fused_cross_head_qk_norm_rope", nunchaku_lite::ops::fused_cross_head_qk_norm_rope)
         .def("per_head_qk_norm_rope3d_", nunchaku_lite::ops::per_head_qk_norm_rope3d_)
+        .def("add_rmsnorm_modulate_", nunchaku_lite::ops::add_rmsnorm_modulate_)
+        .def("silu_mul", nunchaku_lite::ops::silu_mul)
         .def("fused_rms_norm_modulate", nunchaku_lite::ops::fused_rms_norm_modulate)
         .def("fused_affine_modulate", nunchaku_lite::ops::fused_affine_modulate)
         .def("attention_fp16", nunchaku_lite::ops::attention_fp16);

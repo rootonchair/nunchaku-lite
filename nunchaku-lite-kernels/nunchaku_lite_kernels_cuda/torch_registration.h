@@ -182,6 +182,19 @@ void dispatch_per_head_qk_norm_rope3d_(torch::Tensor q,
         q, k, q_weight, k_weight, cos_t, sin_t, cos_h, sin_h, cos_w, sin_w, q_scale, eps);
 }
 
+torch::Tensor dispatch_add_rmsnorm_modulate_(torch::Tensor x,
+                                             torch::Tensor residual,
+                                             OptionalTensor weight,
+                                             torch::Tensor one_plus_scale,
+                                             torch::Tensor shift,
+                                             double eps) {
+    return nunchaku_lite::ops::add_rmsnorm_modulate_(x, residual, weight, one_plus_scale, shift, eps);
+}
+
+torch::Tensor dispatch_silu_mul(torch::Tensor gate_up) {
+    return nunchaku_lite::ops::silu_mul(gate_up);
+}
+
 } // namespace
 #endif // NUNCHAKU_LITE_METAL_BUILD
 
@@ -222,6 +235,9 @@ TORCH_LIBRARY(nunchaku_lite_kernels, ops) {
     ops.def("per_head_qk_norm_rope3d_(Tensor(a!) q, Tensor(b!) k, Tensor? q_weight, Tensor? k_weight, "
             "Tensor cos_t, Tensor sin_t, Tensor cos_h, Tensor sin_h, Tensor cos_w, Tensor sin_w, "
             "float q_scale, float eps) -> ()");
+    ops.def("add_rmsnorm_modulate_(Tensor(a!) x, Tensor residual, Tensor? weight, Tensor one_plus_scale, "
+            "Tensor shift, float eps) -> Tensor");
+    ops.def("silu_mul(Tensor gate_up) -> Tensor");
     // SVDQ W8A8 / W4A8 ops (MPS backend; Neural Accelerator int8 matmul on M5-class GPUs).
     ops.def("svdq_quantize_act_int8(Tensor x, Tensor inv_smooth, float shift) -> (Tensor, Tensor)");
     ops.def("svdq_gemm_w8a8(Tensor a, Tensor w8, Tensor ascale, Tensor wsc, Tensor lact, "
@@ -248,6 +264,8 @@ TORCH_LIBRARY(nunchaku_lite_kernels, ops) {
     ops.impl("attention_fp16", torch::kCUDA, &dispatch_attention_fp16);
     ops.impl("fused_cross_head_qk_norm_rope", torch::kCUDA, &dispatch_fused_cross_head_qk_norm_rope);
     ops.impl("per_head_qk_norm_rope3d_", torch::kCUDA, &dispatch_per_head_qk_norm_rope3d_);
+    ops.impl("add_rmsnorm_modulate_", torch::kCUDA, &dispatch_add_rmsnorm_modulate_);
+    ops.impl("silu_mul", torch::kCUDA, &dispatch_silu_mul);
 #endif
 
 #ifdef NUNCHAKU_LITE_METAL_BUILD

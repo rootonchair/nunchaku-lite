@@ -37,6 +37,15 @@ void per_head_qk_norm_rope3d_(torch::Tensor q,
                               double q_scale,
                               double eps);
 
+torch::Tensor add_rmsnorm_modulate_(torch::Tensor x,
+                                    torch::Tensor residual,
+                                    std::optional<torch::Tensor> weight,
+                                    torch::Tensor one_plus_scale,
+                                    torch::Tensor shift,
+                                    double eps);
+
+torch::Tensor silu_mul(torch::Tensor gate_up);
+
 torch::Tensor fused_rms_norm_modulate(torch::Tensor x,
                                       std::optional<torch::Tensor> norm_weight,
                                       torch::Tensor scale,
