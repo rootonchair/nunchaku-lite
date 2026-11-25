@@ -181,6 +181,7 @@ if __name__ == "__main__":
                 "nunchaku_lite_kernels_cuda/kernels/awq/gemv_awq.cu",
                 "nunchaku_lite_kernels_cuda/kernels/modulation.cu",
                 "nunchaku_lite_kernels_cuda/kernels/cross_head_qk_norm_rope.cu",
+                "nunchaku_lite_kernels_cuda/kernels/per_head_qk_norm_rope3d.cu",
             ],
             extra_compile_args={
                 "gcc": gcc_flags,

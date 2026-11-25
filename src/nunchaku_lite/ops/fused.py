@@ -438,3 +438,70 @@ def fused_cross_head_qk_norm_rope(
         rope_type == "interleaved",
     )
     return q_out, k_out
+
+
+_ROPE3D_TABLE_CACHE: dict[tuple, tuple[torch.Tensor, ...]] = {}
+
+
+def rope3d_axis_tables(rope: torch.nn.Module, num_frames: int, height: int, width: int, device: torch.device):
+    """Per-axis fp32 (cos, sin) tables for an axis-factorized 3D RoPE such as LTX2VideoVaeRotaryPosEmbed3D.
+
+    Computed with the module's own ``rope_dim_split`` and ``_inv_freqs`` and the same fp32 ``positions * inv_freqs``
+    product it uses, so the angles are bit-identical to the unfused rotation. Cached per (shape, device, split).
+    """
+    split = tuple(int(d) for d in rope.rope_dim_split)
+    key = (id(rope), split, float(rope.base), num_frames, height, width, str(device))
+    hit = _ROPE3D_TABLE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    tables = []
+    for dim, length in zip(split, (num_frames, height, width)):
+        inv = rope._inv_freqs(dim, device)
+        pos = torch.arange(length, dtype=torch.float32, device=device)
+        ang = pos[:, None] * inv[None, :]
+        tables += [ang.cos().contiguous(), ang.sin().contiguous()]
+    if len(_ROPE3D_TABLE_CACHE) > 32:
+        _ROPE3D_TABLE_CACHE.clear()
+    _ROPE3D_TABLE_CACHE[key] = tuple(tables)
+    return _ROPE3D_TABLE_CACHE[key]
+
+
+def has_per_head_qk_norm_rope3d() -> bool:
+    try:
+        return hasattr(get_ops(), "per_head_qk_norm_rope3d_")
+    except Exception:  # noqa: BLE001 - no kernels available at all
+        return False
+
+
+def per_head_qk_norm_rope3d_(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    norm_q: torch.nn.Module,
+    norm_k: torch.nn.Module,
+    rope: torch.nn.Module,
+    q_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """In place: per-head RMSNorm of q and k, q *= q_scale, then axis-factorized 3D RoPE (interleaved pairs).
+
+    q, k: contiguous ``(B, T, H, W, heads, head_dim)`` fp16/bf16 CUDA tensors. Equivalent to
+    ``rope(norm_q(q) * q_scale), rope(norm_k(k))`` for LTX2VideoVaeNeighborhoodAttention, in one launch.
+    """
+    if q.device.type != "cuda" or k.device.type != "cuda":
+        raise ValueError("per_head_qk_norm_rope3d_ requires CUDA tensors")
+    return _per_head_qk_norm_rope3d(q, k, norm_q, norm_k, rope, q_scale, get_ops())
+
+
+def _per_head_qk_norm_rope3d(q, k, norm_q, norm_k, rope, q_scale, ops):
+    eps_q, eps_k = _rms_norm_eps(norm_q), _rms_norm_eps(norm_k)
+    if eps_q != eps_k:
+        raise ValueError("per_head_qk_norm_rope3d_ requires matching q/k norm eps")
+    wq = getattr(norm_q, "weight", None)
+    wk = getattr(norm_k, "weight", None)
+    if (wq is None) != (wk is None):
+        raise ValueError("per_head_qk_norm_rope3d_ requires both or neither norm weights")
+    if wq is not None:
+        wq = wq.detach().to(device=q.device, dtype=q.dtype).contiguous()
+        wk = wk.detach().to(device=k.device, dtype=k.dtype).contiguous()
+    tables = rope3d_axis_tables(rope, q.shape[1], q.shape[2], q.shape[3], q.device)
+    ops.per_head_qk_norm_rope3d_(q, k, wq, wk, *tables, float(q_scale), float(eps_q))
+    return q, k

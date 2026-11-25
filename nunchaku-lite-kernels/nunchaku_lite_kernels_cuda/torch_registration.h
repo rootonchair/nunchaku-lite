@@ -166,6 +166,22 @@ std::vector<torch::Tensor> dispatch_fused_cross_head_qk_norm_rope(torch::Tensor 
                                                              interleaved);
 }
 
+void dispatch_per_head_qk_norm_rope3d_(torch::Tensor q,
+                                       torch::Tensor k,
+                                       OptionalTensor q_weight,
+                                       OptionalTensor k_weight,
+                                       torch::Tensor cos_t,
+                                       torch::Tensor sin_t,
+                                       torch::Tensor cos_h,
+                                       torch::Tensor sin_h,
+                                       torch::Tensor cos_w,
+                                       torch::Tensor sin_w,
+                                       double q_scale,
+                                       double eps) {
+    nunchaku_lite::ops::per_head_qk_norm_rope3d_(
+        q, k, q_weight, k_weight, cos_t, sin_t, cos_h, sin_h, cos_w, sin_w, q_scale, eps);
+}
+
 } // namespace
 #endif // NUNCHAKU_LITE_METAL_BUILD
 
@@ -203,6 +219,9 @@ TORCH_LIBRARY(nunchaku_lite_kernels, ops) {
             "Tensor? k_weight, Tensor? q_cos, Tensor? q_sin, Tensor? k_cos, "
             "Tensor? k_sin, int q_heads, int k_heads, int head_dim, float eps, "
             "bool interleaved) -> Tensor[]");
+    ops.def("per_head_qk_norm_rope3d_(Tensor(a!) q, Tensor(b!) k, Tensor? q_weight, Tensor? k_weight, "
+            "Tensor cos_t, Tensor sin_t, Tensor cos_h, Tensor sin_h, Tensor cos_w, Tensor sin_w, "
+            "float q_scale, float eps) -> ()");
     // SVDQ W8A8 / W4A8 ops (MPS backend; Neural Accelerator int8 matmul on M5-class GPUs).
     ops.def("svdq_quantize_act_int8(Tensor x, Tensor inv_smooth, float shift) -> (Tensor, Tensor)");
     ops.def("svdq_gemm_w8a8(Tensor a, Tensor w8, Tensor ascale, Tensor wsc, Tensor lact, "
@@ -228,6 +247,7 @@ TORCH_LIBRARY(nunchaku_lite_kernels, ops) {
     ops.impl("gemv_awq", torch::kCUDA, &dispatch_gemv_awq);
     ops.impl("attention_fp16", torch::kCUDA, &dispatch_attention_fp16);
     ops.impl("fused_cross_head_qk_norm_rope", torch::kCUDA, &dispatch_fused_cross_head_qk_norm_rope);
+    ops.impl("per_head_qk_norm_rope3d_", torch::kCUDA, &dispatch_per_head_qk_norm_rope3d_);
 #endif
 
 #ifdef NUNCHAKU_LITE_METAL_BUILD

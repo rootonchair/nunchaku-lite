@@ -24,6 +24,19 @@ std::vector<torch::Tensor> fused_cross_head_qk_norm_rope(torch::Tensor q,
                                                          double eps,
                                                          bool interleaved);
 
+void per_head_qk_norm_rope3d_(torch::Tensor q,
+                              torch::Tensor k,
+                              std::optional<torch::Tensor> q_weight,
+                              std::optional<torch::Tensor> k_weight,
+                              torch::Tensor cos_t,
+                              torch::Tensor sin_t,
+                              torch::Tensor cos_h,
+                              torch::Tensor sin_h,
+                              torch::Tensor cos_w,
+                              torch::Tensor sin_w,
+                              double q_scale,
+                              double eps);
+
 torch::Tensor fused_rms_norm_modulate(torch::Tensor x,
                                       std::optional<torch::Tensor> norm_weight,
                                       torch::Tensor scale,
