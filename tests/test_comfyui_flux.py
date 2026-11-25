@@ -136,7 +136,8 @@ def test_comfy_flux_matches_diffusers_adapter(tmp_path, awq_modulation, precisio
     assert patcher.model._nunchaku_lite_family == "flux"
     assert torch.isfinite(actual).all()
     assert expected.abs().mean() > 0
-    assert relative_error(actual, expected) < 1e-2  # bf16 noise ~3e-3; a missing AWQ +1 offset gives ~6e-2
+    # INT4 bf16 noise ~3e-3, NVFP4 (Blackwell CUDA) ~1.3e-2; a missing AWQ +1 offset gives ~6e-2.
+    assert relative_error(actual, expected) < (1e-2 if precision == "int4" else 2e-2)
 
 
 def test_comfy_flux_installs_quantized_modules(tmp_path):
@@ -208,3 +209,22 @@ def test_comfy_flux_samples_and_offloads_through_model_management(tmp_path):
     comfy.model_management.unload_all_models()
     devices = {t.device.type for t in patcher.model.diffusion_model.state_dict().values()}
     assert devices == {"cpu"}
+
+
+def test_comfy_flux_refuses_rotated_checkpoints(tmp_path):
+    """FLUX.1 MLPs run fused (unsigned fc2 input), so rotation is refused before anything is built."""
+
+    require_comfyui()
+    from safetensors.torch import load_file
+
+    from nunchaku_lite.comfyui import load_comfy_diffusion_model
+
+    state = load_file(write_checkpoint(tmp_path, awq_modulation=False))
+    state["nunchaku_lite.input_rotation"] = torch.empty(0)
+    target = "single_transformer_blocks.0.attn.to_out"
+    config = {"rank": RANK, "input_rotation": {"format_version": 2, "type": "hadamard", "targets": [target]}}
+    path = tmp_path / "rotated.safetensors"
+    save_file(state, path, metadata={"quantization_config": json.dumps(config)})
+    cpu = torch.device("cpu")
+    with pytest.raises(ValueError, match="does not support"):
+        load_comfy_diffusion_model(path, load_device=cpu, offload_device=cpu)

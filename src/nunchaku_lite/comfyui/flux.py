@@ -398,7 +398,7 @@ class Flux2ComfyFamily:
     """
 
     name = "flux2"
-    supports_input_rotation = False
+    supports_input_rotation = True  # FLUX.2 runs every W4A4 layer on the signed standalone path
 
     def matches(self, state_dict: dict[str, torch.Tensor], metadata: dict[str, str]) -> bool:
         return "double_stream_modulation_img.linear.weight" in state_dict and any(

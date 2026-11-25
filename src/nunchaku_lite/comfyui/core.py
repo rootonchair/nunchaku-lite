@@ -25,9 +25,14 @@ import torch
 from torch import nn
 
 from ..adapters.common import SVDQPatchContext, drop_obsolete_svdq_tensors
-from ..core import _infer_svdq_rank, _precision_from_quantization_config, _validate_quantization_compatibility
-from ..manifest import parse_rotation_declaration
-from ..rotation_loader import refuse_legacy_transform_tensors
+from ..core import (
+    _check_rotation_support,
+    _infer_svdq_rank,
+    _precision_from_quantization_config,
+    _validate_quantization_compatibility,
+)
+from ..manifest import parse_runtime_manifest
+from ..rotation_loader import bind_input_rotations, refuse_legacy_transform_tensors
 from ..utils import convert_fp16, load_state_dict_in_safetensors, patch_scale_key
 
 logger = logging.getLogger(__name__)
@@ -54,11 +59,23 @@ class ComfyLoadPlan:
     modules: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class _RotationAdapterView:
+    """The two adapter attributes the shared rotation checks read."""
+
+    target: str
+    supports_input_rotation: bool
+
+
 class ComfyFamilyAdapter(Protocol):
     """Maps one Nunchaku Lite checkpoint family onto a ComfyUI model class.
 
     ``plan`` must not touch ComfyUI's model; ``install`` mutates ``diffusion_model`` (built on the meta device)
     so that its state-dict keys are exactly ``plan.dense | plan.quant``.
+
+    A family with ``supports_input_rotation`` must map every tensor stored under a quantized layer's checkpoint
+    prefix into ``plan.quant`` under the installed module's path (as :func:`.common.module_tensors` does), so the
+    rotation placeholders follow, and must run those layers on the signed standalone quantize path.
     """
 
     name: str
@@ -223,7 +240,8 @@ def load_comfy_diffusion_model(
 
     Args:
         checkpoint: Local safetensors path (or Hugging Face ``org/repo/file.safetensors`` path).
-        model_options: ComfyUI model options; ``dtype`` overrides the compute dtype.
+        model_options: ComfyUI model options; ``dtype`` overrides the compute dtype, and ``allow_fp4_rotation``
+            loads Hadamard-rotated NVFP4 checkpoints, which are refused by default.
         load_device: Device to run on; defaults to ComfyUI's torch device.
         offload_device: Device to offload to; defaults to ComfyUI's unet offload device.
         disable_dynamic: Accepted for ComfyUI's ``cached_patcher_init`` factory signature. Nunchaku Lite layers
@@ -243,14 +261,30 @@ def load_comfy_diffusion_model(
     quantization_config = _parse_quantization_config(metadata)
     refuse_legacy_transform_tensors(state_dict.keys())
     family = select_comfy_family(state_dict, metadata)
-    if parse_rotation_declaration(quantization_config) is not None and not family.supports_input_rotation:
-        raise NotImplementedError(f"Hadamard-rotated checkpoints are not supported for {family.name} in ComfyUI yet.")
 
-    load_device = load_device or comfy.model_management.get_torch_device()
+    load_device = torch.device(load_device or comfy.model_management.get_torch_device())
+    if load_device.type == "cuda" and load_device.index is None:
+        # ComfyUI matches loaded models by device equality, and torch.device("cuda") != torch.device("cuda:0"):
+        # without an index, unload_all_models()/free_memory() would never unload this model.
+        load_device = torch.device("cuda", torch.cuda.current_device())
     offload_device = offload_device or comfy.model_management.unet_offload_device()
     precision = resolve_checkpoint_precision(state_dict, quantization_config)
     _validate_quantization_compatibility(
         {"weight": {"dtype": "int4" if precision == "int4" else "fp4_e2m1_all"}}, precision, load_device, checkpoint
+    )
+    # The Diffusers loader's rotation decision table, unchanged: it refuses inconsistent declarations, families
+    # without rotation support and devices without the Hadamard op, and marks the rotated targets with placeholder
+    # keys. Families carry the placeholders through their key mapping into ``plan.quant`` like any other tensor
+    # of a quantized layer, so they arrive at ComfyUI module paths and are bound after ``install``.
+    rotation_targets = _check_rotation_support(
+        _RotationAdapterView(f"comfyui:{family.name}", family.supports_input_rotation),
+        None,
+        state_dict,
+        quantization_config,
+        parse_runtime_manifest(quantization_config) if "runtime_manifest" in quantization_config else None,
+        precision=precision,
+        device=load_device,
+        allow_fp4=bool(model_options.get("allow_fp4_rotation", False)),
     )
 
     # The dtype decision needs the model config, which needs the detection view, which needs the context only
@@ -274,6 +308,8 @@ def load_comfy_diffusion_model(
     model = model_config.get_model(plan.detect, "", device=torch.device("meta"))
     diffusion_model = model.diffusion_model
     family.install(diffusion_model, plan, context)
+    if rotation_targets is not None:
+        bind_input_rotations(diffusion_model, plan.quant, rotation_targets)
 
     tensors = dict(model_config.process_unet_state_dict(dict(plan.dense)))
     tensors.update(plan.quant)

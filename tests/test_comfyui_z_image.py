@@ -66,10 +66,12 @@ def test_comfy_z_image_matches_diffusers_adapter(tmp_path):
 
     assert torch.isfinite(actual).all()
     # ComfyUI's NextDiT returns the negated prediction (Diffusers' Z-Image pipeline negates it instead). The bound is
-    # loose: ComfyUI's own q/k-norm + RoPE differ from Diffusers' by ~1% in bf16, and the W4A4 layers amplify input
-    # differences (MPS: ~7e-2; swapping the SwiGLU halves gives ~0.8). The exact mapping is checked layer by layer
-    # in test_comfy_z_image_layers_match_diffusers_layers.
-    assert relative_error(-actual, expected) < 0.15
+    # loose because this random-weight model amplifies tiny differences: ComfyUI's own q/k-norm + RoPE differ from
+    # Diffusers' by ~1% in bf16 (MPS: ~7e-2 end to end). On CUDA even Diffusers alone differs by ~0.1 between two
+    # runs on the same input, and a 0.1% input change moves its output by ~7e-2 (ComfyUI vs Diffusers: ~0.3), so
+    # there the bound only catches gross errors. Swapping the SwiGLU halves gives ~0.8. The exact mapping is checked
+    # layer by layer in test_comfy_z_image_layers_match_diffusers_layers.
+    assert relative_error(-actual, expected) < (0.15 if device.type == "mps" else 0.5)
 
 
 def load_diffusers(checkpoint, device):
@@ -87,7 +89,7 @@ def load_diffusers(checkpoint, device):
 
 
 def test_comfy_z_image_layers_match_diffusers_layers(tmp_path):
-    """Every installed W4A4 layer gives exactly the Diffusers adapter's output on the same input."""
+    """Every installed W4A4 layer gives the Diffusers adapter's output on the same input (bit-exact on MPS)."""
 
     require_comfyui()
     device = kernel_device()
@@ -104,6 +106,8 @@ def test_comfy_z_image_layers_match_diffusers_layers(tmp_path):
     with torch.no_grad():
         for group in ("layers.0", "noise_refiner.0", "noise_refiner.1", "context_refiner.0", "context_refiner.1"):
             ours, theirs = model.get_submodule(group), reference.get_submodule(group)
-            assert torch.equal(ours.attention.qkv(x), theirs.attention.to_qkv(x)), group
-            assert torch.equal(ours.attention.out(x), theirs.attention.to_out[0](x)), group
-            assert torch.equal(ours.feed_forward(x), theirs.feed_forward(x)), group
+            # Same kernels on the same weights: equal up to the CUDA kernels' run-to-run noise (~1e-4); a wrong
+            # mapping (e.g. swapped SwiGLU halves or q/k/v order) gives errors near 1.
+            assert relative_error(ours.attention.qkv(x), theirs.attention.to_qkv(x)) < 1e-3, group
+            assert relative_error(ours.attention.out(x), theirs.attention.to_out[0](x)) < 1e-3, group
+            assert relative_error(ours.feed_forward(x), theirs.feed_forward(x)) < 1e-3, group
