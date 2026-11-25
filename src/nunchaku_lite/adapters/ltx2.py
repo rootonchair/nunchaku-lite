@@ -42,7 +42,10 @@ def _patch_ltx2_feed_forward(ff: FeedForward, context: SVDQPatchContext) -> Feed
     )
     if len(ff.net) > 2 and isinstance(ff.net[2], SVDQW4A4Linear):
         ff.net[2].act_unsigned = False
-        setattr(ff.net[2], FUSED_MLP_FC2_ATTR, True)
+        # Only NVFP4 runs fc2 inside the fused GELU-MLP epilogue (see _use_fused_gelu_mlp); INT4 fc2
+        # quantizes its own input on the signed standalone path, so it may carry an input rotation.
+        if context.precision == "nvfp4":
+            setattr(ff.net[2], FUSED_MLP_FC2_ATTR, True)
     ff._nunchaku_lite_ltx2_original_forward = ff.forward
     ff.forward = types.MethodType(_ltx2_feed_forward, ff)
     return ff
@@ -67,6 +70,8 @@ def _use_fused_gelu_mlp(ff: FeedForward, hidden_states: torch.Tensor, args: tupl
         and isinstance(getattr(ff.net[0], "proj", None), SVDQW4A4Linear)
         and isinstance(ff.net[2], SVDQW4A4Linear)
         and ff.net[2].precision == "nvfp4"
+        and ff.net[0].proj.input_rotation is None
+        and ff.net[2].input_rotation is None
     )
 
 
@@ -550,6 +555,9 @@ class LTX2Adapter:
     """Adapter for Diffusers ``LTX2VideoTransformer3DModel`` checkpoints."""
 
     target = "ltx2"
+    # Every SVDQ layer quantizes its own input on the signed standalone path, except NVFP4 fc2, which
+    # is marked FUSED_MLP_FC2_ATTR and refused by the rotation binder.
+    supports_input_rotation = True
 
     def matches(self, transformer: torch.nn.Module) -> bool:
         return isinstance(transformer, LTX2VideoTransformer3DModel)

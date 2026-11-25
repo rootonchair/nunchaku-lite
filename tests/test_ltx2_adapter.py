@@ -361,3 +361,101 @@ def test_ltx2_feed_forward_uses_fused_mlp_only_for_nvfp4(precision, fused):
     with torch.no_grad():
         assert _use_fused_gelu_mlp(ff, cuda_like, (), {}) is fused
     assert not _use_fused_gelu_mlp(ff, SimpleNamespace(is_cuda=False), (), {})
+
+
+# --- activation rotation (hadamard) -----------------------------------------------------------
+
+_LTX2_ROTATED = [
+    "transformer_blocks.0.attn1.to_q",
+    "transformer_blocks.0.attn2.to_k",
+    "transformer_blocks.0.audio_to_video_attn.to_out.0",
+    "transformer_blocks.0.ff.net.0.proj",
+    "transformer_blocks.0.ff.net.2",
+]
+
+
+def _ltx2_rotated_checkpoint(tmp_path, rotated, *, marker=True, declaration=True, precision="int4", rank=4):
+    source = make_tiny_ltx2_transformer()
+    options = _patch_options(rank)
+    options.precision = precision
+    LTX2Adapter().patch(source, {}, {"rank": rank}, options)
+    state = {k: v.contiguous() for k, v in source.state_dict().items()}
+    if marker:
+        state["nunchaku_lite.input_rotation"] = torch.empty(0)
+    config = {"rank": rank}
+    if declaration:
+        config["input_rotation"] = {"format_version": 2, "type": "hadamard", "targets": list(rotated)}
+    path = tmp_path / "ltx2-rotated.safetensors"
+    save_file(state, path, metadata={"quantization_config": json.dumps(config)})
+    return path
+
+
+def _ltx2_is_unpatched(transformer):
+    return not any(isinstance(m, SVDQW4A4Linear) for m in transformer.modules())
+
+
+@pytest.mark.parametrize("target", ["ltx2", "auto"])
+def test_ltx2_marker_checkpoint_binds_rotated_int4_targets(tmp_path, target):
+    path = _ltx2_rotated_checkpoint(tmp_path, _LTX2_ROTATED)
+    transformer = patch_transformer(
+        make_tiny_ltx2_transformer(), path, target=target, precision="int4", torch_dtype=torch.bfloat16, device="cpu"
+    )
+    bound = {n for n, m in transformer.named_modules() if isinstance(m, SVDQW4A4Linear) and m.input_rotation}
+    assert bound == set(_LTX2_ROTATED)
+    assert transformer.transformer_blocks[0].audio_ff.net[2].input_rotation is None
+    assert not transformer._nunchaku_lite_incompatible_keys.unexpected_keys
+    assert not transformer._nunchaku_lite_incompatible_keys.missing_keys
+
+
+def test_ltx2_declaration_without_marker_is_refused_and_leaves_model_unpatched(tmp_path):
+    path = _ltx2_rotated_checkpoint(tmp_path, _LTX2_ROTATED, marker=False)
+    transformer = make_tiny_ltx2_transformer()
+    with pytest.raises(ValueError, match="marker tensor"):
+        patch_transformer(transformer, path, target="ltx2", precision="int4", torch_dtype=torch.bfloat16, device="cpu")
+    assert _ltx2_is_unpatched(transformer)
+
+
+def test_ltx2_nvfp4_fc2_rotation_is_refused_even_with_fp4_opt_in(tmp_path):
+    # NVFP4 fc2 is quantized inside the fused GELU-MLP epilogue, which applies no rotation.
+    path = _ltx2_rotated_checkpoint(tmp_path, ["transformer_blocks.0.ff.net.2"], precision="nvfp4")
+    transformer = make_tiny_ltx2_transformer()
+    with pytest.raises(ValueError, match="fused-MLP"):
+        patch_transformer(
+            transformer,
+            path,
+            target="ltx2",
+            precision="fp4",
+            torch_dtype=torch.bfloat16,
+            device="cpu",
+            adapter_options={"allow_fp4_rotation": True},
+        )
+
+
+@pytest.mark.parametrize(
+    "precision,rotate,fc2_marked_fused,uses_fused",
+    [
+        ("int4", None, False, False),
+        ("int4", "fc1", False, False),
+        ("int4", "fc2", False, False),
+        ("nvfp4", None, True, True),
+        ("nvfp4", "fc1", True, False),
+        ("nvfp4", "fc2", True, False),
+    ],
+)
+def test_ltx2_fused_mlp_decision_table(precision, rotate, fc2_marked_fused, uses_fused):
+    from diffusers.models.attention import FeedForward
+
+    from nunchaku_lite.adapters.common import SVDQPatchContext
+    from nunchaku_lite.adapters.ltx2 import _patch_ltx2_feed_forward, _use_fused_gelu_mlp
+    from nunchaku_lite.ops.fused import FUSED_MLP_FC2_ATTR
+
+    context = SVDQPatchContext(precision=precision, rank=16, torch_dtype=torch.bfloat16)
+    ff = _patch_ltx2_feed_forward(FeedForward(64, activation_fn="gelu-approximate"), context)
+    if rotate == "fc1":
+        ff.net[0].proj.input_rotation = "hadamard"
+    elif rotate == "fc2":
+        ff.net[2].input_rotation = "hadamard"
+    assert getattr(ff.net[2], FUSED_MLP_FC2_ATTR, False) is fc2_marked_fused
+    assert ff.net[2].act_unsigned is False
+    with torch.no_grad():
+        assert _use_fused_gelu_mlp(ff, SimpleNamespace(is_cuda=True), (), {}) is uses_fused
