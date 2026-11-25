@@ -73,6 +73,7 @@ model guides live under `docs/models/`.
 | Qwen-Image and Qwen-Image-Edit | Qwen-Image, Qwen-Image-Lightning, Qwen-Image-Edit, and Qwen-Image-Edit-2509 | Yes | [docs/models/qwen_image.md](docs/models/qwen_image.md) | Pipeline loading, INT4/FP4 checkpoints, low-VRAM examples, Lightning LoRA workflows, and edit-pipeline examples. |
 | SDXL and SDXL-Turbo | SDXL and SDXL-Turbo | Not yet | [docs/models/sdxl.md](docs/models/sdxl.md) | Pipeline loading for quantized UNet checkpoints. |
 | Z-Image Turbo | Z-Image Turbo | Yes | [docs/models/z_image.md](docs/models/z_image.md) | Pipeline loading, INT4/FP4 checkpoints, runtime LoRA, and dense AdaLN modulation LoRA branches. |
+| LTX-2.5 (preview) | LTX-2.5 distilled | Not yet | [docs/models/ltx2.md](docs/models/ltx2.md) | NVFP4 (Blackwell) and INT4 with Hadamard rotation transformer patching, fused diffusion-decoder kernels. Checkpoints not published yet. |
 
 The Qwen low-VRAM guides use `enable_model_cpu_offload()`, which requires
 `accelerate`.
