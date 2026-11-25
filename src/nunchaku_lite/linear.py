@@ -9,6 +9,33 @@ from .ops.gemv import awq_gemv_w4a16_cuda
 from .ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda, svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda
 
 INPUT_ROTATIONS = (None, "hadamard")
+_ALPHA_CACHE_ATTR = "_nunchaku_lite_alpha_cache"
+# Tensors of SVDQW4A4Linear whose dtype a module-wide cast must not change.
+_CAST_PROTECTED_DTYPES = {"wscales": (torch.float8_e4m3fn,), "wtscale": (torch.float32,)}
+
+
+def wtscale_alpha(module: nn.Module) -> float | torch.Tensor | None:
+    """The NVFP4 per-tensor weight scale to pass to the GEMM as ``alpha``.
+
+    ``wtscale`` is a float, a CPU tensor (set by the Diffusers loader), or, for layers built by
+    :mod:`nunchaku_lite.loader`, a persistent buffer that moves with the module. The native op
+    reads ``alpha`` with ``item()``, so a device-resident buffer would force a host sync on every
+    GEMM (and break CUDA-graph capture): it is read once per (re)load and handed over as a CPU
+    float32 scalar, exactly the value ``item()`` would have read.
+    """
+
+    wtscale = getattr(module, "wtscale", None)
+    if not isinstance(wtscale, torch.Tensor) or wtscale.device.type == "cpu":
+        return wtscale
+    # Inference tensors (models built under torch.inference_mode, as ltx-core does) have no version counter; a
+    # reload still replaces the tensor, so its data pointer alone keys the cache.
+    version = None if wtscale.is_inference() else wtscale._version
+    key = (wtscale.data_ptr(), version, wtscale.dtype)
+    cached = module.__dict__.get(_ALPHA_CACHE_ATTR)
+    if cached is None or cached[0] != key:
+        cached = (key, torch.tensor(float(wtscale.reshape(-1)[0]), dtype=torch.float32))
+        module.__dict__[_ALPHA_CACHE_ATTR] = cached
+    return cached[1]
 
 
 class DenseRuntimeLoraLinear(nn.Linear):
@@ -248,7 +275,7 @@ class SVDQW4A4Linear(nn.Module):
             lora_up=self.proj_up,
             bias=self.bias,
             fp4=self.precision == "nvfp4",
-            alpha=self.wtscale,
+            alpha=wtscale_alpha(self),
             wcscales=self.wcscales,
             act_unsigned=self.act_unsigned,
         )
@@ -257,7 +284,24 @@ class SVDQW4A4Linear(nn.Module):
     def _apply(self, fn, recurse=True):
         from .ops.mps import preserve_cache_across_move
 
-        return preserve_cache_across_move(self, lambda: super(SVDQW4A4Linear, self)._apply(fn, recurse))
+        # A dtype cast (module.to(torch.float16), as framework model managers do) must not touch the packed
+        # NVFP4 scales (float8) or a wtscale buffer (float32): they keep their dtype and only move.
+        # detach(): nn.Module._apply rebinds ``param.data`` in place, which would also change a plain reference.
+        kept = {
+            name: tensor.detach()
+            for name, tensor in (("wscales", self.wscales), ("wtscale", getattr(self, "wtscale", None)))
+            if isinstance(tensor, torch.Tensor) and tensor.dtype in _CAST_PROTECTED_DTYPES[name]
+        }
+        result = preserve_cache_across_move(self, lambda: super(SVDQW4A4Linear, self)._apply(fn, recurse))
+        for name, original in kept.items():
+            moved = getattr(self, name)
+            if moved.dtype != original.dtype:
+                restored = original.to(moved.device)
+                if name in self._parameters:
+                    self._parameters[name] = nn.Parameter(restored, requires_grad=False)
+                else:
+                    self._buffers[name] = restored
+        return result
 
     def forward(self, x: torch.Tensor, output: torch.Tensor | None = None) -> torch.Tensor:
         """Apply the quantized projection to a batched sequence tensor.

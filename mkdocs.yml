@@ -80,6 +80,7 @@ nav:
       - Supported models:
           - FLUX.1: models/flux.md
           - FLUX.2 Klein: models/flux2.md
+          - LTX-2.5 in ltx-core: models/ltx2-reference-code.md
           - Qwen-Image: models/qwen_image.md
           - SDXL: models/sdxl.md
           - Z-Image Turbo: models/z_image.md

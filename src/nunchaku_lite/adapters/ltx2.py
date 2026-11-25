@@ -17,6 +17,7 @@ from torch import nn
 
 from ..core import PatchOptions, register_adapter
 from ..linear import AWQW4A16Linear, SVDQW4A4Linear
+from ..loader import gelu_mlp_plan
 from ..ops.fused import (
     FUSED_MLP_FC2_ATTR,
     fused_affine_modulate,
@@ -69,9 +70,7 @@ def _use_fused_gelu_mlp(ff: FeedForward, hidden_states: torch.Tensor, args: tupl
         and isinstance(ff.net[0], GELU)
         and isinstance(getattr(ff.net[0], "proj", None), SVDQW4A4Linear)
         and isinstance(ff.net[2], SVDQW4A4Linear)
-        and ff.net[2].precision == "nvfp4"
-        and ff.net[0].proj.input_rotation is None
-        and ff.net[2].input_rotation is None
+        and gelu_mlp_plan(ff.net[0].proj, ff.net[2]).fused
     )
 
 

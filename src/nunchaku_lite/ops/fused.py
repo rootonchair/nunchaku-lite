@@ -1,10 +1,16 @@
 """Higher-level fused operations assembled from native quantization and GEMM kernels."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
-from diffusers.models.normalization import RMSNorm as DiffusersRMSNorm
 from torch.nn import RMSNorm
 
-from ..linear import SVDQW4A4Linear
+if TYPE_CHECKING:  # annotation only: ltx-core / ComfyUI integrations run without diffusers
+    from diffusers.models.normalization import RMSNorm as DiffusersRMSNorm
+
+from ..linear import SVDQW4A4Linear, wtscale_alpha
 from ..utils import ceil_divide
 from .backend import get_ops
 from .gemm import svdq_gemm_w4a4_cuda
@@ -61,7 +67,7 @@ def fused_gelu_mlp(x: torch.Tensor, fc1: SVDQW4A4Linear, fc2: SVDQW4A4Linear, pa
         bias=fc1.bias,
         smooth_factor=fc2.smooth_factor,
         fp4=fc1.precision == "nvfp4",
-        alpha=fc1.wtscale,
+        alpha=wtscale_alpha(fc1),
         wcscales=fc1.wcscales,
     )
     output = torch.empty(batch_size * seq_len, fc2.out_features, dtype=x.dtype, device=x.device)
@@ -136,7 +142,7 @@ def fused_qkv_norm_rotary(
             lora_up=proj.proj_up,
             bias=proj.bias,
             fp4=proj.precision == "nvfp4",
-            alpha=proj.wtscale,
+            alpha=wtscale_alpha(proj),
             wcscales=proj.wcscales,
             norm_q=norm_q_weight,
             norm_k=norm_k_weight,
@@ -158,7 +164,7 @@ def fused_qkv_norm_rotary(
         lora_up=proj.proj_up,
         bias=proj.bias,
         fp4=proj.precision == "nvfp4",
-        alpha=proj.wtscale,
+        alpha=wtscale_alpha(proj),
         wcscales=proj.wcscales,
         norm_q=norm_q_weight,
         norm_k=norm_k_weight,
