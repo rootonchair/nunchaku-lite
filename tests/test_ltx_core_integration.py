@@ -16,24 +16,24 @@ import torch
 
 ltx_core = pytest.importorskip("ltx_core")
 
-from ltx_core.loader.simple_builder import SimpleBuilder  # noqa: E402
-from ltx_core.model.transformer.attention import Attention  # noqa: E402
-from ltx_core.model.transformer.model_configurator import (  # noqa: E402
+from ltx_core.loader.simple_builder import SimpleBuilder
+from ltx_core.model.transformer.attention import Attention
+from ltx_core.model.transformer.model_configurator import (
     LTXV_MODEL_COMFY_RENAMING_MAP,
     LTXModelConfigurator,
     transformer_checkpoint_selection_ops,
 )
-from ltx_core.quantization.policy import compose_quantization  # noqa: E402
-from safetensors import safe_open  # noqa: E402
-from safetensors.torch import load_file, save_file  # noqa: E402
+from ltx_core.quantization.policy import compose_quantization
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
+from svdq_files import WTSCALE, quant_config, svdq_tensors, write_checkpoint
 
-from nunchaku_lite.integrations import ltx_core as integration  # noqa: E402
-from nunchaku_lite.integrations.ltx_core import build_nunchaku_policy  # noqa: E402
-from nunchaku_lite.linear import SVDQW4A4Linear  # noqa: E402
-from nunchaku_lite.loader import NATIVE_PREFIX, read_checkpoint_spec  # noqa: E402
-from nunchaku_lite.native_export import _select_targets, splice_native, verify_native_splice  # noqa: E402
-from nunchaku_lite.ops.fused import FUSED_MLP_FC2_ATTR  # noqa: E402
-from svdq_files import WTSCALE, quant_config, svdq_tensors, write_checkpoint  # noqa: E402
+from nunchaku_lite.integrations import ltx_core as integration
+from nunchaku_lite.integrations.ltx_core import build_nunchaku_policy
+from nunchaku_lite.linear import SVDQW4A4Linear
+from nunchaku_lite.loader import NATIVE_PREFIX, read_checkpoint_spec
+from nunchaku_lite.native_export import _select_targets, splice_native, verify_native_splice
+from nunchaku_lite.ops.fused import FUSED_MLP_FC2_ATTR
 
 TINY = {
     "transformer": {
@@ -116,8 +116,8 @@ def test_splice_is_byte_exact(tmp_path, precision, rotate):
     assert len(spec.layers) == 2 * 28  # per block: 6 attentions x (q, k, v, out) + 2 FFs x 2; gate logits excluded
     with safe_open(str(out), framework="pt") as f:
         assert json.loads(f.metadata()["config"]) == TINY
-        assert CONNECTOR_KEY in f.keys()
-        assert not any(k.endswith(".weight") and k.removeprefix(NATIVE_PREFIX).rpartition(".")[0] in layers for k in f.keys())
+        assert CONNECTOR_KEY in f.keys()  # noqa: SIM118 - safe_open handle
+        assert not any(k.endswith(".weight") and k.removeprefix(NATIVE_PREFIX).rpartition(".")[0] in layers for k in f.keys())  # noqa: SIM118
 
 
 def test_splice_refuses_wrong_model(tmp_path):
@@ -132,7 +132,7 @@ def test_splice_refuses_wrong_model(tmp_path):
 
 
 def test_splice_refuses_quantized_official(tmp_path):
-    official, quantized, out, _ = _spliced(tmp_path, "int4")
+    _official, quantized, out, _ = _spliced(tmp_path, "int4")
     with pytest.raises(ValueError, match="already quantized"):
         splice_native(out, quantized, tmp_path / "again.safetensors")
 

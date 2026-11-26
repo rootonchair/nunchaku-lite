@@ -7,6 +7,7 @@ import json
 
 import pytest
 import torch
+from svdq_files import WTSCALE, quant_config, svdq_tensors, write_checkpoint
 from torch import nn
 
 from nunchaku_lite.linear import SVDQW4A4Linear, wtscale_alpha
@@ -19,7 +20,6 @@ from nunchaku_lite.loader import (
     replace_linears,
 )
 from nunchaku_lite.manifest import ROTATION_MARKER_KEY
-from svdq_files import WTSCALE, quant_config, svdq_tensors, write_checkpoint
 
 A, B = "blocks.0.attn.to_q", "blocks.0.ff.net.2"
 SHAPES = {A: (128, 256), B: (256, 128)}  # name -> (in, out)

@@ -167,7 +167,7 @@ def read_checkpoint_spec(path: str | os.PathLike, *, allow_fp4_rotation: bool = 
     with safe_open(str(path), framework="pt") as f:
         metadata = f.metadata() or {}
         header: dict[str, TensorInfo] = {}
-        for key in f.keys():
+        for key in f.keys():  # noqa: SIM118 - safe_open handle, not a dict
             sl = f.get_slice(key)
             header[key] = (tuple(int(d) for d in sl.get_shape()), _dtype(sl.get_dtype(), key))
 
