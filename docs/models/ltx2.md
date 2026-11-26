@@ -151,6 +151,42 @@ Lightricks' INT8 stays closest to bf16; the nunchaku-lite files are the fastest 
 below and untiled decoding, an NVFP4 clip on the RTX PRO 6000 takes 6.2 s (55.2 GB peak) and a bf16 clip 9.4 s.
 Lightricks' files run through ComfyUI's `comfy-kitchen` kernels in this pipeline.
 
+## Lower VRAM: quantized text encoder
+
+After the transformer, the biggest component is the Gemma 4 12B text encoder (22.3 GiB in bf16). Loading it with
+bitsandbytes (`pip install bitsandbytes`) cuts the pipeline's peak VRAM. Replace the `"text_encoder"` entry of the
+example and skip it when moving components to the GPU (bitsandbytes places it at load time):
+
+```python
+from transformers import BitsAndBytesConfig
+
+skip = ["vision_embedder", "embed_vision", "embed_audio", "lm_head"]  # quantize the text decoder layers only
+quantization_config = BitsAndBytesConfig(
+    load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16, llm_int8_skip_modules=skip
+)  # or BitsAndBytesConfig(load_in_8bit=True, llm_int8_skip_modules=skip)
+components["text_encoder"] = AutoModelForImageTextToText.from_pretrained(
+    os.path.join(model_dir, "text_encoder"), torch_dtype=torch.bfloat16,
+    quantization_config=quantization_config, device_map={"": device},
+)
+
+# step 3: move everything else
+for name, component in pipe.components.items():
+    if isinstance(component, torch.nn.Module) and name != "text_encoder":
+        component.to(device)
+```
+
+RTX PRO 6000, NVFP4 transformer, everything on the GPU, 768x512x121:
+
+| Text encoder | Size | Error vs bf16 encoder | Peak VRAM | s/clip |
+|---|---|---|---|---|
+| bf16 | 22.3 GiB | - | 55.2 GB | 6.2 |
+| bitsandbytes 8-bit | 12.1 GiB | 1.1% | 46.4 GB | 6.4 |
+| bitsandbytes NF4 | 7.0 GiB | 2.9% | 41.9 GB | 7.0 |
+
+The error is the relative error of the encoder's hidden states on 6 prompts. On the generated clips, PSNR against the
+full bf16 pipeline is 20.2 dB with NF4 and 19.5 dB with 8-bit, vs 20.9 dB with the bf16 encoder; the spread across
+prompts (2-5 dB) is larger than these differences, so compare a few videos for your prompts.
+
 ## Diffusion decoder
 
 LTX-2.5 decodes latents with a diffusion decoder whose last stage dominates decode time. Step 4 of the example
