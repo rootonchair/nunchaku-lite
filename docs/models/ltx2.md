@@ -1,9 +1,11 @@
 # LTX-2.5 NVFP4 / INT4
 
-> **Status: preview.** The LTX-2.5 checkpoints below are not published yet (the paths are placeholders), and the
-> decoder kernels are not yet in a released `nunchaku-lite-kernels` build. Until they are, the decoder speedup is
-> skipped with a warning. LTX-2.5 needs a Diffusers version that includes `LTX2VideoTransformer3DModel` with the
-> LTX-2.5 options and the `LTX25AutoBlocks` modular pipeline.
+> **Status: preview.** LTX-2.5 needs Diffusers 0.43 or newer. The decoder kernels ship in `nunchaku-lite-kernels`
+> v3; with an older kernel build the decoder speedup is skipped with a warning.
+>
+> The checkpoints are derivatives of LTX-2.5 and are distributed under the
+> [LTX-2.x Community License](https://huggingface.co/rootonchair/nunchaku-lite-ltx-2.5-distilled/blob/main/LICENSE),
+> which has its own terms, including for commercial use.
 
 Quantized transformer for the LTX-2.5 distilled model (22B), plus faster kernels for its diffusion video decoder.
 
@@ -11,6 +13,21 @@ Quantized transformer for the LTX-2.5 distilled model (22B), plus faster kernels
 |---|---|---|
 | Blackwell (RTX PRO 6000, RTX 50xx) | `"fp4"` (NVFP4, rank 32) | fastest; ~1.8x the bf16 transformer speed on an RTX PRO 6000 |
 | Other CUDA GPUs (A100, ...) | `"int4"` (rank 32, Hadamard input rotation) | rotation is stored in the checkpoint and applied automatically |
+
+## Base model
+
+The example loads every component except the quantized transformer from the LTX-2.5 distilled model in the Diffusers
+folder layout. Lightricks ships LTX-2.5 as single files; convert them once with the script in this repository
+(accept the license of the gated [Lightricks/LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5) repo and log in
+first):
+
+```bash
+hf auth login
+python tools/convert_ltx25_distilled.py --out ltx-2.5-distilled-diffusers
+```
+
+It downloads 72 GB, writes about 70 GB and needs about 85 GB of CPU memory. `--meta` checks the conversion from the
+file headers without downloading the weights.
 
 ## Full example
 
@@ -32,9 +49,9 @@ from diffusers.utils import encode_video
 from nunchaku_lite import patch_transformer
 from nunchaku_lite.adapters.ltx2_decoder import optimize_ltx2_diffusion_decoder
 
-model_dir = "path/to/ltx-2.5-distilled-diffusers"  # converted Diffusers folder
+model_dir = "ltx-2.5-distilled-diffusers"  # from tools/convert_ltx25_distilled.py
 precision = "fp4"  # "fp4" on Blackwell, "int4" elsewhere
-checkpoint = f"path/to/svdq-{precision}_r32-ltx-2.5-distilled.safetensors"  # placeholder: not published yet
+checkpoint = f"rootonchair/nunchaku-lite-ltx-2.5-distilled/svdq-{precision}_r32-ltx-2.5-distilled.safetensors"
 device = "cuda"
 
 # 1. quantized transformer
@@ -104,8 +121,28 @@ encode_video(
 ```
 
 `from_pretrained` on the transformer loads the bf16 weights first (about 44 GB of CPU memory) before they are replaced
-by the quantized ones. This script follows the pipeline assembly used for the evaluations below; it has not yet been
-run verbatim end to end.
+by the quantized ones. The script was run as written on an RTX PRO 6000 with both checkpoints: 768x512, 121 frames
+with audio, peak VRAM 55.8 GiB (NVFP4) and 55.3 GiB (INT4).
+
+## Quality and speed
+
+RTX PRO 6000, 6 prompts with people (seeds 47-52), 768x512x121, 8 steps. PSNR and SSIM are against bf16 on the same
+GPU with the same decoder; s/clip is warm generation time per clip including decoding.
+
+| Transformer | Decoder | PSNR vs bf16 | SSIM | s/clip | Peak VRAM |
+|---|---|---|---|---|---|
+| bf16 | nunchaku-lite kernels, untiled | - | - | 9.4 | 79.4 GB |
+| NVFP4 r32 (this repo) | nunchaku-lite kernels, untiled | 20.91 dB | 0.710 | 6.2 | 55.2 GB |
+| INT4 r32 + rotation (this repo) | nunchaku-lite kernels, untiled | 19.16 dB | 0.663 | 24.6 | 54.7 GB |
+| bf16 | Diffusers default, tiled | - | - | 10.9 | 76.8 GB |
+| NVFP4 r32 (this repo) | Diffusers default, tiled | 21.12 dB | 0.722 | 8.0 | 52.6 GB |
+| Lightricks NVFP4 | Diffusers default, tiled | 18.86 dB | 0.671 | 10.2 | 55.2 GB |
+| Lightricks INT8 | Diffusers default, tiled | 26.09 dB | 0.864 | 9.2 | 57.7 GB |
+
+Each group is compared with the bf16 run that decodes the same way. Lightricks' INT8 checkpoint is the most accurate
+option here; NVFP4 r32 is the fastest. INT4 is meant for GPUs without NVFP4 and is not fast on Blackwell. On an
+A100 80GB (Diffusers default decoder) INT4 r32 + rotation takes 15.3 s/clip at 52.1 GB peak, vs 18.5 s for bf16;
+Lightricks INT8 there scores 21.67 dB vs INT4's 17.15 dB.
 
 ## Diffusion decoder
 
