@@ -6,16 +6,19 @@ the same way as Lightricks' own `nvfp4-prequant`: it is an ltx-core `Quantizatio
 
 ## Checkpoint
 
-The published file is Lightricks' transformer file
-(`ltx-2.5-22b-distilled-transformer-bf16.safetensors`) with every quantized layer replaced by its SVDQ W4A4 tensors:
+The checkpoints are on the Hub at
+[rootonchair/nunchaku-lite-ltx-2.5-distilled-native](https://huggingface.co/rootonchair/nunchaku-lite-ltx-2.5-distilled-native).
+Each is Lightricks' transformer file (`ltx-2.5-22b-distilled-transformer-bf16.safetensors`) with every quantized layer
+replaced by its SVDQ W4A4 tensors:
 
 ```
-ltx-2.5-22b-distilled-transformer-nunchaku-nvfp4-r32.safetensors          # Blackwell
-ltx-2.5-22b-distilled-transformer-nunchaku-int4-r32-e0-hadall.safetensors # other GPUs
+ltx-2.5-22b-distilled-transformer-nunchaku-nvfp4-r32.safetensors  # Blackwell
+ltx-2.5-22b-distilled-transformer-nunchaku-int4-r32.safetensors   # other GPUs
 ```
 
 Every other tensor (norms, AdaLN, embeddings, the text connectors) and the file metadata are byte-identical to the
-official file, so it works anywhere the official transformer file does. `tools/ltx2_native_splice.py` writes one from a
+official file (the metadata gains one `quantization_config` entry, and each quantized layer's bias is stored in the
+kernel's packed channel order), so it works anywhere the official transformer file does. `tools/ltx2_native_splice.py` writes one from a
 Diffusers-layout export and verifies it:
 
 ```bash
