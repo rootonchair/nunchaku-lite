@@ -126,23 +126,30 @@ with audio, peak VRAM 55.8 GiB (NVFP4) and 55.3 GiB (INT4).
 
 ## Quality and speed
 
-RTX PRO 6000, 6 prompts with people (seeds 47-52), 768x512x121, 8 steps. PSNR and SSIM are against bf16 on the same
-GPU with the same decoder; s/clip is warm generation time per clip including decoding.
+All rows run in the same Diffusers pipeline with the same (default, tiled) decoder: 6 prompts with people (seeds
+47-52), 768x512, 121 frames, 8 steps. PSNR and SSIM compare each video with the bf16 video for the same GPU and seed;
+s/clip is the full generation time per clip.
 
-| Transformer | Decoder | PSNR vs bf16 | SSIM | s/clip | Peak VRAM |
+**Blackwell (RTX PRO 6000): `"fp4"`**
+
+| Transformer | File size | Transformer per step | s/clip | Peak VRAM | PSNR vs bf16 | SSIM |
+|---|---|---|---|---|---|---|
+| bf16 | 39.1 GiB | 870 ms | 10.9 | 76.8 GB | - | - |
+| NVFP4 r32 (nunchaku-lite) | 11.2 GiB | 475 ms | 8.0 | 52.6 GB | 21.12 dB | 0.722 |
+| Lightricks INT8 | 20.0 GiB | 658 ms | 9.2 | 57.7 GB | 26.09 dB | 0.864 |
+| Lightricks NVFP4 | 17.4 GiB | 786 ms | 10.2 | 55.2 GB | 18.86 dB | 0.671 |
+
+**Other GPUs (A100 80GB): `"int4"`.** NVFP4 runs only on Blackwell.
+
+| Transformer | File size | s/clip | Peak VRAM | PSNR vs bf16 | SSIM |
 |---|---|---|---|---|---|
-| bf16 | nunchaku-lite kernels, untiled | - | - | 9.4 | 79.4 GB |
-| NVFP4 r32 (this repo) | nunchaku-lite kernels, untiled | 20.91 dB | 0.710 | 6.2 | 55.2 GB |
-| INT4 r32 + rotation (this repo) | nunchaku-lite kernels, untiled | 19.16 dB | 0.663 | 24.6 | 54.7 GB |
-| bf16 | Diffusers default, tiled | - | - | 10.9 | 76.8 GB |
-| NVFP4 r32 (this repo) | Diffusers default, tiled | 21.12 dB | 0.722 | 8.0 | 52.6 GB |
-| Lightricks NVFP4 | Diffusers default, tiled | 18.86 dB | 0.671 | 10.2 | 55.2 GB |
-| Lightricks INT8 | Diffusers default, tiled | 26.09 dB | 0.864 | 9.2 | 57.7 GB |
+| bf16 | 39.1 GiB | 18.5 | 76.8 GB | - | - |
+| INT4 r32 + rotation (nunchaku-lite) | 10.6 GiB | 15.3 | 52.1 GB | 17.15 dB | 0.659 |
+| Lightricks INT8 | 20.0 GiB | 20.7 | 57.7 GB | 21.67 dB | 0.792 |
 
-Each group is compared with the bf16 run that decodes the same way. Lightricks' INT8 checkpoint is the most accurate
-option here; NVFP4 r32 is the fastest. INT4 is meant for GPUs without NVFP4 and is not fast on Blackwell. On an
-A100 80GB (Diffusers default decoder) INT4 r32 + rotation takes 15.3 s/clip at 52.1 GB peak, vs 18.5 s for bf16;
-Lightricks INT8 there scores 21.67 dB vs INT4's 17.15 dB.
+Lightricks' INT8 stays closest to bf16; the nunchaku-lite files are the fastest and smallest. With the decoder kernels
+below and untiled decoding, an NVFP4 clip on the RTX PRO 6000 takes 6.2 s (55.2 GB peak) and a bf16 clip 9.4 s.
+Lightricks' files run through ComfyUI's `comfy-kitchen` kernels in this pipeline.
 
 ## Diffusion decoder
 
