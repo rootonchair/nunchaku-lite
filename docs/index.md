@@ -45,5 +45,6 @@ and reproducibility details.
 | Qwen-Image and Qwen-Image-Edit | `qwen_image` | Yes |
 | SDXL and SDXL-Turbo | `sdxl` | Not yet |
 | Z-Image Turbo | `z_image` | Yes |
+| LTX-2 / LTX-2.5 (preview) | `ltx2` | Not yet |
 
 Runnable model guides are stored under [Supported models](models/flux.md).

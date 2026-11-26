@@ -712,7 +712,8 @@ def test_fused_adapters_mark_their_fused_fc2():
     from nunchaku_lite.adapters.common import SVDQPatchContext
     from nunchaku_lite.adapters.ltx2 import _patch_ltx2_feed_forward
 
-    context = SVDQPatchContext(precision="int4", rank=16, torch_dtype=torch.bfloat16)
+    # Only NVFP4 runs the LTX fused GELU-MLP (INT4 LTX exports are unshifted and run unfused).
+    context = SVDQPatchContext(precision="nvfp4", rank=16, torch_dtype=torch.bfloat16)
     ff = _patch_ltx2_feed_forward(FeedForward(64, activation_fn="gelu-approximate"), context)
     assert getattr(ff.net[2], FUSED_MLP_FC2_ATTR, False)
 
