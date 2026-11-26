@@ -5,7 +5,13 @@ mapped by Transformers when the checkpoint dtype matches, so it costs almost no 
 then quantizes one ``nn.Linear`` at a time onto the GPU. The dense encoder is never resident on the GPU.
 
 Weights are quantized round-to-nearest; activations stay in bf16/fp16 (LLM activations have outliers, and the encoder
-runs once per prompt, so speed matters little):
+runs once per prompt, so speed matters little).
+
+:func:`load_quantized_text_encoder` (and ``load_nunchaku_pipeline(text_encoder_quantization=...)``) picks a backend per
+device. On CUDA with ``bitsandbytes`` installed it loads the encoder with bitsandbytes (NF4 for ``"int4"``, LLM.int8
+for ``"int8"``) through :func:`~nunchaku_lite.text_encoders.load_text_encoder_bnb`: on LTX-2.5's Gemma 4 12B, NF4 was
+smaller than group-64 round-to-nearest int4 (7.0 vs 7.7 GiB) and closer to the bf16 encoder (2.9% vs 3.2% hidden-state
+error). Everywhere else (Apple silicon, CPU, CUDA without bitsandbytes) it uses this module's own formats:
 
 - ``"int4"``: asymmetric, groups of 64 input channels. On CUDA as :class:`~nunchaku_lite.linear.AWQW4A16Linear` (the
   AWQ W4A16 kernels); elsewhere (MPS, CPU) as :class:`~nunchaku_lite.linear.Int4WeightOnlyLinear`, which dequantizes
@@ -16,6 +22,7 @@ runs once per prompt, so speed matters little):
 from __future__ import annotations
 
 import gc
+import importlib.util
 import os
 from collections import Counter
 from collections.abc import Iterable
@@ -26,6 +33,8 @@ from torch import nn
 from ..linear import AWQW4A16Linear, Int4WeightOnlyLinear, Int8WeightOnlyLinear
 
 TEXT_ENCODER_QUANTIZATIONS = ("int4", "int8")
+TEXT_ENCODER_BACKENDS = ("auto", "bitsandbytes", "nunchaku-lite")
+_BNB_MODE = {"int4": "nf4", "int8": "int8"}
 
 # Vision towers of VLM text encoders (Qwen2.5-VL's ``visual``) are kept dense by default.
 DEFAULT_EXCLUDE = ("visual", "vision_tower", "vision_model")
@@ -40,6 +49,23 @@ def validate_text_encoder_quantization(weights: str) -> str:
             f"Unsupported text encoder quantization {weights!r}; expected one of {TEXT_ENCODER_QUANTIZATIONS}."
         )
     return weights
+
+
+def resolve_text_encoder_backend(backend: str = "auto", device: str | torch.device | None = None) -> str:
+    """``"bitsandbytes"`` or ``"nunchaku-lite"`` for loading a quantized text encoder on ``device``.
+
+    ``"auto"`` picks bitsandbytes on CUDA when it is installed, else this module's own int4/int8 formats.
+    """
+
+    if backend not in TEXT_ENCODER_BACKENDS:
+        raise ValueError(f"Unsupported text encoder backend {backend!r}; expected one of {TEXT_ENCODER_BACKENDS}.")
+    device = torch.device(device) if device is not None else default_quantization_device()
+    if backend == "auto":
+        on_cuda = device.type == "cuda"
+        return "bitsandbytes" if on_cuda and importlib.util.find_spec("bitsandbytes") is not None else "nunchaku-lite"
+    if backend == "bitsandbytes" and device.type != "cuda":
+        raise ValueError(f"The bitsandbytes text encoder backend needs a CUDA device, got {device}.")
+    return backend
 
 
 def default_quantization_device() -> torch.device:
@@ -131,6 +157,7 @@ def load_quantized_text_encoder(
     torch_dtype: torch.dtype = torch.bfloat16,
     device: str | torch.device | None = None,
     exclude: Iterable[str] | None = DEFAULT_EXCLUDE,
+    backend: str = "auto",
     **from_pretrained_kwargs,
 ) -> nn.Module:
     """Load a Transformers text encoder and quantize its weights at load time.
@@ -143,6 +170,8 @@ def load_quantized_text_encoder(
         torch_dtype: Dtype the dense weights load in, and of scales, biases and the unquantized layers.
         device: Device to quantize on and run on. Defaults to CUDA, then MPS, then CPU.
         exclude: Module-name components to keep dense (see :func:`quantize_text_encoder`).
+        backend: ``"auto"`` (bitsandbytes on CUDA when installed, else this module's formats), ``"bitsandbytes"``
+            or ``"nunchaku-lite"``. A bitsandbytes encoder is placed on ``device`` at load time; don't move it after.
         **from_pretrained_kwargs: Forwarded to ``model_cls.from_pretrained`` (``revision``, ``cache_dir``, ...).
 
     Returns:
@@ -164,6 +193,25 @@ def load_quantized_text_encoder(
             )
         model_cls = getattr(transformers, architectures[0])
 
+    resolved = resolve_text_encoder_backend(backend, device)
+    if resolved == "bitsandbytes":
+        from .bnb import DEFAULT_SKIP_MODULES, load_text_encoder_bnb
+
+        skip = tuple(dict.fromkeys((*DEFAULT_SKIP_MODULES, *(exclude or ()))))
+        model = load_text_encoder_bnb(
+            model_cls,
+            pretrained_model_name_or_path,
+            quantization=_BNB_MODE[weights],
+            device=device or "cuda",
+            torch_dtype=torch_dtype,
+            skip_modules=skip,
+            **hub_kwargs,
+        )
+        model.eval()
+        model._nunchaku_lite_text_encoder_quantization = weights
+        model._nunchaku_lite_text_encoder_backend = resolved
+        return model
+
     dtype_key = "dtype" if _transformers_accepts_dtype() else "torch_dtype"
     model = model_cls.from_pretrained(
         pretrained_model_name_or_path,
@@ -172,7 +220,9 @@ def load_quantized_text_encoder(
         **hub_kwargs,
     )
     model.eval()
-    return quantize_text_encoder(model, weights, device=device, exclude=exclude, torch_dtype=torch_dtype)
+    model = quantize_text_encoder(model, weights, device=device, exclude=exclude, torch_dtype=torch_dtype)
+    model._nunchaku_lite_text_encoder_backend = resolved
+    return model
 
 
 def _transformers_accepts_dtype() -> bool:
@@ -244,7 +294,9 @@ def _fill(module: nn.Module, linear: nn.Linear) -> None:
 
 __all__ = [
     "DEFAULT_EXCLUDE",
+    "TEXT_ENCODER_BACKENDS",
     "TEXT_ENCODER_QUANTIZATIONS",
     "load_quantized_text_encoder",
     "quantize_text_encoder",
+    "resolve_text_encoder_backend",
 ]

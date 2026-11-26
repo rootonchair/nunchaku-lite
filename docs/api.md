@@ -54,7 +54,8 @@ Arguments:
 - `text_encoder_quantization`: quantize the pipeline's Transformers text
   encoders at load time, weights only: `"int4"` or `"int8"` for every
   `text_encoder*` component, or a dict such as `{"text_encoder_2": "int4"}`.
-  No quantized checkpoint is needed. See
+  No quantized checkpoint is needed. On CUDA with bitsandbytes installed it
+  uses bitsandbytes; elsewhere nunchaku-lite's own formats. See
   [Text encoder quantization](#text-encoder-quantization).
 - Additional keyword arguments are forwarded to `pipeline_cls.from_pretrained(...)`.
 
@@ -91,6 +92,24 @@ pipe = load_nunchaku_pipeline(
     text_encoder_quantization="int4",  # or "int8"
 )
 ```
+
+The backend depends on the device:
+
+| Device | Backend | `"int4"` | `"int8"` |
+| --- | --- | --- | --- |
+| CUDA, `bitsandbytes` installed | bitsandbytes | NF4 | LLM.int8 |
+| CUDA without bitsandbytes, Apple silicon (MPS), CPU | nunchaku-lite | round-to-nearest int4, groups of 64 | round-to-nearest int8, per output channel |
+
+bitsandbytes is preferred on CUDA because it measured better: on LTX-2.5's
+Gemma 4 12B encoder, NF4 was smaller than nunchaku-lite's int4 (7.0 vs 7.7 GiB)
+and closer to bf16 (2.9% vs 3.2% hidden-state error). Install it with
+`pip install "nunchaku-lite[bnb]"`. A bitsandbytes encoder is placed on
+`device` while loading; don't move it with `pipe.to()` or CPU offload
+afterwards. To pick the backend yourself, call
+`load_quantized_text_encoder(..., backend="bitsandbytes" | "nunchaku-lite")`
+and pass the encoder to the pipeline.
+
+The rest of this section describes nunchaku-lite's own formats:
 
 - Weights are quantized round-to-nearest; activations stay in bf16/fp16.
   `"int4"` is asymmetric with groups of 64 input channels, `"int8"` symmetric
@@ -132,8 +151,8 @@ pipeline keeps; vision tower left in bf16):
 the same composition as bf16, differing in fine detail. On Qwen-Image its error
 is much larger and it has not been checked on images yet; prefer `"int8"` there.
 
-On an RTX PRO 6000 (FLUX.2 Klein 4B pipeline with the FP4 transformer, 1024x1024, 4 steps; real prompt tokens
-compared):
+On an RTX PRO 6000 with `backend="nunchaku-lite"` (FLUX.2 Klein 4B pipeline with the FP4 transformer, 1024x1024,
+4 steps; real prompt tokens compared):
 
 | Encoder | Encoder size | VRAM after load | Generation peak | Embedding error vs bf16 |
 | --- | ---: | ---: | ---: | --- |
@@ -148,7 +167,7 @@ from nunchaku_lite import load_quantized_text_encoder, quantize_text_encoder
 
 text_encoder = load_quantized_text_encoder(
     "black-forest-labs/FLUX.2-klein-4B", "int4", subfolder="text_encoder", device="cuda"
-)
+)  # backend="auto" (default), "bitsandbytes" or "nunchaku-lite"
 quantize_text_encoder(model, "int8", device="mps")  # any model, in place
 ```
 

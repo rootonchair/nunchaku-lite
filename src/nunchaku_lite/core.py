@@ -241,9 +241,13 @@ def load_nunchaku_pipeline(
             quantized checkpoint needed): ``"int4"`` (groups of 64) or
             ``"int8"`` (per output channel). A string applies to every
             ``text_encoder*`` component; a dict maps component names to a
-            mode. The dense encoder is memory-mapped on the CPU and quantized
-            one layer at a time on ``device``. See
-            :func:`nunchaku_lite.text_encoders.quantize_text_encoder`.
+            mode. On CUDA with ``bitsandbytes`` installed the encoders load
+            through bitsandbytes (NF4 for ``"int4"``, LLM.int8 for ``"int8"``)
+            and are placed on ``device`` at load time: don't move them with
+            ``pipe.to()`` or CPU offload afterwards. Elsewhere (Apple silicon,
+            CPU, CUDA without bitsandbytes) the dense encoder is memory-mapped
+            on the CPU and quantized one layer at a time on ``device``. See
+            :func:`nunchaku_lite.text_encoders.load_quantized_text_encoder`.
         **pipeline_kwargs: Additional keyword arguments forwarded to
             ``pipeline_cls.from_pretrained``.
 

@@ -251,3 +251,86 @@ def test_int4_awq_kernel_matches_dequantized_weight_with_bias(rows):
     expected = reference(x).float()
     actual = model(x.cuda()).float().cpu()
     assert _rel_err(actual, expected) < 0.01
+
+
+# --- backend routing: bitsandbytes on CUDA when installed, this module's formats elsewhere -------------------------
+
+
+@pytest.fixture
+def bitsandbytes_installed(monkeypatch):
+    from nunchaku_lite.text_encoders import quantize
+
+    real = quantize.importlib.util.find_spec
+    monkeypatch.setattr(
+        quantize.importlib.util, "find_spec", lambda name, *a: object() if name == "bitsandbytes" else real(name, *a)
+    )
+
+
+@pytest.mark.parametrize(
+    ("device", "installed", "expected"),
+    [
+        ("cuda", True, "bitsandbytes"),
+        ("cuda", False, "nunchaku-lite"),
+        ("mps", True, "nunchaku-lite"),
+        ("cpu", True, "nunchaku-lite"),
+    ],
+)
+def test_auto_backend_by_device(monkeypatch, device, installed, expected):
+    from nunchaku_lite.text_encoders import quantize
+
+    real = quantize.importlib.util.find_spec
+    monkeypatch.setattr(
+        quantize.importlib.util,
+        "find_spec",
+        lambda name, *a: (object() if installed else None) if name == "bitsandbytes" else real(name, *a),
+    )
+    assert quantize.resolve_text_encoder_backend("auto", device) == expected
+
+
+def test_explicit_backends(bitsandbytes_installed):
+    from nunchaku_lite.text_encoders.quantize import resolve_text_encoder_backend
+
+    assert resolve_text_encoder_backend("nunchaku-lite", "cuda") == "nunchaku-lite"
+    assert resolve_text_encoder_backend("bitsandbytes", "cuda") == "bitsandbytes"
+    with pytest.raises(ValueError, match="needs a CUDA device"):
+        resolve_text_encoder_backend("bitsandbytes", "mps")
+    with pytest.raises(ValueError, match="Unsupported text encoder backend"):
+        resolve_text_encoder_backend("gguf", "cuda")
+
+
+@pytest.mark.parametrize(("weights", "bnb_mode"), [("int4", "nf4"), ("int8", "int8")])
+def test_cuda_load_routes_to_bitsandbytes(tmp_path, monkeypatch, bitsandbytes_installed, weights, bnb_mode):
+    import nunchaku_lite.text_encoders.bnb as bnb
+    from nunchaku_lite import load_quantized_text_encoder
+
+    calls = []
+
+    def fake_bnb(model_cls, path, **kwargs):
+        calls.append((model_cls, path, kwargs))
+        return nn.Linear(2, 2)
+
+    monkeypatch.setattr(bnb, "load_text_encoder_bnb", fake_bnb)
+
+    class FakeEncoder:
+        pass
+
+    model = load_quantized_text_encoder(
+        tmp_path, weights, model_cls=FakeEncoder, subfolder="text_encoder", device="cuda", revision="abc"
+    )
+
+    ((model_cls, path, kwargs),) = calls
+    assert model_cls is FakeEncoder and path == tmp_path
+    assert kwargs["quantization"] == bnb_mode and kwargs["device"] == "cuda"
+    assert kwargs["subfolder"] == "text_encoder" and kwargs["revision"] == "abc"
+    assert {"visual", "vision_tower", "vision_model", "lm_head"} <= set(kwargs["skip_modules"])
+    assert model._nunchaku_lite_text_encoder_backend == "bitsandbytes"
+    assert model._nunchaku_lite_text_encoder_quantization == weights
+
+
+def test_cpu_load_uses_own_formats_and_records_backend(tmp_path, bitsandbytes_installed):
+    from nunchaku_lite import load_quantized_text_encoder
+
+    _tiny_qwen3().save_pretrained(tmp_path / "text_encoder")
+    model = load_quantized_text_encoder(tmp_path, "int4", subfolder="text_encoder", device="cpu")
+    assert type(model.model.layers[0].mlp.up_proj) is Int4WeightOnlyLinear
+    assert model._nunchaku_lite_text_encoder_backend == "nunchaku-lite"
