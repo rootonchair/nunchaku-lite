@@ -1,8 +1,9 @@
 """Nunchaku Lite checkpoints in Lightricks' ltx-core, end to end on a tiny real ``LTXModel`` (CPU, no kernels).
 
-Covers the native splice (byte-identity), ltx-core's own builder with our ``QuantizationPolicy`` (every target bound
-bit-exact, wtscale bound, nothing left on meta, non-targets equal to the official file), the feed-forward and
-attention replacements, and their fallbacks.
+Covers reading a native-layout file (Lightricks' transformer file with our SVDQ layers in place of the quantized
+linears), ltx-core's own builder with our ``QuantizationPolicy`` (every target bound bit-exact, wtscale bound, nothing
+left on meta, non-targets equal to the official file), partial quantization, the feed-forward and attention
+replacements, and their fallbacks.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from nunchaku_lite.integrations import ltx_core as integration
 from nunchaku_lite.integrations.ltx_core import build_nunchaku_policy
 from nunchaku_lite.linear import SVDQW4A4Linear
 from nunchaku_lite.loader import NATIVE_PREFIX, read_checkpoint_spec
-from nunchaku_lite.native_export import _select_targets, splice_native, verify_native_splice
+from nunchaku_lite.manifest import ROTATION_MARKER_KEY
 from nunchaku_lite.ops.fused import FUSED_MLP_FC2_ATTR
 
 TINY = {
@@ -89,12 +90,29 @@ def _quantized(tmp_path, model, precision, rotate=()):
                             marker=bool(rotated)), layers
 
 
-def _spliced(tmp_path, precision, rotate=()):
+def _native(tmp_path, precision="int4", rotate=(), keep=None):
+    """A native-layout file: the official file with each quantized layer's weight/bias replaced by its SVDQ tensors,
+    the official metadata plus ``quantization_config``, and the rotation marker when any layer is rotated."""
     official, model = _official(tmp_path)
-    quantized, layers = _quantized(tmp_path, model, precision, rotate)
+    targets = {n: m for n, m in sorted(_targets(model).items()) if keep is None or keep(n)}
+    layers = {
+        name: svdq_tensors(m.in_features, m.out_features, precision=precision, bias=m.bias is not None, seed=i)
+        for i, (name, m) in enumerate(targets.items())
+    }
+    rotated = [n for n in layers if any(n.endswith(r) for r in rotate)]
+    tensors = load_file(str(official))
+    for name in layers:
+        for p in ("weight", "bias"):
+            tensors.pop(f"{NATIVE_PREFIX}{name}.{p}", None)
+    tensors.update({f"{NATIVE_PREFIX}{n}.{k}": v for n, ts in layers.items() for k, v in ts.items()})
+    if rotated:
+        tensors[ROTATION_MARKER_KEY] = torch.empty(0)
+    with safe_open(str(official), framework="pt") as f:
+        metadata = dict(f.metadata())
+    metadata["quantization_config"] = json.dumps(quant_config(list(layers), precision=precision, rotated=rotated))
     out = tmp_path / "native.safetensors"
-    splice_native(official, quantized, out)
-    return official, quantized, out, layers
+    save_file(tensors, str(out), metadata=metadata)
+    return official, out, layers
 
 
 def _build(path, policy):
@@ -104,37 +122,16 @@ def _build(path, policy):
     return builder.build(device=torch.device("cpu"), dtype=torch.bfloat16)
 
 
-# --- splice ----------------------------------------------------------------------------------------
+# --- native layout --------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("precision,rotate", [("nvfp4", ()), ("int4", ()), ("int4", ("",))])
-def test_splice_is_byte_exact(tmp_path, precision, rotate):
-    official, quantized, out, layers = _spliced(tmp_path, precision, rotate)
-    verify_native_splice(official, out, quantized)
+def test_native_file_is_read_as_native(tmp_path, precision, rotate):
+    _, out, layers = _native(tmp_path, precision, rotate)
     spec = read_checkpoint_spec(out)
     assert spec.layout == "native" and set(spec.layers) == set(layers)
     assert len(spec.layers) == 2 * 28  # per block: 6 attentions x (q, k, v, out) + 2 FFs x 2; gate logits excluded
-    with safe_open(str(out), framework="pt") as f:
-        assert json.loads(f.metadata()["config"]) == TINY
-        assert CONNECTOR_KEY in f.keys()  # noqa: SIM118 - safe_open handle
-        assert not any(k.endswith(".weight") and k.removeprefix(NATIVE_PREFIX).rpartition(".")[0] in layers for k in f.keys())  # noqa: SIM118
-
-
-def test_splice_refuses_wrong_model(tmp_path):
-    official, model = _official(tmp_path)
-    quantized, _ = _quantized(tmp_path, model, "int4")
-    tensors = load_file(str(official))
-    key = f"{NATIVE_PREFIX}transformer_blocks.0.attn1.to_q.weight"
-    tensors[key] = torch.zeros(256, 128, dtype=torch.bfloat16)
-    save_file(tensors, str(official), metadata={"config": json.dumps(TINY)})
-    with pytest.raises(ValueError, match="not the same model"):
-        splice_native(official, quantized, tmp_path / "out.safetensors")
-
-
-def test_splice_refuses_quantized_official(tmp_path):
-    _official, quantized, out, _ = _spliced(tmp_path, "int4")
-    with pytest.raises(ValueError, match="already quantized"):
-        splice_native(out, quantized, tmp_path / "again.safetensors")
+    assert all((la.input_rotation is not None) == bool(rotate) for la in spec.layers.values())
 
 
 # Lightricks' nvfp4 layer set (ltx_core.quantization.nvfp4.convert): video-side linears only.
@@ -145,83 +142,18 @@ LIGHTRICKS_SET = re.compile(
 
 
 @pytest.mark.parametrize("rotate", [(), ("",), ("audio_ff.net.2",)])
-def test_subset_splice(tmp_path, rotate):
-    official, model = _official(tmp_path)
-    quantized, layers = _quantized(tmp_path, model, "int4", rotate)
-    subset = sorted(n for n in layers if LIGHTRICKS_SET.fullmatch(n))
-    assert len(subset) == 2 * 12
-    out = tmp_path / "subset.safetensors"
-    report = splice_native(official, quantized, out, targets=subset)
-    assert report["layers"] == len(subset)
-    verify_native_splice(official, out, quantized, targets=subset)
-    with pytest.raises(AssertionError, match="targets"):
-        verify_native_splice(official, out, quantized)  # not every layer: the default check must fail
-    with pytest.raises(AssertionError, match="targets"):
-        verify_native_splice(official, out, quantized, targets=subset[:-1])  # one more spliced than requested
-    spec = read_checkpoint_spec(out)
-    assert sorted(spec.layers) == subset
-    rotated_in_subset = sorted(n for n in subset if any(n.endswith(r) for r in rotate))
-    assert sorted(n for n, la in spec.layers.items() if la.input_rotation is not None) == rotated_in_subset
-    off, got = load_file(str(official)), load_file(str(out))
-    with safe_open(str(out), framework="pt") as f:
-        config = json.loads(f.metadata()["quantization_config"])
-    assert config["svdq_w4a4"]["targets"] == subset
-    assert config.get("input_rotation", {}).get("targets", []) == rotated_in_subset
-    assert ("nunchaku_lite.input_rotation" in got) == bool(rotated_in_subset)
-    for name in set(layers) - set(subset):  # left out: official bf16 tensors, byte for byte
-        for p in ("weight", "bias"):
-            key = f"{NATIVE_PREFIX}{name}.{p}"
-            assert (key in got) == (key in off) and (key not in off or torch.equal(got[key], off[key]))
-        assert f"{NATIVE_PREFIX}{name}.qweight" not in got
-    built = _build(out, build_nunchaku_policy(out, fused_attention=False))
+def test_partially_quantized_file(tmp_path, rotate):
+    """Only the listed layers are quantized; every other linear keeps its official bf16 weights."""
+    official, out, layers = _native(tmp_path, "int4", rotate, keep=LIGHTRICKS_SET.fullmatch)
+    assert len(layers) == 2 * 12
+    reference = {k.removeprefix(NATIVE_PREFIX): v for k, v in load_file(str(official)).items()}
+    candidates = set(_targets(LTXModelConfigurator.from_metadata({"config": TINY})))
+    built = _build(out, build_nunchaku_policy(out, device="cpu", fused_attention=False))
     for name, module in built.named_modules():
-        if name in layers:
-            assert isinstance(module, SVDQW4A4Linear) == (name in subset), name
-
-
-def test_subset_splice_refusals(tmp_path):
-    official, model = _official(tmp_path)
-    quantized, layers = _quantized(tmp_path, model, "int4")
-    out = tmp_path / "subset.safetensors"
-    with pytest.raises(ValueError, match="empty"):
-        splice_native(official, quantized, out, targets=[])
-    with pytest.raises(ValueError, match="not quantized layers"):
-        splice_native(official, quantized, out, targets=[*sorted(layers)[:2], "transformer_blocks.0.nope"])
-    with safe_open(str(quantized), framework="pt") as f:
-        config = json.loads(f.metadata()["quantization_config"])
-    with pytest.raises(ValueError, match="target-list"):  # runtime manifests are not rewritten
-        _select_targets({**config, "runtime_manifest": {}}, read_checkpoint_spec(quantized), sorted(layers)[:1])
-    assert not out.exists()
-
-
-def test_subset_cli(tmp_path, monkeypatch, capsys):
-    import importlib.util
-    import pathlib
-
-    official, model = _official(tmp_path)
-    quantized, layers = _quantized(tmp_path, model, "nvfp4")
-    out = tmp_path / "cli.safetensors"
-    tool = pathlib.Path(__file__).resolve().parents[1] / "tools" / "ltx2_native_splice.py"
-    mod_spec = importlib.util.spec_from_file_location("splice_tool", tool)
-    mod = importlib.util.module_from_spec(mod_spec)
-    mod_spec.loader.exec_module(mod)
-    monkeypatch.setattr("sys.argv", ["x", "--official", str(official), "--quantized", str(quantized), "--out", str(out),
-                                     "--targets-regex", LIGHTRICKS_SET.pattern])
-    mod.main()
-    report = json.loads(capsys.readouterr().out)
-    assert report == {**report, "layers": 24, "verified": True}
-    assert sorted(read_checkpoint_spec(out).layers) == sorted(n for n in layers if LIGHTRICKS_SET.fullmatch(n))
-
-
-def test_verify_catches_tampering(tmp_path):
-    official, quantized, out, _ = _spliced(tmp_path, "int4")
-    with safe_open(str(out), framework="pt") as f:
-        meta = f.metadata()
-    tensors = load_file(str(out))
-    tensors[CONNECTOR_KEY] = tensors[CONNECTOR_KEY] + 1
-    save_file(tensors, str(out), metadata=meta)
-    with pytest.raises(AssertionError, match="differs from the official tensor"):
-        verify_native_splice(official, out, quantized)
+        if name in candidates:
+            assert isinstance(module, SVDQW4A4Linear) == (name in layers), name
+            if name not in layers:
+                assert torch.equal(module.weight, reference[f"{name}.weight"].to(module.weight.dtype)), name
 
 
 # --- ltx-core build --------------------------------------------------------------------------------
@@ -229,7 +161,7 @@ def test_verify_catches_tampering(tmp_path):
 
 @pytest.mark.parametrize("precision,rotate", [("nvfp4", ()), ("int4", ()), ("int4", ("",)), ("int4", ("ff.net.2",))])
 def test_ltx_core_builder_binds_everything(tmp_path, precision, rotate):
-    official, _, out, layers = _spliced(tmp_path, precision, rotate)
+    official, out, layers = _native(tmp_path, precision, rotate)
     policy = build_nunchaku_policy(out, device="cpu")
     model = _build(out, policy)
     spec = read_checkpoint_spec(out)
@@ -262,7 +194,7 @@ def test_feed_forward_plan_applied(tmp_path):
     for precision in ("nvfp4", "int4"):
         sub = tmp_path / precision
         sub.mkdir()
-        _, _, out, _ = _spliced(sub, precision)
+        _, out, _ = _native(sub, precision)
         model = _build(out, build_nunchaku_policy(out, device="cpu"))
         ff = model.transformer_blocks[0].ff
         fused = precision == "nvfp4"
@@ -271,12 +203,7 @@ def test_feed_forward_plan_applied(tmp_path):
 
 
 def test_rotated_nvfp4_fc2_runs_unfused(tmp_path):
-    official, model = _official(tmp_path)
-    quantized, _ = _quantized(tmp_path, model, "nvfp4", ("ff.net.2",))
-    out = tmp_path / "native.safetensors"
-    with pytest.raises(ValueError, match="NVFP4 is refused"):
-        splice_native(official, quantized, out)
-    splice_native(official, quantized, out, allow_fp4_rotation=True)
+    _, out, _ = _native(tmp_path, "nvfp4", ("ff.net.2",))
     with pytest.raises(ValueError, match="NVFP4 is refused"):
         build_nunchaku_policy(out, device="cpu")
     built = _build(out, build_nunchaku_policy(out, device="cpu", allow_fp4_rotation=True))
@@ -286,7 +213,7 @@ def test_rotated_nvfp4_fc2_runs_unfused(tmp_path):
 
 
 def test_attention_forward_patched_only_on_quantized_attention(tmp_path):
-    _, _, out, _ = _spliced(tmp_path, "int4")
+    _, out, _ = _native(tmp_path, "int4")
     model = _build(out, build_nunchaku_policy(out, device="cpu"))
     patched = [n for n, m in model.named_modules() if isinstance(m, Attention) and "forward" in m.__dict__]
     assert len(patched) == 2 * 6
@@ -295,12 +222,7 @@ def test_attention_forward_patched_only_on_quantized_attention(tmp_path):
 
 
 def test_attention_left_stock_when_unquantized(tmp_path):
-    official, model = _official(tmp_path)
-    ff_only = {n: m for n, m in _targets(model).items() if ".ff." in n or ".audio_ff." in n}
-    layers = {n: svdq_tensors(m.in_features, m.out_features, bias=m.bias is not None, seed=i) for i, (n, m) in enumerate(ff_only.items())}
-    quantized = write_checkpoint(tmp_path / "q.safetensors", layers, config=quant_config(list(layers)))
-    out = tmp_path / "native.safetensors"
-    splice_native(official, quantized, out)
+    _, out, _ = _native(tmp_path, keep=lambda n: ".ff." in n or ".audio_ff." in n)
     built = _build(out, build_nunchaku_policy(out, device="cpu"))
     assert not [m for m in built.modules() if isinstance(m, Attention) and "forward" in m.__dict__]
     assert isinstance(built.transformer_blocks[0].attn1.to_q, torch.nn.Linear)
@@ -317,8 +239,8 @@ def test_policy_names_differ_by_checkpoint_and_options(tmp_path):
     a = tmp_path / "a"
     b = tmp_path / "b"
     a.mkdir(), b.mkdir()
-    _, _, out_a, _ = _spliced(a, "int4")
-    _, _, out_b, _ = _spliced(b, "int4", ("",))
+    _, out_a, _ = _native(a, "int4")
+    _, out_b, _ = _native(b, "int4", ("",))
     names = {
         build_nunchaku_policy(out_a, device="cpu").module_ops[0].name,
         build_nunchaku_policy(out_b, device="cpu").module_ops[0].name,
@@ -387,7 +309,7 @@ def test_fused_qk_declines_unsupported_inputs():
 
 
 def test_upstream_drift_falls_back_to_stock(tmp_path, monkeypatch):
-    _, _, out, _ = _spliced(tmp_path, "nvfp4")
+    _, out, _ = _native(tmp_path, "nvfp4")
     monkeypatch.setattr(integration, "_ATTENTION_FORWARD_SHA", "0" * 16)
     monkeypatch.setattr(integration, "_FEED_FORWARD_FORWARD_SHA", "0" * 16)
     with warnings.catch_warnings(record=True) as caught:
@@ -415,7 +337,7 @@ def test_cli_injects_policy_into_pipeline_args(tmp_path, monkeypatch):
     import sys
     import types
 
-    _, _, out, _ = _spliced(tmp_path, "int4")
+    _, out, _ = _native(tmp_path, "int4")
     seen = {}
     args_module = types.ModuleType("ltx_pipelines.utils.args")
     args_module._resolve_quantization = lambda ns: None

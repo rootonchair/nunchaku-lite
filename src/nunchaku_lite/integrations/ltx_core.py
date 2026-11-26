@@ -1,8 +1,8 @@
 """Run Nunchaku Lite LTX-2.x transformers in Lightricks' reference code (``ltx-core`` / ``ltx-pipelines``).
 
-A native-layout checkpoint (Lightricks' transformer file with our SVDQ layers spliced in, see
-``tools/ltx2_native_splice.py``) plugs into ltx-core as a :class:`~ltx_core.quantization.QuantizationPolicy`,
-the same hook as Lightricks' own ``nvfp4-prequant``::
+A native-layout checkpoint (Lightricks' transformer file with our SVDQ layers in place of the quantized linears, as
+published in ``rootonchair/nunchaku-lite-ltx-2.5-distilled-native``) plugs into ltx-core as a
+:class:`~ltx_core.quantization.QuantizationPolicy`, the same hook as Lightricks' own ``nvfp4-prequant``::
 
     from nunchaku_lite.integrations.ltx_core import build_nunchaku_policy
 
@@ -67,8 +67,8 @@ def build_nunchaku_policy(
     spec = read_checkpoint_spec(checkpoint_path, allow_fp4_rotation=allow_fp4_rotation)
     if spec.layout != "native":
         raise ValueError(
-            f"{checkpoint_path} is a Diffusers-layout checkpoint; ltx-core reads Lightricks' native layout. Convert it "
-            "with tools/ltx2_native_splice.py (splices our layers into the official transformer file)."
+            f"{checkpoint_path} is a Diffusers-layout checkpoint; ltx-core reads Lightricks' native layout (their "
+            "transformer file with our quantized layers in place), e.g. rootonchair/nunchaku-lite-ltx-2.5-distilled-native."
         )
     if device is None and torch.cuda.is_available():
         device = torch.device("cuda", torch.cuda.current_device())

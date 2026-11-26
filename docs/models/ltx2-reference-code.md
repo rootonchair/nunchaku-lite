@@ -18,18 +18,9 @@ ltx-2.5-22b-distilled-transformer-nunchaku-int4-r32.safetensors   # other GPUs
 
 Every other tensor (norms, AdaLN, embeddings, the text connectors) and the file metadata are byte-identical to the
 official file (the metadata gains one `quantization_config` entry, and each quantized layer's bias is stored in the
-kernel's packed channel order), so it works anywhere the official transformer file does. `tools/ltx2_native_splice.py` writes one from a
-Diffusers-layout export and verifies it:
-
-```bash
-python tools/ltx2_native_splice.py \
-    --official  ltx-2.5-22b-distilled-transformer-bf16.safetensors \
-    --quantized nvfp4-r32/transformer/diffusion_pytorch_model.safetensors \
-    --out       ltx-2.5-22b-distilled-transformer-nunchaku-nvfp4-r32.safetensors
-```
-
-`--targets-regex` splices only the quantized layers whose full name matches; the others keep the official bf16
-weights, and the file's `quantization_config` names only the spliced layers.
+kernel's packed channel order), so it works anywhere the official transformer file does. They hold the same quantized
+weights as the Diffusers checkpoints in
+[rootonchair/nunchaku-lite-ltx-2.5-distilled](https://huggingface.co/rootonchair/nunchaku-lite-ltx-2.5-distilled).
 
 ## Command line
 
@@ -91,8 +82,8 @@ about 3% of transformer time; `--nunchaku-stock-attention` gives the same qualit
 
 Our NVFP4 flickers more than Lightricks' in this pipeline, and most of the difference comes from the last blocks.
 Lightricks' NVFP4 file quantizes all 28 linear layers in blocks 0-41 and keeps blocks 42-47 in bf16; ours quantizes
-all 48 blocks. Splicing ours into blocks 0-41 only (`--targets-regex 'transformer_blocks\.([0-9]|[1-3][0-9]|4[01])\..*'`)
-closes about 70% of the gap (RTX PRO 4500 Blackwell, 10 of the 16 clips, flicker measured on the MP4s):
+all 48 blocks. A test file with ours in blocks 0-41 only (blocks 42-47 left in bf16) closes about 70% of the gap (RTX
+PRO 4500 Blackwell, 10 of the 16 clips, flicker measured on the MP4s):
 
 | transformer | flicker gap to Lightricks NVFP4 | clips steadier than all-48 | transformer size |
 | --- | --- | --- | --- |
@@ -100,11 +91,12 @@ closes about 70% of the gap (RTX PRO 4500 Blackwell, 10 of the 16 clips, flicker
 | Nunchaku Lite NVFP4 r32, blocks 42-47 kept bf16 | +0.42 | 9 of 10 (one tie) | 18.0 GB |
 
 Side by side, the difference is hard to see, so the published checkpoints keep all 48 blocks quantized (smaller and
-faster); `--targets-regex` gives the steadier variant for anyone who prefers it. Restricting the quantized layer
-types instead (Lightricks' video-side linears only, in all 48 blocks) does not change flicker, and the activation
-scaling is not the cause either: emulating our dynamic NVFP4 scales against Lightricks' static `input_scale` gives the
-same quantization error and frame-to-frame noise. Our quantized path is also not bit-reproducible from run to run,
-and the ancestral sampler amplifies that: repeated runs of the same file differ by about 0.3 dB PSNR.
+faster). The loader also reads a file in which only some layers are quantized, so a variant with the last blocks in
+bf16 needs no code change. Restricting the quantized layer types instead (Lightricks' video-side linears only, in all
+48 blocks) does not change flicker, and the activation scaling is not the cause either: emulating our dynamic NVFP4
+scales against Lightricks' static `input_scale` gives the same quantization error and frame-to-frame noise. Our
+quantized path is also not bit-reproducible from run to run, and the ancestral sampler amplifies that: repeated runs
+of the same file differ by about 0.3 dB PSNR.
 
 ## Results (L40S, INT4)
 
