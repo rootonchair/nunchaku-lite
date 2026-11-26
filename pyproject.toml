@@ -23,6 +23,9 @@ classifiers = [
 # itself imports without torch (nunchaku_lite/__init__.py is lazy), so `pip install --no-deps` + mlx also works.
 dependencies = [
   "accelerate>=0.31",
+  # Quantized text encoders on CUDA (nunchaku_lite.text_encoders); about 40 MB, no extra dependencies. Not on macOS,
+  # where text encoders use nunchaku-lite's own int4/int8.
+  "bitsandbytes>=0.45; sys_platform != 'darwin'",
   "diffusers>=0.36",
   "huggingface-hub>=0.34",
   "kernels>=0.14,<0.15",
@@ -39,8 +42,8 @@ Documentation = "https://nunchaku-lite.readthedocs.io/en/latest/"
 Issues = "https://github.com/rootonchair/nunchaku-lite/issues"
 
 [project.optional-dependencies]
-# Quantized text encoders via nunchaku_lite.text_encoders.load_text_encoder_bnb (CUDA).
-bnb = [ "bitsandbytes>=0.45" ]
+# Kept so `pip install "nunchaku-lite[bnb]"` (0.5.1 docs) still works; bitsandbytes is now a base dependency off macOS.
+bnb = []
 # Accepted for compatibility with instructions that use `nunchaku-lite[torch]`; the base install already has torch.
 torch = []
 # MLX runtime (Apple silicon): nunchaku_lite.mlx. Pipelines come from mflux (pip install mflux).

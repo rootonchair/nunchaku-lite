@@ -154,8 +154,8 @@ Lightricks' files run through ComfyUI's `comfy-kitchen` kernels in this pipeline
 ## Lower VRAM: quantized text encoder
 
 After the transformer, the biggest component is the Gemma 4 12B text encoder (22.3 GiB in bf16).
-`load_text_encoder_bnb` loads it with bitsandbytes NF4 or 8-bit weights, already on the GPU (`pip install
-"nunchaku-lite[bnb]"`). Replace the `"text_encoder"` entry of the example, and skip it when moving components to the
+`load_text_encoder_bnb` loads it with bitsandbytes NF4 or 8-bit weights, already on the GPU (bitsandbytes comes
+with nunchaku-lite). Replace the `"text_encoder"` entry of the example, and skip it when moving components to the
 GPU:
 
 ```python

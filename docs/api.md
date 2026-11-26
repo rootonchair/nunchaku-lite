@@ -97,13 +97,13 @@ The backend depends on the device:
 
 | Device | Backend | `"int4"` | `"int8"` |
 | --- | --- | --- | --- |
-| CUDA, `bitsandbytes` installed | bitsandbytes | NF4 | LLM.int8 |
-| CUDA without bitsandbytes, Apple silicon (MPS), CPU | nunchaku-lite | round-to-nearest int4, groups of 64 | round-to-nearest int8, per output channel |
+| CUDA | bitsandbytes | NF4 | LLM.int8 |
+| Apple silicon (MPS), CPU, or CUDA if bitsandbytes was uninstalled | nunchaku-lite | round-to-nearest int4, groups of 64 | round-to-nearest int8, per output channel |
 
 bitsandbytes is preferred on CUDA because it measured better: on LTX-2.5's
 Gemma 4 12B encoder, NF4 was smaller than nunchaku-lite's int4 (7.0 vs 7.7 GiB)
-and closer to bf16 (2.9% vs 3.2% hidden-state error). Install it with
-`pip install "nunchaku-lite[bnb]"`. A bitsandbytes encoder is placed on
+and closer to bf16 (2.9% vs 3.2% hidden-state error). It is installed with
+nunchaku-lite everywhere except macOS. A bitsandbytes encoder is placed on
 `device` while loading; don't move it with `pipe.to()` or CPU offload
 afterwards. To pick the backend yourself, call
 `load_quantized_text_encoder(..., backend="bitsandbytes" | "nunchaku-lite")`
@@ -201,8 +201,8 @@ text_encoder = load_text_encoder_bnb(
 
 Loads a Hugging Face text encoder with bitsandbytes NF4 or 8-bit weights, placed on the CUDA device (do not call
 `.to()` on it afterwards). Vision/audio towers and the LM head stay in `torch_dtype` (default bf16);
-`skip_modules` changes that list, and other keyword arguments go to `from_pretrained`. Needs
-`pip install "nunchaku-lite[bnb]"`. `bnb_quantization_config(...)` returns the `BitsAndBytesConfig` it uses. See
+`skip_modules` changes that list, and other keyword arguments go to `from_pretrained`. bitsandbytes is installed with
+nunchaku-lite (not on macOS). `bnb_quantization_config(...)` returns the `BitsAndBytesConfig` it uses. See
 [LTX-2.5](models/ltx2.md#lower-vram-quantized-text-encoder) for measured sizes and accuracy.
 
 ## `patch_transformer`
