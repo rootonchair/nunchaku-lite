@@ -9,10 +9,12 @@ from .ops.gemv import awq_gemv_w4a16_cuda
 from .ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda, svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda
 
 INPUT_ROTATIONS = (None, "hadamard")
-# Checkpoint tensors of an SVDQ layer that are not module parameters: an optional one-element per-tensor scale
-# (NVFP4 ``wtscale``, kept as an attribute) and a leftover of older exports that every loader drops.
-SVDQ_CHECKPOINT_SCALARS = ("wtscale",)
-SVDQ_LEGACY_CHECKPOINT_SUFFIXES = ("smooth_factor_orig",)
+# The SVDQ checkpoint format, defined here once and used by every loading path:
+SVDQ_GROUP_SIZE = {"int4": 64, "nvfp4": 16}  # input channels per weight scale
+SVDQ_RANK_TENSOR = "proj_down"  # (in_features, rank): the tensor that fixes the low-rank branch's rank
+SVDQ_CHECKPOINT_SCALARS = ("wtscale",)  # optional one-element per-tensor scale (NVFP4); absent means 1.0
+SVDQ_DEFAULTED_CHECKPOINT_TENSORS = ("wcscales",)  # parameters a checkpoint may omit (NVFP4 channel scales: ones)
+SVDQ_LEGACY_CHECKPOINT_SUFFIXES = ("smooth_factor_orig",)  # leftover of older exports; every loader drops it
 _ALPHA_CACHE_ATTR = "_nunchaku_lite_alpha_cache"
 # Tensors of SVDQW4A4Linear whose dtype a module-wide cast must not change.
 _CAST_PROTECTED_DTYPES = {"wscales": (torch.float8_e4m3fn,), "wtscale": (torch.float32,)}
@@ -143,12 +145,9 @@ class SVDQW4A4Linear(nn.Module):
         self.precision = precision
         self.torch_dtype = torch_dtype
 
-        if precision == "nvfp4":
-            self.group_size = 16
-        elif precision == "int4":
-            self.group_size = 64
-        else:
+        if precision not in SVDQ_GROUP_SIZE:
             raise ValueError(f"Invalid precision: {precision}")
+        self.group_size = SVDQ_GROUP_SIZE[precision]
 
         self.qweight = nn.Parameter(
             torch.empty(out_features, in_features // 2, dtype=torch.int8, device=device), requires_grad=False
@@ -200,11 +199,37 @@ class SVDQW4A4Linear(nn.Module):
             ValueError: If either is not 2-D.
         """
 
-        qweight, proj_down = shapes["qweight"], shapes["proj_down"]
+        qweight, proj_down = shapes["qweight"], shapes[SVDQ_RANK_TENSOR]
         if len(qweight) != 2 or len(proj_down) != 2:
-            raise ValueError(f"qweight {tuple(qweight)} and proj_down {tuple(proj_down)} must be 2-D")
+            raise ValueError(f"qweight {tuple(qweight)} and {SVDQ_RANK_TENSOR} {tuple(proj_down)} must be 2-D")
         out_features, packed_in = qweight
-        return 2 * packed_in, out_features, proj_down[1]
+        return 2 * packed_in, out_features, SVDQW4A4Linear.checkpoint_rank(proj_down)
+
+    @staticmethod
+    def checkpoint_rank(proj_down_shape: tuple[int, ...]) -> int:
+        """The low-rank branch rank from the shape of the checkpoint's ``proj_down`` tensor ``(in_features, rank)``."""
+
+        return int(proj_down_shape[1])
+
+    def use_checkpoint_scalar(self, name: str, shape: tuple[int, ...]) -> None:
+        """Hold the checkpoint's per-tensor scale ``name`` (e.g. ``wtscale``) as a persistent float32 buffer, so any
+        state-dict loader fills it and moves keep it on the module's device; without one it stays a plain ``1.0``."""
+
+        if name not in SVDQ_CHECKPOINT_SCALARS or getattr(self, name, None) is None:
+            raise ValueError(f"{self.precision} SVDQ layers have no checkpoint scalar {name!r}.")
+        delattr(self, name)
+        self.register_buffer(name, torch.ones(shape, dtype=torch.float32, device=self.qweight.device), persistent=True)
+
+    def default_missing_tensor(self, name: str) -> None:
+        """Turn parameter ``name``, which the checkpoint omits, into a non-persistent buffer of its default (ones), so a
+        strict loader does not expect it. Built on meta, the buffer is created on the CPU for the caller to move."""
+
+        if name not in SVDQ_DEFAULTED_CHECKPOINT_TENSORS or getattr(self, name, None) is None:
+            raise ValueError(f"{self.precision} SVDQ layers cannot default {name!r}.")
+        old = getattr(self, name)
+        device = torch.device("cpu") if old.device.type == "meta" else old.device
+        delattr(self, name)
+        self.register_buffer(name, torch.ones(old.shape, dtype=old.dtype, device=device), persistent=False)
 
     @classmethod
     def from_linear(cls, linear: nn.Linear, **kwargs):

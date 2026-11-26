@@ -642,7 +642,13 @@ def _infer_svdq_rank(state_dict: dict[str, torch.Tensor]) -> int | None:
     ``transformer/config.json``; without it, a rank-64 checkpoint would be patched with the default rank 32.
     """
 
-    ranks = {int(v.shape[1]) for k, v in state_dict.items() if k.endswith(".proj_down") and v.ndim == 2}
+    from .linear import SVDQ_RANK_TENSOR, SVDQW4A4Linear
+
+    ranks = {
+        SVDQW4A4Linear.checkpoint_rank(tuple(v.shape))
+        for k, v in state_dict.items()
+        if k.endswith(f".{SVDQ_RANK_TENSOR}") and v.ndim == 2
+    }
     if not ranks:
         return None
     if len(ranks) > 1:

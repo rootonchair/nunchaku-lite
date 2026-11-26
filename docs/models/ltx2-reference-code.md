@@ -116,18 +116,26 @@ layers; the runtime's own weight loader then fills them by name.
 | function | does |
 | --- | --- |
 | `read_checkpoint_spec(path, key_prefix="")` | reads and checks the header (no tensor data): targets, precision, rank, per-layer shapes and rotation. `key_prefix` is where the model's tensors sit in the file; ltx-core passes `"model.diffusion_model."` |
-| `replace_linears(root, spec, name_map=...)` | swaps each target module by exact name for an empty SVDQ layer (meta allowed), atomically |
-| `gelu_mlp_plan(fc1, fc2)` | the one rule for fusing a GELU MLP (NVFP4, neither layer rotated), also used by the Diffusers adapter |
+| `replace_linears(root, spec)` | swaps each target module by exact name for an empty SVDQ layer (meta allowed), atomically |
 | `check_runtime_support(spec, device)` | refuses what the device cannot run (same GPU and rotation rules as `patch_transformer`) |
+
+The contract with the runtime: the checkpoint's layer names, relative to `key_prefix`, are the runtime's module names,
+and the runtime's own weight loader fills the new layers by those names. A runtime whose module names or layer
+structure differ from the export (for example a fused QKV projection) needs a checkpoint exported in its own naming,
+which is why the ltx-core files use Lightricks' layout. Only `svdq_w4a4` layers are supported here; AWQ W4A16 layers
+and structural patches need a model adapter.
 
 The loader defines no checkpoint format of its own:
 
 * each target's tensors (names, shapes, dtypes, group size) are checked against an empty `SVDQW4A4Linear` built for
   that layer, so the layer class is the only definition; floating tensors may be bf16, fp16 or fp32 (cast on load),
-  int8 and fp8 tensors must match exactly;
+  int8 and fp8 tensors must match exactly. The format facts that are not parameters (group sizes, the rank tensor, the
+  optional `wtscale`, the NVFP4 `wcscales` default of ones, the legacy `smooth_factor_orig`) are defined once next to
+  the layer in `nunchaku_lite.linear` and used by the Diffusers path as well;
 * the `quantization_config` lookup (safetensors metadata, else a sibling `config.json`) and the GPU support rules come
   from `nunchaku_lite.checkpoint_config`, and the rotation rules from `nunchaku_lite.rotation_loader`, both shared with
   `patch_transformer`;
 * the key layout is the caller's (`key_prefix`); the rotation marker is always a root key.
 
-Only `svdq_w4a4` targets are supported here; checkpoints with other ops or structural patches need a model adapter.
+The GELU-MLP fusion rule is LTX's own (its exports quantize fc2's input signed, unlike FLUX and Qwen-Image INT4
+exports), so it lives in `nunchaku_lite.ltx2_conventions`, shared by the Diffusers LTX adapter and this integration.

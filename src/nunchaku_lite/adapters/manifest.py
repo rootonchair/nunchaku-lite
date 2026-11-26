@@ -8,9 +8,10 @@ import torch
 from torch import nn
 
 from ..core import PatchOptions, register_adapter
-from ..linear import AWQW4A16Linear, SVDQW4A4Linear
+from ..linear import SVDQ_GROUP_SIZE, AWQW4A16Linear, SVDQW4A4Linear
 from ..manifest import RuntimeManifest, RuntimeManifestTarget, parse_runtime_manifest
 from ..rotation_loader import resolve_input_rotation
+from ..utils import module_device as _module_device
 from .common import SVDQPatchContext, _mark_patched_module, finalize_svdq_checkpoint, prepare_transformer_dtype
 
 
@@ -314,7 +315,7 @@ def _mark_manifest_replacement(module: nn.Module) -> nn.Module:
 
 
 def _validate_svdq_group_size(target: RuntimeManifestTarget) -> None:
-    expected = 16 if target.precision == "fp4" else 64
+    expected = SVDQ_GROUP_SIZE[target.runtime_precision]
     if target.group_size != expected:
         raise ValueError(
             f"svdq_w4a4 target {target.checkpoint_prefix!r} precision={target.precision!r} "
@@ -375,16 +376,6 @@ def _set_submodule(root: nn.Module, path: str, replacement: nn.Module) -> None:
         parent[int(child_name)] = replacement
     else:
         setattr(parent, child_name, replacement)
-
-
-def _module_device(module: nn.Module) -> torch.device:
-    parameter = next(module.parameters(recurse=False), None)
-    if parameter is not None:
-        return parameter.device
-    parameter = next(module.parameters(), None)
-    if parameter is not None:
-        return parameter.device
-    return torch.device("cpu")
 
 
 def _bind_manifest_runtime_apis(transformer: nn.Module) -> None:

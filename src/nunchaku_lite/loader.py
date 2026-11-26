@@ -18,16 +18,21 @@ from __future__ import annotations
 
 import itertools
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 import torch
 from torch import nn
 
 from .checkpoint_config import check_device_precision, resolve_quantization_config
-from .linear import SVDQ_CHECKPOINT_SCALARS, SVDQ_LEGACY_CHECKPOINT_SUFFIXES, SVDQW4A4Linear
+from .linear import (
+    SVDQ_CHECKPOINT_SCALARS,
+    SVDQ_DEFAULTED_CHECKPOINT_TENSORS,
+    SVDQ_LEGACY_CHECKPOINT_SUFFIXES,
+    SVDQW4A4Linear,
+)
 from .manifest import ROTATION_MARKER_KEY, parse_runtime_manifest, with_target_list_manifest
 from .rotation_loader import (
     HADAMARD,
@@ -36,20 +41,18 @@ from .rotation_loader import (
     resolve_rotated_targets,
     validate_declared_targets,
 )
+from .utils import module_device
 
 __all__ = [
     "CheckpointSpec",
-    "GeluMlpPlan",
     "LayerSpec",
     "check_runtime_support",
-    "gelu_mlp_plan",
     "make_linear",
     "read_checkpoint_spec",
     "replace_linears",
 ]
 
 TensorInfo = tuple[tuple[int, ...], torch.dtype]
-NameMap = Callable[[str], str]
 
 
 @dataclass(frozen=True)
@@ -66,6 +69,7 @@ class LayerSpec:
     has_wtscale: bool
     input_rotation: str | None
     tensors: Mapping[str, TensorInfo] = field(repr=False)  # suffix -> (shape, dtype), legacy suffixes excluded
+    defaulted: tuple[str, ...] = ()  # layer tensors the file omits (filled with the layer's default)
 
 
 @dataclass(frozen=True)
@@ -85,40 +89,6 @@ class CheckpointSpec:
         return tuple(name for name, layer in self.layers.items() if layer.input_rotation is not None)
 
 
-@dataclass(frozen=True)
-class GeluMlpPlan:
-    """How a ``fc1 -> GELU -> fc2`` pair of SVDQ layers runs."""
-
-    fused: bool  # through ops.fused.fused_gelu_mlp (fc2's input quantized in fc1's epilogue)
-    fc2_act_unsigned: bool
-    fc2_fused_flag: bool  # set ops.fused.FUSED_MLP_FC2_ATTR on fc2
-
-
-class _QuantizedLayer(Protocol):
-    precision: str
-    input_rotation: str | None
-
-
-def gelu_mlp_plan(fc1: _QuantizedLayer, fc2: _QuantizedLayer) -> GeluMlpPlan:
-    """The one rule for SVDQ GELU MLPs, shared by the Diffusers and framework integrations.
-
-    Takes :class:`LayerSpec` objects or bound SVDQ layers (anything with ``precision`` and
-    ``input_rotation``).
-
-    Fused only for NVFP4 with neither layer rotated: for INT4, fc1's fused epilogue quantizes fc2's
-    input unsigned with the shifted-GELU convention, which LTX exports do not use, and a rotated
-    layer must quantize its own input on the signed standalone path. Unfused, fc2 is signed.
-    """
-
-    fused = (
-        fc1.precision == "nvfp4"
-        and fc2.precision == "nvfp4"
-        and fc1.input_rotation is None
-        and fc2.input_rotation is None
-    )
-    return GeluMlpPlan(fused=fused, fc2_act_unsigned=False, fc2_fused_flag=fused)
-
-
 def read_checkpoint_spec(
     path: str | os.PathLike, *, key_prefix: str = "", allow_fp4_rotation: bool = False
 ) -> CheckpointSpec:
@@ -133,19 +103,20 @@ def read_checkpoint_spec(
 
     from safetensors import safe_open
 
+    if key_prefix and not key_prefix.endswith("."):
+        raise ValueError(f"key_prefix must end with '.', got {key_prefix!r}.")
     path = Path(path)
     with safe_open(str(path), framework="pt") as f:
         metadata = f.metadata() or {}
-        header: dict[str, TensorInfo] = {}
-        for key in f.keys():  # noqa: SIM118 - safe_open handle, not a dict
-            sl = f.get_slice(key)
-            header[key] = (tuple(int(d) for d in sl.get_shape()), _dtype(sl.get_dtype(), key))
-
-    if key_prefix and f"{key_prefix}{ROTATION_MARKER_KEY}" in header:
-        raise ValueError(f"The {ROTATION_MARKER_KEY!r} marker must be a root key, not under {key_prefix!r}.")
-    has_marker = ROTATION_MARKER_KEY in header
-    model = {key[len(key_prefix) :]: info for key, info in header.items() if key.startswith(key_prefix)}
-    model.pop(ROTATION_MARKER_KEY, None)
+        keys = list(f.keys())
+        has_marker = ROTATION_MARKER_KEY in keys
+        if key_prefix and f"{key_prefix}{ROTATION_MARKER_KEY}" in keys:
+            raise ValueError(f"The {ROTATION_MARKER_KEY!r} marker must be a root key, not under {key_prefix!r}.")
+        model: dict[str, TensorInfo] = {}
+        for key in keys:  # other components of a single-file checkpoint are never inspected
+            if key.startswith(key_prefix) and key != ROTATION_MARKER_KEY:
+                sl = f.get_slice(key)
+                model[key[len(key_prefix) :]] = (tuple(int(d) for d in sl.get_shape()), _dtype(sl.get_dtype(), key))
     if not model:
         raise ValueError(f"{path} has no tensors under the key prefix {key_prefix!r}.")
 
@@ -188,9 +159,11 @@ def read_checkpoint_spec(
             by_layer[owner][suffix] = info
     # A target's tensors must sit directly under it: nothing may hide one level deeper.
     for key in model:
-        for name in targets:
-            if key.startswith(f"{name}.") and key.rpartition(".")[0] != name:
-                raise ValueError(f"Unexpected tensor {key!r} under quantization target {name!r}.")
+        parts = key.split(".")
+        for depth in range(1, len(parts) - 1):
+            ancestor = ".".join(parts[:depth])
+            if ancestor in targets:
+                raise ValueError(f"Unexpected tensor {key!r} under quantization target {ancestor!r}.")
 
     layers = {}
     for name, target in targets.items():
@@ -258,9 +231,9 @@ def make_linear(
     )
     for scalar in SVDQ_CHECKPOINT_SCALARS:
         if scalar in layer.tensors:
-            delattr(module, scalar)  # the plain attribute set by __init__
-            shape = layer.tensors[scalar][0]
-            module.register_buffer(scalar, torch.ones(shape, dtype=torch.float32, device=device), persistent=True)
+            module.use_checkpoint_scalar(scalar, layer.tensors[scalar][0])
+    for tensor in layer.defaulted:
+        module.default_missing_tensor(tensor)
     return module
 
 
@@ -270,35 +243,34 @@ def replace_linears(
     *,
     torch_dtype: torch.dtype | None = None,
     device: torch.device | str | None = None,
-    name_map: NameMap | None = None,
 ) -> dict[str, SVDQW4A4Linear]:
     """Swap every target of ``spec`` in ``root`` for an empty SVDQ layer, by exact module name.
 
-    The old module need not be an ``nn.Linear``; its ``in_features`` / ``out_features`` are checked
-    when it has them. ``device`` defaults to the old module's (``meta`` included) and
+    The contract: the checkpoint's layer names (relative to ``spec.key_prefix``) are the runtime's module names, so the
+    runtime's own weight loader fills the new layers from the file by those names. The old module need not be an
+    ``nn.Linear``; its ``in_features`` / ``out_features`` are checked when it has them. ``device`` defaults to the old module's (``meta`` included) and
     ``torch_dtype`` to its floating dtype (bfloat16 when it has none). All targets are resolved and
     checked before ``root`` is modified. Returns ``{spec name: new module}``.
     """
 
     plan = []
     for name, layer in spec.layers.items():
-        path = name_map(name) if name_map is not None else name
         try:
-            old = root.get_submodule(path)
+            old = root.get_submodule(name)
         except AttributeError as exc:
-            raise ValueError(f"Quantization target {name!r} has no module {path!r} in the model.") from exc
+            raise ValueError(f"Quantization target {name!r} has no module in the model.") from exc
         for attr, expected in (("in_features", layer.in_features), ("out_features", layer.out_features)):
             actual = getattr(old, attr, None)
             if isinstance(actual, int) and actual != expected:
-                raise ValueError(f"Module {path!r} has {attr}={actual}, but the checkpoint layer has {expected}.")
+                raise ValueError(f"Module {name!r} has {attr}={actual}, but the checkpoint layer has {expected}.")
         dtype = torch_dtype or _floating_dtype(old) or torch.bfloat16
-        target_device = device if device is not None else _module_device(old)
-        plan.append((name, path, layer, dtype, target_device))
+        target_device = device if device is not None else module_device(old)
+        plan.append((name, layer, dtype, target_device))
 
     replaced = {}
-    for name, path, layer, dtype, target_device in plan:
+    for name, layer, dtype, target_device in plan:
         module = make_linear(layer, torch_dtype=dtype, device=target_device)
-        parent_path, _, child = path.rpartition(".")
+        parent_path, _, child = name.rpartition(".")
         parent = root.get_submodule(parent_path) if parent_path else root
         setattr(parent, child, module)
         replaced[name] = module
@@ -363,13 +335,16 @@ def _layer_spec(
         for suffix, t in itertools.chain(reference.named_parameters(recurse=False), reference.named_buffers(recurse=False))
     }
     scalars = {s for s in SVDQ_CHECKPOINT_SCALARS if getattr(reference, s, None) is not None}
-    missing = sorted(set(expected) - set(tensors))
+    defaulted = tuple(sorted(t for t in SVDQ_DEFAULTED_CHECKPOINT_TENSORS if t in expected and t not in tensors))
+    missing = sorted(set(expected) - set(tensors) - set(defaulted))
     if missing:
         raise ValueError(f"Target {name!r} is missing tensors {missing}.")
     extra = sorted(set(tensors) - set(expected) - scalars)
     if extra:
         raise ValueError(f"Target {name!r} has unexpected tensors {extra}.")
     for suffix, (shape, dtype) in expected.items():
+        if suffix in defaulted:
+            continue
         actual_shape, actual_dtype = tensors[suffix]
         loadable = actual_dtype in _LOADABLE_FLOATS if dtype in _LOADABLE_FLOATS else actual_dtype == dtype
         if tuple(actual_shape) != shape or not loadable:
@@ -390,15 +365,8 @@ def _layer_spec(
         has_wtscale=any(s in tensors for s in SVDQ_CHECKPOINT_SCALARS),
         input_rotation=rotation,
         tensors=tensors,
+        defaulted=defaulted,
     )
-
-
-def _module_device(module: nn.Module) -> torch.device:
-    for tensor in (*module.parameters(recurse=False), *module.buffers(recurse=False)):
-        return tensor.device
-    for tensor in (*module.parameters(), *module.buffers()):
-        return tensor.device
-    return torch.device("cpu")
 
 
 def _floating_dtype(module: nn.Module) -> torch.dtype | None:

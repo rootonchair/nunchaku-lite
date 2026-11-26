@@ -12,11 +12,11 @@ from torch import nn
 
 from nunchaku_lite.linear import SVDQW4A4Linear, wtscale_alpha
 from nunchaku_lite.loader import (
-    gelu_mlp_plan,
     make_linear,
     read_checkpoint_spec,
     replace_linears,
 )
+from nunchaku_lite.ltx2_conventions import ltx2_gelu_mlp_plan
 from nunchaku_lite.manifest import ROTATION_MARKER_KEY
 
 A, B = "blocks.0.attn.to_q", "blocks.0.ff.net.2"
@@ -69,6 +69,21 @@ def test_prefix_without_tensors_refused(tmp_path):
         read_checkpoint_spec(_write(tmp_path), key_prefix=PREFIX)
 
 
+def test_prefix_must_end_with_a_dot(tmp_path):
+    with pytest.raises(ValueError, match="must end with"):
+        read_checkpoint_spec(_write(tmp_path, prefix=PREFIX), key_prefix=PREFIX.rstrip("."))
+
+
+def test_unsupported_dtypes_outside_prefix_ignored(tmp_path):
+    from safetensors.torch import load_file, save_file
+
+    path = _write(tmp_path, prefix=PREFIX)
+    tensors = load_file(str(path))
+    tensors["vae.index"] = torch.zeros(4, dtype=torch.uint32)  # a dtype the loader has no use for
+    save_file(tensors, str(path), metadata={"quantization_config": json.dumps(quant_config(list(SHAPES)))})
+    assert set(read_checkpoint_spec(path, key_prefix=PREFIX).layers) == set(SHAPES)
+
+
 def test_prefixed_file_reads_sidecar_config(tmp_path):
     path = _write(tmp_path, prefix=PREFIX, sidecar=True)
     assert set(read_checkpoint_spec(path, key_prefix=PREFIX).layers) == set(SHAPES)
@@ -98,7 +113,7 @@ def test_tensors_outside_prefix_ignored(tmp_path):
 
 
 @pytest.mark.parametrize("precision", ["int4", "nvfp4"])
-@pytest.mark.parametrize("suffix", ["qweight", "wscales", "smooth_factor", "proj_down", "proj_up", "bias", "wcscales"])
+@pytest.mark.parametrize("suffix", ["qweight", "wscales", "smooth_factor", "proj_down", "proj_up", "bias"])  # wcscales: defaulted
 def test_missing_tensor_refused(tmp_path, precision, suffix):
     layers = _layers(precision)
     if suffix not in layers[A]:
@@ -109,6 +124,21 @@ def test_missing_tensor_refused(tmp_path, precision, suffix):
         config = _manifest_config(layers, precision, has_bias=True)
     with pytest.raises(ValueError, match="missing tensors"):
         read_checkpoint_spec(_write(tmp_path, precision, layers=layers, config=config))
+
+
+def test_missing_nvfp4_wcscales_defaults_to_ones(tmp_path):
+    """As on the Diffusers path: an NVFP4 file without channel scales means ones."""
+    layers = _layers("nvfp4")
+    del layers[A]["wcscales"]
+    path = _write(tmp_path, "nvfp4", layers=layers)
+    spec = read_checkpoint_spec(path)
+    assert spec.layers[A].defaulted == ("wcscales",) and spec.layers[B].defaulted == ()
+    model = _Model(device="meta")
+    replace_linears(model, spec)
+    module = model.get_submodule(A)
+    assert module.wcscales.device.type == "cpu" and torch.equal(module.wcscales, torch.ones(256, dtype=torch.bfloat16))
+    assert "wcscales" not in module.state_dict()  # a strict framework loader does not expect it
+    assert "wcscales" in model.get_submodule(B).state_dict()
 
 
 def test_wtscale_is_optional_for_nvfp4(tmp_path):
@@ -260,7 +290,7 @@ def test_legacy_input_transform_refused(tmp_path):
         read_checkpoint_spec(_write(tmp_path, extra={f"{A}.input_transform": torch.zeros(1)}))
 
 
-# --- GELU MLP rule ---------------------------------------------------------------------------------
+# --- LTX GELU MLP rule ----------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("p1,p2,r1,r2", list(itertools.product(["int4", "nvfp4"], ["int4", "nvfp4"], [None, "hadamard"], [None, "hadamard"])))
@@ -269,7 +299,7 @@ def test_gelu_mlp_plan_full_table(p1, p2, r1, r2):
         def __init__(self, precision, rotation):
             self.precision, self.input_rotation = precision, rotation
 
-    plan = gelu_mlp_plan(L(p1, r1), L(p2, r2))
+    plan = ltx2_gelu_mlp_plan(L(p1, r1), L(p2, r2))
     expected = p1 == p2 == "nvfp4" and r1 is None and r2 is None
     assert plan.fused == expected and plan.fc2_fused_flag == expected
     assert plan.fc2_act_unsigned is False
@@ -336,14 +366,6 @@ def test_replace_linears_missing_module(tmp_path):
     del model.blocks[0].attn.to_q
     with pytest.raises(ValueError, match="has no module"):
         replace_linears(model, spec)
-
-
-def test_replace_linears_name_map(tmp_path):
-    spec = read_checkpoint_spec(_write(tmp_path))
-    outer = nn.Module()
-    outer.diffusion_model = _Model()
-    replace_linears(outer, spec, name_map=lambda n: f"diffusion_model.{n}")
-    assert isinstance(outer.diffusion_model.get_submodule(A), SVDQW4A4Linear)
 
 
 # --- moves and casts keep the quantized tensors ------------------------------------------------------

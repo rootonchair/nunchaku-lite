@@ -15,7 +15,7 @@ The policy
   and drops legacy ``smooth_factor_orig`` tensors;
 * swaps each target ``nn.Linear`` of the meta shell for an SVDQ W4A4 layer (:func:`nunchaku_lite.loader.replace_linears`),
   so ltx-core's loader binds our tensors like any other weight;
-* runs the feed-forward through the fused NVFP4 GELU-MLP when :func:`~nunchaku_lite.loader.gelu_mlp_plan` allows it;
+* runs the feed-forward through the fused NVFP4 GELU-MLP when :func:`~nunchaku_lite.ltx2_conventions.ltx2_gelu_mlp_plan` allows it;
 * optionally replaces the attention Q/K RMSNorm + RoPE by one fused CUDA kernel (``fused_attention``), keeping the
   stock path for everything that kernel does not cover.
 
@@ -33,8 +33,9 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from ..linear import SVDQW4A4Linear
-from ..loader import CheckpointSpec, check_runtime_support, gelu_mlp_plan, read_checkpoint_spec, replace_linears
+from ..linear import SVDQ_LEGACY_CHECKPOINT_SUFFIXES, SVDQW4A4Linear
+from ..loader import CheckpointSpec, check_runtime_support, read_checkpoint_spec, replace_linears
+from ..ltx2_conventions import ltx2_gelu_mlp_plan
 
 # Lightricks' single-file transformer layout (also ComfyUI's): every model tensor sits under this prefix.
 NATIVE_PREFIX = "model.diffusion_model."
@@ -79,7 +80,9 @@ def build_nunchaku_policy(
         check_runtime_support(spec, device)
 
     name = f"nunchaku-lite:{_spec_digest(spec)}:attn={'fused' if fused_attention else 'stock'}"
-    sd_ops = SDOps(f"{name}:load").with_kv_operation(_drop, key_suffix=".smooth_factor_orig")
+    sd_ops = SDOps(f"{name}:load")
+    for suffix in SVDQ_LEGACY_CHECKPOINT_SUFFIXES:
+        sd_ops = sd_ops.with_kv_operation(_drop, key_suffix=f".{suffix}")
     swap = ModuleOps(
         f"{name}:swap",
         matcher=lambda model: hasattr(model, "transformer_blocks"),
@@ -119,7 +122,7 @@ def _patch_feed_forward(ff: nn.Module, gelu_approx_cls: type) -> None:
     fc1 = getattr(fc1_owner, "proj", None)
     if not (isinstance(fc1_owner, gelu_approx_cls) and isinstance(fc1, SVDQW4A4Linear) and isinstance(fc2, SVDQW4A4Linear)):
         return
-    plan = gelu_mlp_plan(fc1, fc2)
+    plan = ltx2_gelu_mlp_plan(fc1, fc2)
     fc2.act_unsigned = plan.fc2_act_unsigned
     if plan.fc2_fused_flag:
         setattr(fc2, FUSED_MLP_FC2_ATTR, True)
