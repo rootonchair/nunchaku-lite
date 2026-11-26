@@ -9,6 +9,10 @@ from .ops.gemv import awq_gemv_w4a16_cuda
 from .ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda, svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda
 
 INPUT_ROTATIONS = (None, "hadamard")
+# Checkpoint tensors of an SVDQ layer that are not module parameters: an optional one-element per-tensor scale
+# (NVFP4 ``wtscale``, kept as an attribute) and a leftover of older exports that every loader drops.
+SVDQ_CHECKPOINT_SCALARS = ("wtscale",)
+SVDQ_LEGACY_CHECKPOINT_SUFFIXES = ("smooth_factor_orig",)
 _ALPHA_CACHE_ATTR = "_nunchaku_lite_alpha_cache"
 # Tensors of SVDQW4A4Linear whose dtype a module-wide cast must not change.
 _CAST_PROTECTED_DTYPES = {"wscales": (torch.float8_e4m3fn,), "wtscale": (torch.float32,)}
@@ -186,6 +190,21 @@ class SVDQW4A4Linear(nn.Module):
         self.input_rotation = input_rotation
         # Quantized-kernel backend on Apple silicon ("auto", "int8", "int4", "dense"); set by patch_transformer.
         self.backend = "auto"
+
+    @staticmethod
+    def checkpoint_dims(shapes: dict[str, tuple[int, ...]]) -> tuple[int, int, int]:
+        """``(in_features, out_features, rank)`` of a layer from its checkpoint tensor shapes (``suffix -> shape``).
+
+        Raises:
+            KeyError: If ``qweight`` or ``proj_down`` is missing.
+            ValueError: If either is not 2-D.
+        """
+
+        qweight, proj_down = shapes["qweight"], shapes["proj_down"]
+        if len(qweight) != 2 or len(proj_down) != 2:
+            raise ValueError(f"qweight {tuple(qweight)} and proj_down {tuple(proj_down)} must be 2-D")
+        out_features, packed_in = qweight
+        return 2 * packed_in, out_features, proj_down[1]
 
     @classmethod
     def from_linear(cls, linear: nn.Linear, **kwargs):

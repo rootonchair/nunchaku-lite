@@ -8,7 +8,6 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 
-from nunchaku_lite.loader import NATIVE_PREFIX
 from nunchaku_lite.manifest import ROTATION_MARKER_KEY
 
 WTSCALE = 0.0123
@@ -71,13 +70,12 @@ def write_checkpoint(
     layers: dict[str, dict[str, torch.Tensor]],
     *,
     config: dict | None,
-    native: bool = False,
+    prefix: str = "",
     extra: dict[str, torch.Tensor] | None = None,
     marker: bool = False,
     sidecar: bool = False,
     metadata: dict[str, str] | None = None,
 ) -> Path:
-    prefix = NATIVE_PREFIX if native else ""
     tensors = {f"{prefix}{name}.{suffix}": t for name, ts in layers.items() for suffix, t in ts.items()}
     tensors.update({f"{prefix}{k}": v for k, v in (extra or {}).items()})
     if marker:

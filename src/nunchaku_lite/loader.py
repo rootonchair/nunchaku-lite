@@ -1,36 +1,22 @@
 """Framework-agnostic loading of Nunchaku Lite SVDQ W4A4 checkpoints.
 
-Used by integrations that build the model themselves (Lightricks' ltx-core, ComfyUI): they read a
-:class:`CheckpointSpec` from the safetensors header, swap their linears for SVDQ layers by exact
-module name and bind the quantized tensors. Torch only: no Diffusers, ltx-core or ComfyUI imports.
+For integrations that build the model themselves (Lightricks' ltx-core, later ComfyUI): read a :class:`CheckpointSpec`
+from the safetensors header, then swap the model's linears for SVDQ layers by exact module name; the framework's own
+weight loader fills them. Torch only: no Diffusers or framework imports.
 
-Frozen spec (see ``docs/models/ltx2-reference-code.md`` for the decision table):
+This module defines no checkpoint format of its own:
 
-* **Layout.** ``native`` when any key starts with ``model.diffusion_model.`` (Lightricks' official
-  single-file transformer layout, also read by ComfyUI); every model tensor then carries that
-  prefix, and layer names in the spec are relative to it. Otherwise ``diffusers``: no prefix.
-  The ``nunchaku_lite.input_rotation`` marker always sits at the file root.
-* **Metadata.** ``quantization_config`` (JSON) in the safetensors metadata; a Diffusers-layout
-  file may instead keep it in a sibling ``config.json``. A native file must carry it in metadata.
-* **Targets.** The ``svdq_w4a4`` targets of the config (target lists or a runtime manifest).
-  Other ops, and manifests with structural patches, are refused here: they need a model adapter.
-* **Per-layer tensors.** ``qweight`` int8 ``(out, in/2)``; ``wscales`` ``(in/g, out)``, bf16/fp16
-  for INT4 (``g`` = 64) and float8_e4m3fn for NVFP4 (``g`` = 16); ``smooth_factor`` ``(in,)``;
-  ``proj_down`` ``(in, r)``; ``proj_up`` ``(out, r)``; ``bias`` ``(out,)`` iff declared; NVFP4
-  also ``wcscales`` ``(out,)`` and optionally ``wtscale`` (one element). ``smooth_factor_orig`` is
-  a legacy leftover and is dropped. Anything else under a target, or a missing tensor, is refused.
-* **Rotation.** As :func:`nunchaku_lite.core.patch_transformer`: a model-level ``input_rotation``
-  declaration requires the marker tensor and vice versa (or a stored version 2 manifest declaring
-  rotation per target, which must agree); rotated layers must be SVDQ targets; NVFP4 rotation is
-  refused unless ``allow_fp4_rotation``.
-* **wtscale.** When the file has it, the layer keeps it as a persistent float32 buffer so that a
-  generic state-dict loader binds it; the GEMM reads it once per load (``wtscale_alpha``). An
-  NVFP4 layer without ``wtscale`` uses 1.0.
+* the per-layer tensors (names, shapes, dtypes, group size) are checked against an empty
+  :class:`~nunchaku_lite.linear.SVDQW4A4Linear` built for that layer, so the layer class is the only definition;
+* ``quantization_config`` lookup and GPU support rules come from :mod:`nunchaku_lite.checkpoint_config`, and the
+  rotation rules from :mod:`nunchaku_lite.rotation_loader`, shared with :func:`nunchaku_lite.core.patch_transformer`;
+* the key layout is the caller's: ``key_prefix`` names the prefix the model's tensors sit under in the file (``""``
+  for a file that holds only the model). The rotation marker is always a root key.
 """
 
 from __future__ import annotations
 
-import json
+import itertools
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -40,34 +26,27 @@ from typing import Any, Protocol
 import torch
 from torch import nn
 
-from .linear import SVDQW4A4Linear
-from .manifest import ROTATION_MARKER_KEY, RuntimeManifest, parse_runtime_manifest, with_target_list_manifest
+from .checkpoint_config import check_device_precision, resolve_quantization_config
+from .linear import SVDQ_CHECKPOINT_SCALARS, SVDQ_LEGACY_CHECKPOINT_SUFFIXES, SVDQW4A4Linear
+from .manifest import ROTATION_MARKER_KEY, parse_runtime_manifest, with_target_list_manifest
 from .rotation_loader import (
     HADAMARD,
     check_rotation_runtime,
-    parse_rotation_declaration,
     refuse_legacy_transform_tensors,
+    resolve_rotated_targets,
+    validate_declared_targets,
 )
 
 __all__ = [
-    "NATIVE_PREFIX",
     "CheckpointSpec",
     "GeluMlpPlan",
     "LayerSpec",
-    "bind_quantized_state",
     "check_runtime_support",
     "gelu_mlp_plan",
     "make_linear",
     "read_checkpoint_spec",
     "replace_linears",
 ]
-
-NATIVE_PREFIX = "model.diffusion_model."
-LEGACY_DROPPED_SUFFIXES = ("smooth_factor_orig",)
-_INT_SUFFIXES = {"qweight"}
-_REQUIRED = ("qweight", "wscales", "smooth_factor", "proj_down", "proj_up")
-_GROUP_SIZE = {"int4": 64, "nvfp4": 16}
-_FLOATS = (torch.bfloat16, torch.float16, torch.float32)
 
 TensorInfo = tuple[tuple[int, ...], torch.dtype]
 NameMap = Callable[[str], str]
@@ -86,8 +65,7 @@ class LayerSpec:
     has_bias: bool
     has_wtscale: bool
     input_rotation: str | None
-    tensors: Mapping[str, TensorInfo] = field(repr=False)  # suffix -> (shape, dtype)
-    dropped: tuple[str, ...] = field(default=(), repr=False)  # legacy suffixes present in the file
+    tensors: Mapping[str, TensorInfo] = field(repr=False)  # suffix -> (shape, dtype), legacy suffixes excluded
 
 
 @dataclass(frozen=True)
@@ -95,33 +73,16 @@ class CheckpointSpec:
     """Header-level description of a Nunchaku Lite checkpoint."""
 
     path: Path
-    layout: str  # "native" | "diffusers"
     key_prefix: str
-    precision: str
+    precision: str  # the layers' precision, or "mixed"
     rank: int
     layers: Mapping[str, LayerSpec]
     quantization_config: Mapping[str, Any] = field(repr=False)
     has_rotation_marker: bool = False
-    model_keys: frozenset[str] = field(default=frozenset(), repr=False)  # every key under key_prefix, unprefixed
 
     @property
     def rotated(self) -> tuple[str, ...]:
         return tuple(name for name, layer in self.layers.items() if layer.input_rotation is not None)
-
-    def file_key(self, name: str, suffix: str) -> str:
-        return f"{self.key_prefix}{name}.{suffix}"
-
-    def layer_file_keys(self, name: str) -> set[str]:
-        layer = self.layers[name]
-        return {self.file_key(name, s) for s in (*layer.tensors, *layer.dropped)}
-
-    def quantized_file_keys(self) -> set[str]:
-        """Every file key that :func:`bind_quantized_state` consumes."""
-
-        keys = set().union(*(self.layer_file_keys(name) for name in self.layers)) if self.layers else set()
-        if self.has_rotation_marker:
-            keys.add(ROTATION_MARKER_KEY)
-        return keys
 
 
 @dataclass(frozen=True)
@@ -139,7 +100,7 @@ class _QuantizedLayer(Protocol):
 
 
 def gelu_mlp_plan(fc1: _QuantizedLayer, fc2: _QuantizedLayer) -> GeluMlpPlan:
-    """The one rule for SVDQ GELU MLPs, shared by the Diffusers, ltx-core and ComfyUI integrations.
+    """The one rule for SVDQ GELU MLPs, shared by the Diffusers and framework integrations.
 
     Takes :class:`LayerSpec` objects or bound SVDQ layers (anything with ``precision`` and
     ``input_rotation``).
@@ -158,8 +119,17 @@ def gelu_mlp_plan(fc1: _QuantizedLayer, fc2: _QuantizedLayer) -> GeluMlpPlan:
     return GeluMlpPlan(fused=fused, fc2_act_unsigned=False, fc2_fused_flag=fused)
 
 
-def read_checkpoint_spec(path: str | os.PathLike, *, allow_fp4_rotation: bool = False) -> CheckpointSpec:
-    """Read and validate a checkpoint's header without loading any tensor data."""
+def read_checkpoint_spec(
+    path: str | os.PathLike, *, key_prefix: str = "", allow_fp4_rotation: bool = False
+) -> CheckpointSpec:
+    """Read and validate a checkpoint's header without loading any tensor data.
+
+    Args:
+        path: Local safetensors file.
+        key_prefix: Prefix of the model's tensor keys in the file; keys outside it are ignored (a single-file
+            checkpoint may also hold other components). Layer names in the spec are relative to it.
+        allow_fp4_rotation: Accept rotated NVFP4 layers.
+    """
 
     from safetensors import safe_open
 
@@ -171,17 +141,19 @@ def read_checkpoint_spec(path: str | os.PathLike, *, allow_fp4_rotation: bool = 
             sl = f.get_slice(key)
             header[key] = (tuple(int(d) for d in sl.get_shape()), _dtype(sl.get_dtype(), key))
 
-    native = any(key.startswith(NATIVE_PREFIX) for key in header)
-    prefix = NATIVE_PREFIX if native else ""
-    model = {key[len(prefix) :]: info for key, info in header.items() if key.startswith(prefix)}
-    if native:
-        model.pop(ROTATION_MARKER_KEY, None)  # the marker belongs at the root, never under the prefix
+    if key_prefix and f"{key_prefix}{ROTATION_MARKER_KEY}" in header:
+        raise ValueError(f"The {ROTATION_MARKER_KEY!r} marker must be a root key, not under {key_prefix!r}.")
     has_marker = ROTATION_MARKER_KEY in header
-    if f"{NATIVE_PREFIX}{ROTATION_MARKER_KEY}" in header:
-        raise ValueError(f"The {ROTATION_MARKER_KEY!r} marker must be a root key, not under {NATIVE_PREFIX!r}.")
+    model = {key[len(key_prefix) :]: info for key, info in header.items() if key.startswith(key_prefix)}
+    model.pop(ROTATION_MARKER_KEY, None)
+    if not model:
+        raise ValueError(f"{path} has no tensors under the key prefix {key_prefix!r}.")
 
-    config = _quantization_config(metadata, path, native=native)
+    config = resolve_quantization_config(metadata, path)
+    if not config:
+        raise ValueError(f"{path} has no 'quantization_config' (metadata or sibling config.json).")
     refuse_legacy_transform_tensors(model)
+    has_stored_manifest = "runtime_manifest" in config
     config = with_target_list_manifest(config, model.keys())
     manifest = parse_runtime_manifest(config)
     if manifest is None:
@@ -191,14 +163,23 @@ def read_checkpoint_spec(path: str | os.PathLike, *, allow_fp4_rotation: bool = 
     other_ops = sorted({t.nunchaku_op for t in manifest.targets} - {"svdq_w4a4"})
     if other_ops:
         raise NotImplementedError(f"Only svdq_w4a4 targets are supported here; checkpoint also has {other_ops}.")
-
-    rotated = _rotated_targets(config, manifest, has_marker)
     targets = {t.checkpoint_prefix: t for t in manifest.targets}
     if len(targets) != len(manifest.targets):
         raise ValueError("Checkpoint declares a quantization target more than once.")
-    unknown = sorted(set(rotated) - set(targets))
-    if unknown:
-        raise ValueError(f"Rotated targets {unknown[:3]} are not svdq_w4a4 targets of the checkpoint.")
+
+    rotated = resolve_rotated_targets(
+        config, has_marker=has_marker, stored_manifest=manifest if has_stored_manifest else None
+    ) or ()
+    if rotated:
+        validate_declared_targets(
+            model,
+            rotated,
+            is_fp4=any(targets[n].runtime_precision == "nvfp4" for n in rotated if n in targets),
+            allow_fp4=allow_fp4_rotation,
+        )
+        unknown = sorted(set(rotated) - set(targets))
+        if unknown:
+            raise ValueError(f"Rotated targets {unknown[:3]} are not svdq_w4a4 targets of the checkpoint.")
 
     by_layer: dict[str, dict[str, TensorInfo]] = {name: {} for name in targets}
     for key, info in model.items():
@@ -213,18 +194,17 @@ def read_checkpoint_spec(path: str | os.PathLike, *, allow_fp4_rotation: bool = 
 
     layers = {}
     for name, target in targets.items():
-        precision = target.runtime_precision
-        if precision not in _GROUP_SIZE:
-            raise ValueError(f"Target {name!r} has unsupported precision {target.precision!r}.")
-        rotation = HADAMARD if name in rotated else None
-        if rotation is not None and precision == "nvfp4" and not allow_fp4_rotation:
-            raise ValueError(
-                "Rotated checkpoint: rotation on NVFP4 is refused by default (it measured slightly worse than no "
-                "rotation); pass allow_fp4_rotation=True to load it anyway."
-            )
-        layers[name] = _layer_spec(name, precision, target.group_size, target.has_bias, rotation, by_layer[name])
-        if target.rank and layers[name].rank != target.rank:
-            raise ValueError(f"Target {name!r} declares rank {target.rank}, but its tensors have rank {layers[name].rank}.")
+        layer = _layer_spec(
+            name,
+            target.runtime_precision,
+            target.group_size,
+            target.has_bias,
+            HADAMARD if name in rotated else None,
+            by_layer[name],
+        )
+        if target.rank and layer.rank != target.rank:
+            raise ValueError(f"Target {name!r} declares rank {target.rank}, but its tensors have rank {layer.rank}.")
+        layers[name] = layer
 
     ranks = {layer.rank for layer in layers.values()}
     precisions = {layer.precision for layer in layers.values()}
@@ -233,32 +213,22 @@ def read_checkpoint_spec(path: str | os.PathLike, *, allow_fp4_rotation: bool = 
         raise ValueError(f"Checkpoint declares rank {declared_rank} but its layers have ranks {sorted(ranks)}.")
     return CheckpointSpec(
         path=path,
-        layout="native" if native else "diffusers",
-        key_prefix=prefix,
+        key_prefix=key_prefix,
         precision=precisions.pop() if len(precisions) == 1 else "mixed",
         rank=max(ranks),
         layers=layers,
         quantization_config=config,
         has_rotation_marker=has_marker,
-        model_keys=frozenset(model),
     )
 
 
 def check_runtime_support(spec: CheckpointSpec, device: torch.device | str) -> None:
-    """Refuse a checkpoint the target device cannot run, before anything is built."""
+    """Refuse a checkpoint the target device cannot run, before anything is built (same rules as the Diffusers path)."""
 
-    device = torch.device(device)
     if spec.rotated:
-        check_rotation_runtime(device)
-    if device.type != "cuda":
-        return
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    major, minor = torch.cuda.get_device_capability(index)
-    sm = major * 10 + minor
-    if any(layer.precision == "nvfp4" for layer in spec.layers.values()) and sm < 100:
-        raise ValueError(f"NVFP4 checkpoints need a Blackwell GPU (sm100+); this GPU is sm{sm}. Use an INT4 checkpoint.")
-    if sm < 75 or (80 < sm < 100 and sm not in (86, 89)):
-        raise ValueError(f"Unsupported GPU architecture sm{sm}; Nunchaku Lite needs Turing, Ampere, Ada or Blackwell.")
+        check_rotation_runtime(torch.device(device))
+    for precision in sorted({layer.precision for layer in spec.layers.values()}):
+        check_device_precision(precision, device)
 
 
 def make_linear(
@@ -267,11 +237,10 @@ def make_linear(
     torch_dtype: torch.dtype = torch.bfloat16,
     device: torch.device | str | None = "meta",
 ) -> SVDQW4A4Linear:
-    """An empty SVDQ layer shaped by ``layer``; its tensors are bound later.
+    """An empty SVDQ layer shaped by ``layer``; its tensors are filled by the framework's weight loader.
 
-    ``torch_dtype`` (bf16 or fp16) is the dtype of the floating tensors (bias, smooth_factor,
-    low-rank factors, INT4 wscales, NVFP4 wcscales). ``wtscale``, when the file has one, is a
-    persistent float32 buffer.
+    ``torch_dtype`` (bf16 or fp16) is the dtype of the floating tensors. A one-element scale the file carries
+    (``wtscale``) becomes a persistent float32 buffer, so that a generic state-dict loader binds it too.
     """
 
     if torch_dtype not in (torch.bfloat16, torch.float16):
@@ -287,10 +256,11 @@ def make_linear(
         device=device,
         input_rotation=layer.input_rotation,
     )
-    if layer.has_wtscale:
-        del module.wtscale  # the plain float attribute set by __init__
-        shape = layer.tensors["wtscale"][0]
-        module.register_buffer("wtscale", torch.ones(shape, dtype=torch.float32, device=device), persistent=True)
+    for scalar in SVDQ_CHECKPOINT_SCALARS:
+        if scalar in layer.tensors:
+            delattr(module, scalar)  # the plain attribute set by __init__
+            shape = layer.tensors[scalar][0]
+            module.register_buffer(scalar, torch.ones(shape, dtype=torch.float32, device=device), persistent=True)
     return module
 
 
@@ -335,63 +305,9 @@ def replace_linears(
     return replaced
 
 
-@torch.no_grad()
-def bind_quantized_state(
-    root: nn.Module,
-    spec: CheckpointSpec,
-    *,
-    device: torch.device | str | None = None,
-    name_map: NameMap | None = None,
-) -> set[str]:
-    """Load the quantized tensors of every target into the SVDQ layers of ``root``.
-
-    The layers must come from :func:`replace_linears` / :func:`make_linear` for the same spec.
-    Meta layers are materialized on ``device`` (default: CPU); others stay where they are unless
-    ``device`` is given. Floating tensors are cast to the layer's dtype, fp8 and int8 tensors are
-    loaded bit-exact, ``wtscale`` as float32. Returns every file key consumed, so a caller that
-    loads the rest itself can check full coverage.
-    """
-
-    from safetensors import safe_open
-
-    modules = {}
-    for name, layer in spec.layers.items():
-        path = name_map(name) if name_map is not None else name
-        module = root.get_submodule(path)
-        _check_bound_module(path, module, layer)
-        modules[name] = module
-
-    consumed: set[str] = set()
-    with safe_open(str(spec.path), framework="pt") as f:
-        for name, layer in spec.layers.items():
-            module = modules[name]
-            current = _module_device(module)
-            target = torch.device(device) if device is not None else (torch.device("cpu") if current.type == "meta" else current)
-            for suffix in layer.tensors:
-                value = f.get_tensor(spec.file_key(name, suffix))
-                if suffix == "wtscale":
-                    value = value.to(torch.float32).reshape(module.wtscale.shape)
-                else:
-                    expected = getattr(module, suffix)
-                    if value.dtype in _FLOATS and expected.dtype in _FLOATS:
-                        value = value.to(expected.dtype)
-                    if value.dtype != expected.dtype or tuple(value.shape) != tuple(expected.shape):
-                        raise ValueError(f"{spec.file_key(name, suffix)}: {tuple(value.shape)} {value.dtype} does not "
-                                         f"fit the layer's {tuple(expected.shape)} {expected.dtype}.")
-                _assign(module, suffix, value.to(target))
-            consumed |= spec.layer_file_keys(name)
-            meta = [n for n, t in (*module.named_parameters(), *module.named_buffers()) if t.is_meta]
-            if meta:
-                raise RuntimeError(f"Layer {name!r} still has meta tensors after binding: {meta}.")
-            module.__dict__.pop("_nunchaku_lite_alpha_cache", None)
-    if spec.has_rotation_marker:
-        consumed.add(ROTATION_MARKER_KEY)
-    return consumed
-
-
 # --- helpers -------------------------------------------------------------------------------------
 
-_DTYPES = {
+_DTYPES = {  # safetensors dtype names
     "BF16": torch.bfloat16,
     "F16": torch.float16,
     "F32": torch.float32,
@@ -405,6 +321,7 @@ _DTYPES = {
     "F8_E4M3": torch.float8_e4m3fn,
     "F8_E5M2": torch.float8_e5m2,
 }
+_LOADABLE_FLOATS = (torch.bfloat16, torch.float16, torch.float32)  # cast to the layer's dtype on load
 
 
 def _dtype(name: str, key: str) -> torch.dtype:
@@ -412,50 +329,6 @@ def _dtype(name: str, key: str) -> torch.dtype:
         return _DTYPES[name]
     except KeyError:
         raise ValueError(f"Tensor {key!r} has unsupported dtype {name!r}.") from None
-
-
-def _quantization_config(metadata: Mapping[str, str], path: Path, *, native: bool) -> dict[str, Any]:
-    raw = metadata.get("quantization_config")
-    if raw is not None:
-        try:
-            config = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid JSON in {path} metadata 'quantization_config': {exc}") from exc
-        if not isinstance(config, dict):
-            raise TypeError(f"{path} metadata 'quantization_config' must be a JSON object.")
-        return config
-    if native:
-        raise ValueError(f"{path} is a native-layout checkpoint without 'quantization_config' in its metadata.")
-    sibling = path.parent / "config.json"
-    if sibling.is_file():
-        config = json.loads(sibling.read_text()).get("quantization_config")
-        if isinstance(config, dict):
-            return config
-    raise ValueError(f"{path} has no 'quantization_config' (metadata or sibling config.json).")
-
-
-def _rotated_targets(config: Mapping[str, Any], manifest: RuntimeManifest, has_marker: bool) -> tuple[str, ...]:
-    declared = parse_rotation_declaration(dict(config))
-    stored = "runtime_manifest" in config and manifest.nunchaku_format_version >= 2
-    manifest_rotated = tuple(t.checkpoint_prefix for t in manifest.rotated_targets) if stored else ()
-    if has_marker and declared is None:
-        raise ValueError(
-            f"Checkpoint has the {ROTATION_MARKER_KEY!r} rotation marker but no quantization_config.input_rotation "
-            "declaration listing the rotated targets."
-        )
-    if declared is None:
-        return manifest_rotated
-    if manifest_rotated and set(declared) != set(manifest_rotated):
-        raise ValueError(
-            "quantization_config.input_rotation.targets do not match the runtime_manifest targets that declare "
-            "op_options.rotation; the checkpoint metadata is inconsistent."
-        )
-    if not manifest_rotated and not has_marker:
-        raise ValueError(
-            "Checkpoint declares quantization_config.input_rotation without the "
-            f"{ROTATION_MARKER_KEY!r} marker tensor (or a version 2 runtime_manifest declaring it)."
-        )
-    return declared
 
 
 def _layer_spec(
@@ -466,52 +339,46 @@ def _layer_spec(
     rotation: str | None,
     tensors: dict[str, TensorInfo],
 ) -> LayerSpec:
-    expected_group = _GROUP_SIZE[precision]
-    if group_size != expected_group:
-        raise ValueError(f"Target {name!r}: {precision} needs group_size {expected_group}, got {group_size}.")
-    dropped = tuple(s for s in LEGACY_DROPPED_SUFFIXES if s in tensors)
-    tensors = {s: info for s, info in tensors.items() if s not in dropped}
-    nvfp4_extra = {"wcscales", "wtscale"} if precision == "nvfp4" else set()
-    allowed = set(_REQUIRED) | ({"bias"} if has_bias else set()) | nvfp4_extra
-    required = set(_REQUIRED) | ({"bias"} if has_bias else set()) | ({"wcscales"} if precision == "nvfp4" else set())
-    missing = sorted(required - set(tensors))
+    """Check one target's tensors against the SVDQ layer they will load into."""
+
+    tensors = {s: info for s, info in tensors.items() if s not in SVDQ_LEGACY_CHECKPOINT_SUFFIXES}
+    try:
+        in_features, out_features, rank = SVDQW4A4Linear.checkpoint_dims({s: shape for s, (shape, _) in tensors.items()})
+    except KeyError as exc:
+        raise ValueError(f"Target {name!r} is missing tensors [{exc.args[0]!r}].") from None
+    except ValueError as exc:
+        raise ValueError(f"Target {name!r}: {exc}.") from None
+    try:
+        reference = SVDQW4A4Linear(
+            in_features, out_features, rank=rank, bias=has_bias, precision=precision, device="meta",
+            input_rotation=rotation,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise ValueError(f"Target {name!r}: {exc}") from None
+    if group_size != reference.group_size:
+        raise ValueError(f"Target {name!r}: {precision} needs group_size {reference.group_size}, got {group_size}.")
+
+    expected = {
+        suffix: (tuple(t.shape), t.dtype)
+        for suffix, t in itertools.chain(reference.named_parameters(recurse=False), reference.named_buffers(recurse=False))
+    }
+    scalars = {s for s in SVDQ_CHECKPOINT_SCALARS if getattr(reference, s, None) is not None}
+    missing = sorted(set(expected) - set(tensors))
     if missing:
         raise ValueError(f"Target {name!r} is missing tensors {missing}.")
-    extra = sorted(set(tensors) - allowed)
+    extra = sorted(set(tensors) - set(expected) - scalars)
     if extra:
         raise ValueError(f"Target {name!r} has unexpected tensors {extra}.")
-
-    qshape, qdtype = tensors["qweight"]
-    if len(qshape) != 2 or qdtype != torch.int8:
-        raise ValueError(f"Target {name!r}: qweight must be 2-D int8, got {qshape} {qdtype}.")
-    out_features, half_in = qshape
-    in_features = 2 * half_in
-    down_shape = tensors["proj_down"][0]
-    rank = down_shape[1] if len(down_shape) == 2 else -1
-    scale_dtypes = (torch.float8_e4m3fn,) if precision == "nvfp4" else (torch.bfloat16, torch.float16)
-    shapes = {
-        "wscales": ((in_features // group_size, out_features), scale_dtypes),
-        "smooth_factor": ((in_features,), _FLOATS),
-        "proj_down": ((in_features, rank), _FLOATS),
-        "proj_up": ((out_features, rank), _FLOATS),
-        "bias": ((out_features,), _FLOATS),
-        "wcscales": ((out_features,), _FLOATS),
-    }
-    for suffix, (shape, dtypes) in shapes.items():
-        if suffix not in tensors:
-            continue
+    for suffix, (shape, dtype) in expected.items():
         actual_shape, actual_dtype = tensors[suffix]
-        if tuple(actual_shape) != shape or actual_dtype not in dtypes:
-            raise ValueError(f"Target {name!r}: {suffix} is {tuple(actual_shape)} {actual_dtype}, expected {shape} "
-                             f"in {[str(d) for d in dtypes]}.")
-    if in_features % group_size or in_features % 128 or out_features % 128:
-        raise ValueError(f"Target {name!r}: ({out_features}, {in_features}) does not fit SVDQ packing.")
-    if rank < 0 or rank % 16:
-        raise ValueError(f"Target {name!r}: low-rank rank {rank} must be a non-negative multiple of 16.")
-    if "wtscale" in tensors:
-        shape, dtype = tensors["wtscale"]
-        if int(torch.Size(shape).numel()) != 1 or dtype not in _FLOATS:
-            raise ValueError(f"Target {name!r}: wtscale must be one floating element, got {shape} {dtype}.")
+        loadable = actual_dtype in _LOADABLE_FLOATS if dtype in _LOADABLE_FLOATS else actual_dtype == dtype
+        if tuple(actual_shape) != shape or not loadable:
+            raise ValueError(f"Target {name!r}: {suffix} is {tuple(actual_shape)} {actual_dtype}, but the layer's "
+                             f"{suffix} is {shape} {dtype}.")
+    for suffix in scalars & set(tensors):
+        shape, dtype = tensors[suffix]
+        if int(torch.Size(shape).numel()) != 1 or dtype not in _LOADABLE_FLOATS:
+            raise ValueError(f"Target {name!r}: {suffix} must be one floating element, got {shape} {dtype}.")
     return LayerSpec(
         name=name,
         precision=precision,
@@ -520,34 +387,10 @@ def _layer_spec(
         rank=rank,
         group_size=group_size,
         has_bias=has_bias,
-        has_wtscale="wtscale" in tensors,
+        has_wtscale=any(s in tensors for s in SVDQ_CHECKPOINT_SCALARS),
         input_rotation=rotation,
         tensors=tensors,
-        dropped=dropped,
     )
-
-
-def _check_bound_module(path: str, module: nn.Module, layer: LayerSpec) -> None:
-    if not isinstance(module, SVDQW4A4Linear):
-        raise TypeError(f"{path!r} is a {type(module).__name__}; call replace_linears first.")
-    got = (module.in_features, module.out_features, module.rank, module.precision, module.input_rotation,
-           module.bias is not None, isinstance(getattr(module, "wtscale", None), torch.Tensor))
-    want = (layer.in_features, layer.out_features, layer.rank, layer.precision, layer.input_rotation,
-            layer.has_bias, layer.has_wtscale)
-    if got != want:
-        raise ValueError(f"{path!r} does not match its checkpoint layer: module {got}, checkpoint {want}.")
-    if module.act_unsigned:
-        raise ValueError(f"{path!r} is set to unsigned activations; checkpoint layers quantize signed inputs.")
-
-
-def _assign(module: nn.Module, name: str, value: torch.Tensor) -> None:
-    if name in module._parameters:
-        old = module._parameters[name]
-        module._parameters[name] = nn.Parameter(value, requires_grad=bool(old is not None and old.requires_grad and value.is_floating_point()))
-    elif name in module._buffers:
-        module._buffers[name] = value
-    else:
-        raise AttributeError(f"SVDQ layer has no tensor {name!r}.")
 
 
 def _module_device(module: nn.Module) -> torch.device:

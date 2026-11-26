@@ -12,8 +12,6 @@ from torch import nn
 
 from nunchaku_lite.linear import SVDQW4A4Linear, wtscale_alpha
 from nunchaku_lite.loader import (
-    NATIVE_PREFIX,
-    bind_quantized_state,
     gelu_mlp_plan,
     make_linear,
     read_checkpoint_spec,
@@ -22,6 +20,7 @@ from nunchaku_lite.loader import (
 from nunchaku_lite.manifest import ROTATION_MARKER_KEY
 
 A, B = "blocks.0.attn.to_q", "blocks.0.ff.net.2"
+PREFIX = "unet."  # any caller-chosen prefix; the loader knows none
 SHAPES = {A: (128, 256), B: (256, 128)}  # name -> (in, out)
 
 
@@ -29,11 +28,11 @@ def _layers(precision="int4", **kw):
     return {name: svdq_tensors(i, o, precision=precision, seed=n, **kw) for n, (name, (i, o)) in enumerate(SHAPES.items())}
 
 
-def _write(tmp_path, precision="int4", *, native=False, rotated=None, marker=None, layers=None, config=None, **kw):
+def _write(tmp_path, precision="int4", *, prefix="", rotated=None, marker=None, layers=None, config=None, **kw):
     layers = layers if layers is not None else _layers(precision)
     config = config if config is not None else quant_config(list(layers), precision=precision, rotated=rotated)
     marker = bool(rotated) if marker is None else marker
-    return write_checkpoint(tmp_path / "ckpt.safetensors", layers, config=config, native=native, marker=marker, **kw)
+    return write_checkpoint(tmp_path / "ckpt.safetensors", layers, config=config, prefix=prefix, marker=marker, **kw)
 
 
 class _Model(nn.Module):
@@ -50,27 +49,29 @@ class _Model(nn.Module):
 # --- layout / metadata -----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("prefix", ["", PREFIX])
 @pytest.mark.parametrize("precision", ["int4", "nvfp4"])
-def test_spec_layout_and_layers(tmp_path, native, precision):
-    spec = read_checkpoint_spec(_write(tmp_path, precision, native=native))
-    assert spec.layout == ("native" if native else "diffusers")
-    assert spec.key_prefix == (NATIVE_PREFIX if native else "")
+def test_spec_layers(tmp_path, prefix, precision):
+    spec = read_checkpoint_spec(_write(tmp_path, precision, prefix=prefix), key_prefix=prefix)
+    assert spec.key_prefix == prefix
     assert spec.precision == precision and spec.rank == 16
     assert set(spec.layers) == set(SHAPES)
     for name, (i, o) in SHAPES.items():
         layer = spec.layers[name]
         assert (layer.in_features, layer.out_features, layer.rank) == (i, o, 16)
-        assert layer.group_size == (64 if precision == "int4" else 16)
+        assert layer.group_size == SVDQW4A4Linear(i, o, rank=16, precision=precision, device="meta").group_size
         assert layer.has_bias and layer.input_rotation is None
         assert layer.has_wtscale == (precision == "nvfp4")
-    assert spec.quantized_file_keys() == {spec.file_key(n, s) for n in SHAPES for s in spec.layers[n].tensors}
 
 
-def test_native_requires_metadata_config(tmp_path):
-    path = _write(tmp_path, native=True, sidecar=True)
-    with pytest.raises(ValueError, match="native-layout checkpoint without 'quantization_config'"):
-        read_checkpoint_spec(path)
+def test_prefix_without_tensors_refused(tmp_path):
+    with pytest.raises(ValueError, match="no tensors under the key prefix"):
+        read_checkpoint_spec(_write(tmp_path), key_prefix=PREFIX)
+
+
+def test_prefixed_file_reads_sidecar_config(tmp_path):
+    path = _write(tmp_path, prefix=PREFIX, sidecar=True)
+    assert set(read_checkpoint_spec(path, key_prefix=PREFIX).layers) == set(SHAPES)
 
 
 def test_diffusers_layout_reads_sidecar_config(tmp_path):
@@ -83,15 +84,14 @@ def test_no_config_refused(tmp_path):
         read_checkpoint_spec(path)
 
 
-def test_native_ignores_tensors_outside_prefix(tmp_path):
-    path = _write(tmp_path, native=True, metadata={"config": "{}"})
+def test_tensors_outside_prefix_ignored(tmp_path):
     from safetensors.torch import load_file, save_file
 
+    path = _write(tmp_path, prefix=PREFIX)
     tensors = load_file(str(path))
-    tensors["vae.decoder.weight"] = torch.zeros(2)  # a full single-file checkpoint carries other components
+    tensors["vae.decoder.weight"] = torch.zeros(2)  # a single-file checkpoint may carry other components
     save_file(tensors, str(path), metadata={"quantization_config": json.dumps(quant_config(list(SHAPES)))})
-    spec = read_checkpoint_spec(path)
-    assert "vae.decoder.weight" not in spec.model_keys
+    assert set(read_checkpoint_spec(path, key_prefix=PREFIX).layers) == set(SHAPES)
 
 
 # --- per-layer tensors -----------------------------------------------------------------------------
@@ -139,8 +139,8 @@ def test_nested_tensor_under_target_refused(tmp_path):
 @pytest.mark.parametrize(
     "suffix,value,match",
     [
-        ("qweight", torch.zeros(256, 64, dtype=torch.uint8), "qweight must be 2-D int8"),
-        ("qweight", torch.zeros(256 * 64, dtype=torch.int8), "qweight must be 2-D int8"),
+        ("qweight", torch.zeros(256, 64, dtype=torch.uint8), "qweight"),
+        ("qweight", torch.zeros(256 * 64, dtype=torch.int8), "qweight"),
         ("wscales", torch.zeros(2, 256, dtype=torch.float8_e4m3fn), "wscales"),  # fp8 scales on INT4
         ("wscales", torch.zeros(4, 256, dtype=torch.bfloat16), "wscales"),  # wrong group count
         ("smooth_factor", torch.zeros(64, dtype=torch.bfloat16), "smooth_factor"),
@@ -191,12 +191,6 @@ def test_per_target_rank_mismatch_refused(tmp_path):
         read_checkpoint_spec(_write(tmp_path, layers=layers, config=config))
 
 
-def test_rank_must_be_multiple_of_16(tmp_path):
-    layers = {name: svdq_tensors(i, o, rank=8) for name, (i, o) in SHAPES.items()}
-    with pytest.raises(ValueError, match="multiple of 16"):
-        read_checkpoint_spec(_write(tmp_path, layers=layers, config=quant_config(list(SHAPES), rank=0)))
-
-
 def test_missing_target_module_tensors_refused(tmp_path):
     config = quant_config([*SHAPES, "blocks.0.attn.to_k"])
     with pytest.raises(ValueError, match="missing tensors"):
@@ -208,7 +202,6 @@ def test_legacy_smooth_factor_orig_dropped_but_consumed(tmp_path):
     layers[A]["smooth_factor_orig"] = layers[A]["smooth_factor"].clone()
     spec = read_checkpoint_spec(_write(tmp_path, layers=layers))
     assert "smooth_factor_orig" not in spec.layers[A].tensors
-    assert f"{A}.smooth_factor_orig" in spec.quantized_file_keys()
 
 
 def test_non_svdq_ops_refused(tmp_path):
@@ -221,11 +214,10 @@ def test_non_svdq_ops_refused(tmp_path):
 # --- rotation --------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("native", [False, True])
-def test_rotation_declared_with_marker(tmp_path, native):
-    spec = read_checkpoint_spec(_write(tmp_path, rotated=[A, B], native=native))
-    assert set(spec.rotated) == {A, B}
-    assert spec.has_rotation_marker and ROTATION_MARKER_KEY in spec.quantized_file_keys()
+@pytest.mark.parametrize("prefix", ["", PREFIX])
+def test_rotation_declared_with_marker(tmp_path, prefix):
+    spec = read_checkpoint_spec(_write(tmp_path, rotated=[A, B], prefix=prefix), key_prefix=prefix)
+    assert set(spec.rotated) == {A, B} and spec.has_rotation_marker
     assert all(spec.layers[n].input_rotation == "hadamard" for n in (A, B))
 
 
@@ -240,19 +232,19 @@ def test_marker_without_declaration_refused(tmp_path):
 
 
 def test_declaration_without_marker_refused(tmp_path):
-    with pytest.raises(ValueError, match="without the"):
+    with pytest.raises(ValueError, match="marker tensor"):
         read_checkpoint_spec(_write(tmp_path, rotated=[A], marker=False))
 
 
-def test_marker_under_native_prefix_refused(tmp_path):
-    path = _write(tmp_path, native=True, rotated=[A], marker=False, extra={ROTATION_MARKER_KEY: torch.empty(0)})
+def test_marker_under_prefix_refused(tmp_path):
+    path = _write(tmp_path, prefix=PREFIX, rotated=[A], marker=False, extra={ROTATION_MARKER_KEY: torch.empty(0)})
     with pytest.raises(ValueError, match="root key"):
-        read_checkpoint_spec(path)
+        read_checkpoint_spec(path, key_prefix=PREFIX)
 
 
 def test_rotated_non_target_refused(tmp_path):
     config = quant_config(list(SHAPES), rotated=["blocks.0.attn.to_k"])
-    with pytest.raises(ValueError, match="not svdq_w4a4 targets"):
+    with pytest.raises(ValueError, match="no packed SVDQ weight"):
         read_checkpoint_spec(_write(tmp_path, config=config, marker=True))
 
 
@@ -283,7 +275,7 @@ def test_gelu_mlp_plan_full_table(p1, p2, r1, r2):
     assert plan.fc2_act_unsigned is False
 
 
-# --- make / replace / bind -------------------------------------------------------------------------
+# --- make / replace -----------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("precision", ["int4", "nvfp4"])
@@ -354,78 +346,16 @@ def test_replace_linears_name_map(tmp_path):
     assert isinstance(outer.diffusion_model.get_submodule(A), SVDQW4A4Linear)
 
 
-@pytest.mark.parametrize("native", [False, True])
-@pytest.mark.parametrize("precision,dtype", [("int4", torch.bfloat16), ("int4", torch.float16), ("nvfp4", torch.bfloat16)])
-def test_bind_quantized_state_exact(tmp_path, native, precision, dtype):
-    layers = _layers(precision)
-    layers[A]["smooth_factor_orig"] = layers[A]["smooth_factor"].clone()
-    path = _write(tmp_path, precision, native=native, layers=layers, rotated=[A] if precision == "int4" else None)
-    spec = read_checkpoint_spec(path)
-    model = _Model(device="meta")
-    replace_linears(model, spec, torch_dtype=dtype)
-    consumed = bind_quantized_state(model, spec)
-    assert consumed == spec.quantized_file_keys()
-    from safetensors import safe_open
-
-    with safe_open(str(path), framework="pt") as f:
-        assert consumed <= set(f.keys())
-        for name in SHAPES:
-            module = model.get_submodule(name)
-            assert not any(t.is_meta for t in (*module.parameters(), *module.buffers()))
-            for suffix, value in layers[name].items():
-                if suffix == "smooth_factor_orig":
-                    continue
-                got = getattr(module, suffix)
-                if suffix == "wtscale":
-                    assert got.dtype == torch.float32 and got.item() == value.float().item()
-                elif value.dtype in (torch.int8, torch.float8_e4m3fn):
-                    assert got.dtype == value.dtype and torch.equal(got.view(torch.uint8), value.view(torch.uint8))
-                else:
-                    assert got.dtype == dtype and torch.equal(got, value.to(dtype))
-
-
-def test_bind_refuses_mismatched_module(tmp_path):
-    spec = read_checkpoint_spec(_write(tmp_path, rotated=[A]))
-    model = _Model(device="meta")
-    replace_linears(model, spec)
-    model.get_submodule(A).input_rotation = None  # e.g. a caller rebuilt the layer without its rotation
-    with pytest.raises(ValueError, match="does not match its checkpoint layer"):
-        bind_quantized_state(model, spec)
-
-
-def test_bind_refuses_layers_left_on_meta(tmp_path):
-    spec = read_checkpoint_spec(_write(tmp_path))
-    model = _Model(device="meta")
-    replace_linears(model, spec)
-    model.get_submodule(A).register_buffer("stray", torch.empty(1, device="meta"))
-    with pytest.raises(RuntimeError, match="still has meta tensors"):
-        bind_quantized_state(model, spec)
-
-
-def test_bind_refuses_unswapped_model(tmp_path):
-    spec = read_checkpoint_spec(_write(tmp_path))
-    with pytest.raises(TypeError, match="replace_linears first"):
-        bind_quantized_state(_Model(), spec)
-
-
-def test_bind_refuses_unsigned(tmp_path):
-    spec = read_checkpoint_spec(_write(tmp_path))
-    model = _Model(device="meta")
-    replace_linears(model, spec)
-    model.get_submodule(B).act_unsigned = True
-    with pytest.raises(ValueError, match="unsigned"):
-        bind_quantized_state(model, spec)
-
-
 # --- moves and casts keep the quantized tensors ------------------------------------------------------
 
 
 @pytest.mark.parametrize("precision", ["int4", "nvfp4"])
 def test_to_dtype_and_device_keep_quantized_tensors(tmp_path, precision):
-    spec = read_checkpoint_spec(_write(tmp_path, precision, rotated=[A] if precision == "int4" else None))
+    path = _write(tmp_path, precision, rotated=[A] if precision == "int4" else None)
+    spec = read_checkpoint_spec(path)
     model = _Model()
     replace_linears(model, spec)
-    bind_quantized_state(model, spec)
+    _fill(model, path, spec)
     module = model.get_submodule(A)
     before = {k: v.clone() for k, v in module.state_dict().items()}
     for dtype in (torch.float16, torch.bfloat16, torch.float16):
@@ -444,10 +374,11 @@ def test_to_dtype_and_device_keep_quantized_tensors(tmp_path, precision):
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs a non-CPU device")
 def test_wtscale_alpha_reads_device_buffer_once_per_load(tmp_path):
-    spec = read_checkpoint_spec(_write(tmp_path, "nvfp4"))
+    path = _write(tmp_path, "nvfp4")
+    spec = read_checkpoint_spec(path)
     model = _Model()
     replace_linears(model, spec)
-    bind_quantized_state(model, spec)
+    _fill(model, path, spec)
     module = model.get_submodule(A)
     assert wtscale_alpha(module) is module.wtscale  # CPU tensor: passed through, as for the Diffusers loader
     model.to("mps")
@@ -462,11 +393,13 @@ def test_wtscale_alpha_reads_device_buffer_once_per_load(tmp_path):
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs a non-CPU device")
 def test_wtscale_alpha_handles_inference_tensors(tmp_path):
     """ltx-core builds and binds under torch.inference_mode: the wtscale buffer is then an inference tensor."""
-    spec = read_checkpoint_spec(_write(tmp_path, "nvfp4"))
+    path = _write(tmp_path, "nvfp4")
+    spec = read_checkpoint_spec(path)
     with torch.inference_mode():
         model = _Model()
         replace_linears(model, spec)
-        bind_quantized_state(model, spec, device="mps")
+        _fill(model, path, spec)
+        model.to("mps")
     module = model.get_submodule(A)
     assert module.wtscale.is_inference() and module.wtscale.device.type == "mps"
     alpha = wtscale_alpha(module)  # outside inference mode, as the first forward may be
@@ -478,13 +411,15 @@ def test_wtscale_alpha_handles_inference_tensors(tmp_path):
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs Apple silicon")
 def test_mps_forward_on_inference_mode_model(tmp_path):
     """The MPS backend (INT4 only) caches derived weights keyed by tensor version; inference tensors have none."""
-    spec = read_checkpoint_spec(_write(tmp_path, "int4"))
+    path = _write(tmp_path, "int4")
+    spec = read_checkpoint_spec(path)
     models = []
     for inference in (False, True):
         with torch.inference_mode(inference):
             model = _Model()
             replace_linears(model, spec)
-            bind_quantized_state(model, spec, device="mps")
+            _fill(model, path, spec)
+            model.to("mps")
         models.append(model)
     x = torch.randn(3, spec.layers[A].in_features, generator=torch.Generator().manual_seed(0)).to("mps", torch.bfloat16)
     with torch.inference_mode():
@@ -493,6 +428,15 @@ def test_mps_forward_on_inference_mode_model(tmp_path):
         again = models[1].get_submodule(A)(x)  # second call hits the derived-weight cache
     assert models[1].get_submodule(A).qweight.is_inference()
     assert torch.equal(out, ref) and torch.equal(again, ref)
+
+
+def _fill(model, path, spec):
+    """What a framework's own weight loader does after replace_linears: load the file's tensors by name."""
+    from safetensors.torch import load_file
+
+    state = {k.removeprefix(spec.key_prefix): v for k, v in load_file(str(path)).items() if k.startswith(spec.key_prefix)}
+    state = {k: v for k, v in state.items() if k.rpartition(".")[0] in spec.layers and k.rpartition(".")[2] in spec.layers[k.rpartition(".")[0]].tensors}
+    model.load_state_dict(state, strict=False)
 
 
 def _manifest_config(layers, precision, *, has_bias):

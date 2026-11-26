@@ -25,6 +25,8 @@ from torch import nn
 from .manifest import (
     LEGACY_INPUT_TRANSFORM_SUFFIX,
     ROTATION_DECLARATION_KEY,
+    ROTATION_MARKER_KEY,
+    RuntimeManifest,
     RuntimeManifestTarget,
     parse_rotation_declaration,
 )
@@ -43,8 +45,54 @@ __all__ = [
     "parse_rotation_declaration",
     "refuse_legacy_transform_tensors",
     "resolve_input_rotation",
+    "resolve_rotated_targets",
     "validate_declared_targets",
 ]
+
+
+def resolve_rotated_targets(
+    quantization_config: dict,
+    *,
+    has_marker: bool,
+    stored_manifest: RuntimeManifest | None,
+) -> tuple[str, ...] | None:
+    """The checkpoint prefixes declared rotated, or ``None`` when the checkpoint declares no rotation.
+
+    Rotation is declared per target in a ``nunchaku_format_version`` 2 runtime manifest stored in the checkpoint
+    (``stored_manifest``; never one synthesized from target lists), or by the model-level ``input_rotation``
+    declaration together with the ``ROTATION_MARKER_KEY`` tensor. Both make loaders that predate rotation refuse the
+    checkpoint; when a manifest and a declaration are both present they must agree.
+    """
+
+    declared = parse_rotation_declaration(quantization_config)
+    manifest_rotated = (
+        tuple(target.checkpoint_prefix for target in stored_manifest.rotated_targets) if stored_manifest else ()
+    )
+    if has_marker and declared is None:
+        raise ValueError(
+            f"Checkpoint has the {ROTATION_MARKER_KEY!r} rotation marker but no quantization_config.input_rotation "
+            "declaration listing the rotated targets."
+        )
+    if declared is None and not manifest_rotated:
+        return None
+    if stored_manifest is not None and declared is not None and set(declared) != set(manifest_rotated):
+        if not manifest_rotated:
+            raise ValueError(
+                "Checkpoint declares quantization_config.input_rotation but its runtime_manifest declares no "
+                "rotation; checkpoints with a manifest must declare rotation per target in op_options.rotation."
+            )
+        raise ValueError(
+            "quantization_config.input_rotation.targets do not match the runtime_manifest targets that declare "
+            "op_options.rotation; the checkpoint metadata is inconsistent."
+        )
+    if not manifest_rotated and not has_marker:
+        raise ValueError(
+            "Checkpoint declares quantization_config.input_rotation without a runtime_manifest "
+            f"(nunchaku_format_version 2) declaring the rotation or the {ROTATION_MARKER_KEY!r} marker tensor. "
+            "One of them is required, so that older Nunchaku Lite versions refuse the checkpoint instead of "
+            "loading it without rotation."
+        )
+    return manifest_rotated or declared
 
 
 def resolve_input_rotation(target: RuntimeManifestTarget, *, allow_fp4: bool = False) -> str | None:

@@ -30,9 +30,9 @@ from safetensors.torch import load_file, save_file
 from svdq_files import WTSCALE, quant_config, svdq_tensors, write_checkpoint
 
 from nunchaku_lite.integrations import ltx_core as integration
-from nunchaku_lite.integrations.ltx_core import build_nunchaku_policy
+from nunchaku_lite.integrations.ltx_core import NATIVE_PREFIX, build_nunchaku_policy
 from nunchaku_lite.linear import SVDQW4A4Linear
-from nunchaku_lite.loader import NATIVE_PREFIX, read_checkpoint_spec
+from nunchaku_lite.loader import read_checkpoint_spec
 from nunchaku_lite.manifest import ROTATION_MARKER_KEY
 from nunchaku_lite.ops.fused import FUSED_MLP_FC2_ATTR
 
@@ -128,8 +128,8 @@ def _build(path, policy):
 @pytest.mark.parametrize("precision,rotate", [("nvfp4", ()), ("int4", ()), ("int4", ("",))])
 def test_native_file_is_read_as_native(tmp_path, precision, rotate):
     _, out, layers = _native(tmp_path, precision, rotate)
-    spec = read_checkpoint_spec(out)
-    assert spec.layout == "native" and set(spec.layers) == set(layers)
+    spec = read_checkpoint_spec(out, key_prefix=NATIVE_PREFIX)
+    assert spec.key_prefix == NATIVE_PREFIX and set(spec.layers) == set(layers)
     assert len(spec.layers) == 2 * 28  # per block: 6 attentions x (q, k, v, out) + 2 FFs x 2; gate logits excluded
     assert all((la.input_rotation is not None) == bool(rotate) for la in spec.layers.values())
 
@@ -164,7 +164,7 @@ def test_ltx_core_builder_binds_everything(tmp_path, precision, rotate):
     official, out, layers = _native(tmp_path, precision, rotate)
     policy = build_nunchaku_policy(out, device="cpu")
     model = _build(out, policy)
-    spec = read_checkpoint_spec(out)
+    spec = read_checkpoint_spec(out, key_prefix=NATIVE_PREFIX)
 
     reference = {k.removeprefix(NATIVE_PREFIX): v for k, v in load_file(str(official)).items()}
     state = model.state_dict()

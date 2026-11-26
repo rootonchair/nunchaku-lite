@@ -35,6 +35,9 @@ from torch import nn
 
 from ..linear import SVDQW4A4Linear
 from ..loader import CheckpointSpec, check_runtime_support, gelu_mlp_plan, read_checkpoint_spec, replace_linears
+
+# Lightricks' single-file transformer layout (also ComfyUI's): every model tensor sits under this prefix.
+NATIVE_PREFIX = "model.diffusion_model."
 from ..ops.fused import FUSED_MLP_FC2_ATTR
 
 __all__ = ["build_nunchaku_policy", "main", "patch_ltx_model"]
@@ -64,12 +67,12 @@ def build_nunchaku_policy(
     from ltx_core.loader.sd_ops import SDOps
     from ltx_core.quantization.policy import QuantizationPolicy
 
-    spec = read_checkpoint_spec(checkpoint_path, allow_fp4_rotation=allow_fp4_rotation)
-    if spec.layout != "native":
+    if not _has_native_keys(checkpoint_path):
         raise ValueError(
             f"{checkpoint_path} is a Diffusers-layout checkpoint; ltx-core reads Lightricks' native layout (their "
             "transformer file with our quantized layers in place), e.g. rootonchair/nunchaku-lite-ltx-2.5-distilled-native."
         )
+    spec = read_checkpoint_spec(checkpoint_path, key_prefix=NATIVE_PREFIX, allow_fp4_rotation=allow_fp4_rotation)
     if device is None and torch.cuda.is_available():
         device = torch.device("cuda", torch.cuda.current_device())
     if device is not None:
@@ -243,6 +246,13 @@ def _refuse_lora_rule():
         return FLOAT_FUSE_RULE.patch(key, weight, delta, clean)
 
     return FuseRule("nunchaku-lite-bf16-add", torch.bfloat16, patch)
+
+
+def _has_native_keys(path: str | Path) -> bool:
+    from safetensors import safe_open
+
+    with safe_open(str(path), framework="pt") as f:
+        return any(key.startswith(NATIVE_PREFIX) for key in f.keys())  # noqa: SIM118 - safe_open handle
 
 
 def _spec_digest(spec: CheckpointSpec) -> str:

@@ -109,27 +109,25 @@ Same setup on a 48 GB L40S (Ada), INT4 r32 with Hadamard rotation (smooth expone
 
 ## For integrators: `nunchaku_lite.loader`
 
-The framework-agnostic core used here (and meant for other runtimes such as ComfyUI) needs only torch:
+The ltx-core integration is built on a small torch-only loader, meant for other runtimes that build the model
+themselves (such as ComfyUI). It reads and checks a checkpoint's header and swaps the model's linears for SVDQ
+layers; the runtime's own weight loader then fills them by name.
 
 | function | does |
 | --- | --- |
-| `read_checkpoint_spec(path)` | reads and validates the header (no tensor data): layout, precision, rank, per-layer shapes and rotation |
-| `replace_linears(root, spec, name_map=...)` | swaps each target module by exact name for an empty SVDQ layer (meta allowed) |
-| `bind_quantized_state(root, spec)` | loads the target tensors and returns every file key it consumed |
-| `gelu_mlp_plan(fc1, fc2)` | the one rule for fusing a GELU MLP (NVFP4, neither layer rotated) |
-| `check_runtime_support(spec, device)` | refuses NVFP4 below Blackwell, rotation where unsupported |
+| `read_checkpoint_spec(path, key_prefix="")` | reads and checks the header (no tensor data): targets, precision, rank, per-layer shapes and rotation. `key_prefix` is where the model's tensors sit in the file; ltx-core passes `"model.diffusion_model."` |
+| `replace_linears(root, spec, name_map=...)` | swaps each target module by exact name for an empty SVDQ layer (meta allowed), atomically |
+| `gelu_mlp_plan(fc1, fc2)` | the one rule for fusing a GELU MLP (NVFP4, neither layer rotated), also used by the Diffusers adapter |
+| `check_runtime_support(spec, device)` | refuses what the device cannot run (same GPU and rotation rules as `patch_transformer`) |
 
-### Frozen checkpoint rules
+The loader defines no checkpoint format of its own:
 
-| input | accepted | refused |
-| --- | --- | --- |
-| layout | `model.diffusion_model.*` (native), or no prefix (Diffusers) | — |
-| `quantization_config` | safetensors metadata; Diffusers layout may use a sibling `config.json` | native file without metadata |
-| targets | `svdq_w4a4` target list or runtime manifest | other ops, structural patches |
-| per layer | `qweight` int8 `(out, in/2)`, `wscales` `(in/g, out)` (bf16/fp16 INT4, fp8 NVFP4), `smooth_factor`, `proj_down`, `proj_up`, `bias` iff declared, NVFP4 `wcscales` (+ optional one-element `wtscale`) | any missing, extra, nested, mis-shaped or mis-typed tensor; group size other than 64 (INT4) / 16 (NVFP4); rank not a multiple of 16 or disagreeing with the declaration |
-| rotation | `input_rotation` declaration + root `nunchaku_lite.input_rotation` marker (or a version 2 manifest declaring it, which must agree) | marker without declaration, declaration without marker, rotated non-targets, marker under the native prefix, NVFP4 rotation unless `allow_fp4_rotation`, legacy `.input_transform` tensors |
-| `smooth_factor_orig` | dropped (reported as consumed) | — |
+* each target's tensors (names, shapes, dtypes, group size) are checked against an empty `SVDQW4A4Linear` built for
+  that layer, so the layer class is the only definition; floating tensors may be bf16, fp16 or fp32 (cast on load),
+  int8 and fp8 tensors must match exactly;
+* the `quantization_config` lookup (safetensors metadata, else a sibling `config.json`) and the GPU support rules come
+  from `nunchaku_lite.checkpoint_config`, and the rotation rules from `nunchaku_lite.rotation_loader`, both shared with
+  `patch_transformer`;
+* the key layout is the caller's (`key_prefix`); the rotation marker is always a root key.
 
-Invariants (tested): every target is swapped exactly once and atomically; bound tensors are bit-exact (int8/fp8) or
-cast once to the layer dtype; `wtscale` is a float32 buffer that a module-wide `.to(dtype)` does not change, and the
-GEMM reads it once per load; nothing stays on the meta device; casts never change `int8`/`fp8` tensors.
+Only `svdq_w4a4` targets are supported here; checkpoints with other ops or structural patches need a model adapter.
