@@ -153,27 +153,25 @@ Lightricks' files run through ComfyUI's `comfy-kitchen` kernels in this pipeline
 
 ## Lower VRAM: quantized text encoder
 
-After the transformer, the biggest component is the Gemma 4 12B text encoder (22.3 GiB in bf16). Loading it with
-bitsandbytes (`pip install bitsandbytes`) cuts the pipeline's peak VRAM. Replace the `"text_encoder"` entry of the
-example and skip it when moving components to the GPU (bitsandbytes places it at load time):
+After the transformer, the biggest component is the Gemma 4 12B text encoder (22.3 GiB in bf16).
+`load_text_encoder_bnb` loads it with bitsandbytes NF4 or 8-bit weights, already on the GPU (`pip install
+"nunchaku-lite[bnb]"`). Replace the `"text_encoder"` entry of the example, and skip it when moving components to the
+GPU:
 
 ```python
-from transformers import BitsAndBytesConfig
+from nunchaku_lite.text_encoders import load_text_encoder_bnb
 
-skip = ["vision_embedder", "embed_vision", "embed_audio", "lm_head"]  # quantize the text decoder layers only
-quantization_config = BitsAndBytesConfig(
-    load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16, llm_int8_skip_modules=skip
-)  # or BitsAndBytesConfig(load_in_8bit=True, llm_int8_skip_modules=skip)
-components["text_encoder"] = AutoModelForImageTextToText.from_pretrained(
-    os.path.join(model_dir, "text_encoder"), torch_dtype=torch.bfloat16,
-    quantization_config=quantization_config, device_map={"": device},
-)
+components["text_encoder"] = load_text_encoder_bnb(
+    AutoModelForImageTextToText, os.path.join(model_dir, "text_encoder"), quantization="nf4", device=device
+)  # or quantization="int8"
 
 # step 3: move everything else
 for name, component in pipe.components.items():
     if isinstance(component, torch.nn.Module) and name != "text_encoder":
         component.to(device)
 ```
+
+Only the text decoder layers are quantized; the vision and audio towers and the LM head stay bf16.
 
 RTX PRO 6000, NVFP4 transformer, everything on the GPU, 768x512x121:
 
