@@ -8,8 +8,10 @@ import torch
 from torch import nn
 
 from ..core import PatchOptions, register_adapter
-from ..linear import AWQW4A16Linear, SVDQW4A4Linear
+from ..linear import SVDQ_GROUP_SIZE, AWQW4A16Linear, SVDQW4A4Linear
 from ..manifest import RuntimeManifest, RuntimeManifestTarget, parse_runtime_manifest
+from ..rotation_loader import resolve_input_rotation
+from ..utils import module_device as _module_device
 from .common import SVDQPatchContext, _mark_patched_module, finalize_svdq_checkpoint, prepare_transformer_dtype
 
 
@@ -17,6 +19,8 @@ class ManifestAdapter:
     """Generic adapter driven by ``quantization_config.runtime_manifest``."""
 
     target = "manifest"
+    # Rotations declared at model level (target-list checkpoints) are bound by core after patching.
+    supports_input_rotation = True
 
     def matches(self, transformer: torch.nn.Module) -> bool:
         """The manifest adapter is selected from checkpoint metadata, not model type."""
@@ -38,10 +42,16 @@ class ManifestAdapter:
             raise ValueError("target='manifest' requires quantization_config.runtime_manifest metadata.")
 
         context = _manifest_context(transformer, manifest, options)
+        allow_fp4_rotation = bool(options.adapter_options.get("allow_fp4_rotation", False))
+        # Resolve every rotation before touching the model, so a bad checkpoint fails cleanly.
+        input_rotations = {
+            target.checkpoint_prefix: resolve_input_rotation(target, allow_fp4=allow_fp4_rotation)
+            for target in manifest.targets
+        }
         prepare_transformer_dtype(transformer, context)
         _apply_structural_patches(transformer, manifest)
         for target in manifest.targets:
-            _replace_target(transformer, target, context)
+            _replace_target(transformer, target, context, input_rotation=input_rotations[target.checkpoint_prefix])
 
         finalize_svdq_checkpoint(transformer, checkpoint_state, context)
         transformer._nunchaku_lite_runtime_manifest = manifest
@@ -209,7 +219,13 @@ def _apply_structural_patches(transformer: nn.Module, manifest: RuntimeManifest)
             _set_submodule(transformer, module_name, _mark_manifest_replacement(replacement))
 
 
-def _replace_target(transformer: nn.Module, target: RuntimeManifestTarget, context: SVDQPatchContext) -> None:
+def _replace_target(
+    transformer: nn.Module,
+    target: RuntimeManifestTarget,
+    context: SVDQPatchContext,
+    *,
+    input_rotation: str | None = None,
+) -> None:
     for source_module in target.source_modules:
         try:
             transformer.get_submodule(source_module)
@@ -244,6 +260,7 @@ def _replace_target(transformer: nn.Module, target: RuntimeManifestTarget, conte
             precision=target.runtime_precision,
             torch_dtype=context.torch_dtype,
             device=_module_device(module),
+            input_rotation=input_rotation,
         )
     elif target.nunchaku_op == "awq_w4a16":
         if target.precision != "int4":
@@ -298,7 +315,7 @@ def _mark_manifest_replacement(module: nn.Module) -> nn.Module:
 
 
 def _validate_svdq_group_size(target: RuntimeManifestTarget) -> None:
-    expected = 16 if target.precision == "fp4" else 64
+    expected = SVDQ_GROUP_SIZE[target.runtime_precision]
     if target.group_size != expected:
         raise ValueError(
             f"svdq_w4a4 target {target.checkpoint_prefix!r} precision={target.precision!r} "
@@ -359,16 +376,6 @@ def _set_submodule(root: nn.Module, path: str, replacement: nn.Module) -> None:
         parent[int(child_name)] = replacement
     else:
         setattr(parent, child_name, replacement)
-
-
-def _module_device(module: nn.Module) -> torch.device:
-    parameter = next(module.parameters(recurse=False), None)
-    if parameter is not None:
-        return parameter.device
-    parameter = next(module.parameters(), None)
-    if parameter is not None:
-        return parameter.device
-    return torch.device("cpu")
 
 
 def _bind_manifest_runtime_apis(transformer: nn.Module) -> None:

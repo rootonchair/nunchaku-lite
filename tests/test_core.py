@@ -324,19 +324,35 @@ def test_patch_transformer_rejects_precision_checkpoint_mismatch(tmp_path, monke
 
 
 def test_patch_scale_key_materializes_missing_fp4_scales_from_meta():
+    from nunchaku_lite.linear import SVDQW4A4Linear
     from nunchaku_lite.utils import patch_scale_key
 
-    with torch.device("meta"):
-        module = torch.nn.Module()
-        module.proj = torch.nn.Module()
-        module.proj.wcscales = torch.nn.Parameter(torch.empty(4, dtype=torch.bfloat16), requires_grad=False)
+    module = torch.nn.Module()
+    module.proj = SVDQW4A4Linear(128, 4 * 32, rank=16, precision="nvfp4", device="meta")
     state = {}
 
     patch_scale_key(module, state)
 
-    assert state["proj.wcscales"].device.type == "cpu"
-    assert state["proj.wcscales"].dtype == torch.bfloat16
-    assert torch.equal(state["proj.wcscales"], torch.ones(4, dtype=torch.bfloat16))
+    wcscales = module.proj.wcscales
+    assert wcscales.device.type == "cpu" and wcscales.dtype == torch.bfloat16
+    assert torch.equal(wcscales, torch.ones(128, dtype=torch.bfloat16))
+    assert "proj.wcscales" not in module.state_dict() and state == {}  # a strict load does not expect it
+
+
+def test_patch_scale_key_keeps_checkpoint_wtscale_as_float32_buffer():
+    from nunchaku_lite.linear import SVDQW4A4Linear
+    from nunchaku_lite.utils import patch_scale_key
+
+    module = torch.nn.Module()
+    module.proj = SVDQW4A4Linear(128, 128, rank=16, precision="nvfp4", device="meta")
+    module.other = SVDQW4A4Linear(128, 128, rank=16, precision="nvfp4", device="meta")
+    state = {"proj.wtscale": torch.tensor([0.25], dtype=torch.bfloat16), "proj.wcscales": torch.ones(128)}
+
+    patch_scale_key(module, state)
+
+    assert "wtscale" in module.proj._buffers and module.proj.wtscale.dtype == torch.float32
+    assert state["proj.wtscale"].dtype == torch.float32 and "proj.wtscale" in module.state_dict()
+    assert module.other.wtscale == 1.0  # no wtscale in the file: the plain default
 
 
 def test_materialize_known_meta_tensors_rebuilds_qwen_rope_attributes():

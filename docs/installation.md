@@ -51,7 +51,7 @@ pip install ./nunchaku-lite-kernels
 
 At runtime, `nunchaku_lite` prefers a locally installed
 `nunchaku_lite_kernels` package. If it is not installed, the op wrappers load
-`rootonchair/nunchaku-lite-kernels` with `kernels.get_kernel(..., version=2)`.
+`rootonchair/nunchaku-lite-kernels` with `kernels.get_kernel(..., version=3)`.
 
 The Hugging Face kernel package lists support for CUDA `7.5`, `8.0`, `8.6`,
 `8.9`, `12.0a`, and `12.1a`.

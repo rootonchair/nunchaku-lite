@@ -24,6 +24,28 @@ std::vector<torch::Tensor> fused_cross_head_qk_norm_rope(torch::Tensor q,
                                                          double eps,
                                                          bool interleaved);
 
+void per_head_qk_norm_rope3d_(torch::Tensor q,
+                              torch::Tensor k,
+                              std::optional<torch::Tensor> q_weight,
+                              std::optional<torch::Tensor> k_weight,
+                              torch::Tensor cos_t,
+                              torch::Tensor sin_t,
+                              torch::Tensor cos_h,
+                              torch::Tensor sin_h,
+                              torch::Tensor cos_w,
+                              torch::Tensor sin_w,
+                              double q_scale,
+                              double eps);
+
+torch::Tensor add_rmsnorm_modulate_(torch::Tensor x,
+                                    torch::Tensor residual,
+                                    std::optional<torch::Tensor> weight,
+                                    torch::Tensor one_plus_scale,
+                                    torch::Tensor shift,
+                                    double eps);
+
+torch::Tensor silu_mul(torch::Tensor gate_up);
+
 torch::Tensor fused_rms_norm_modulate(torch::Tensor x,
                                       std::optional<torch::Tensor> norm_weight,
                                       torch::Tensor scale,
@@ -114,6 +136,25 @@ inline void quantize_w4a4_act_fuse_lora(std::optional<torch::Tensor> input,
                                                    as_tensor(smooth),
                                                    fuse_glu,
                                                    fp4);
+}
+
+inline void quantize_w4a4_act_hadamard_fuse_lora(std::optional<torch::Tensor> input,
+                                                 std::optional<torch::Tensor> output,
+                                                 std::optional<torch::Tensor> oscales,
+                                                 std::optional<torch::Tensor> lora_down,
+                                                 std::optional<torch::Tensor> lora_act_out,
+                                                 std::optional<torch::Tensor> smooth,
+                                                 bool fuse_glu,
+                                                 bool fp4) {
+    TorchOpContext ctx;
+    nunchaku::kernels::quantize_w4a4_act_hadamard_fuse_lora(as_tensor(input),
+                                                            as_tensor(output),
+                                                            as_tensor(oscales),
+                                                            as_tensor(lora_down),
+                                                            as_tensor(lora_act_out),
+                                                            as_tensor(smooth),
+                                                            fuse_glu,
+                                                            fp4);
 }
 
 inline torch::Tensor gemv_awq(torch::Tensor in_feats,

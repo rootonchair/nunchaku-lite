@@ -2,7 +2,6 @@
 
 import importlib
 import inspect
-import json
 import os
 import warnings
 from dataclasses import dataclass, field
@@ -11,8 +10,20 @@ from typing import Any, Protocol
 
 import torch
 
-from .manifest import RuntimeManifest, parse_runtime_manifest, with_target_list_manifest
-from .utils import fetch_or_download, get_precision, load_state_dict_in_safetensors
+from .checkpoint_config import check_device_precision
+from .checkpoint_config import parse_json_metadata as _parse_json_metadata
+from .checkpoint_config import sibling_quantization_config as _sibling_quantization_config
+from .manifest import ROTATION_MARKER_KEY, RuntimeManifest, parse_runtime_manifest, with_target_list_manifest
+from .rotation_loader import (
+    bind_input_rotations,
+    check_rotation_runtime,
+    mark_rotated_targets,
+    refuse_legacy_transform_tensors,
+    resolve_input_rotation,
+    resolve_rotated_targets,
+    validate_declared_targets,
+)
+from .utils import get_precision, load_state_dict_in_safetensors
 
 
 @dataclass
@@ -465,6 +476,11 @@ def _patch_component(
         )
     _ensure_builtin_adapters()
 
+    if getattr(transformer, "_nunchaku_lite_patch_failed", False):
+        raise RuntimeError(
+            "This transformer was partially patched by a load that failed after it started modifying the model; "
+            "its layers and forward may be in an inconsistent state. Create a new transformer and load again."
+        )
     existing_target = getattr(transformer, "_nunchaku_lite_target", None)
     if getattr(transformer, "_nunchaku_lite_patched", False):
         if target == "auto" or target == existing_target:
@@ -475,6 +491,9 @@ def _patch_component(
     quantization_config = _parse_json_metadata(metadata, "quantization_config") or _sibling_quantization_config(
         checkpoint
     )
+    # Rotation needs a manifest stored in the checkpoint: loaders that predate rotation ignore
+    # model-level declarations and synthesize v1 manifests from target lists themselves.
+    has_stored_manifest = "runtime_manifest" in quantization_config
     quantization_config = with_target_list_manifest(quantization_config, state_dict.keys())
     runtime_manifest = parse_runtime_manifest(quantization_config)
     if "rank" not in quantization_config:
@@ -486,6 +505,16 @@ def _patch_component(
     adapter = _select_adapter_for_checkpoint(transformer, target, runtime_manifest)
     normalized_precision = _normalize_precision(precision, device, checkpoint, runtime_manifest)
     _validate_quantization_compatibility(quantization_config, normalized_precision, device, checkpoint)
+    rotation_targets = _check_rotation_support(
+        adapter,
+        transformer,
+        state_dict,
+        quantization_config,
+        runtime_manifest if has_stored_manifest else None,
+        precision=normalized_precision,
+        device=device,
+        allow_fp4=bool((adapter_options or {}).get("allow_fp4_rotation", False)),
+    )
     options = PatchOptions(
         precision=normalized_precision,
         torch_dtype=torch_dtype,
@@ -495,18 +524,28 @@ def _patch_component(
         backend=backend,
     )
 
-    maybe_state_dict = adapter.patch(transformer, state_dict, quantization_config, options)
-    if maybe_state_dict is not None:
-        state_dict = maybe_state_dict
+    # Everything above only reads; from here on the transformer is modified. If anything fails,
+    # mark it so a retry on the same object is refused instead of building on a half-patched model
+    # (stale layers, rotations or forward wrappers).
+    try:
+        maybe_state_dict = adapter.patch(transformer, state_dict, quantization_config, options)
+        if maybe_state_dict is not None:
+            state_dict = maybe_state_dict
+        if rotation_targets is not None:
+            # The adapter has renamed the target markers to module paths along with the checkpoint keys.
+            bind_input_rotations(transformer, state_dict, rotation_targets)
 
-    if assign:
-        _coerce_state_dict_for_assign(transformer, state_dict)
-    incompatible = transformer.load_state_dict(state_dict, strict=strict, assign=assign)
-    _materialize_known_meta_tensors(transformer)
-    if device is not None:
-        transformer.to(device)
-    configure_backend(transformer, backend)
-    _install_mps_attention(transformer)
+        if assign:
+            _coerce_state_dict_for_assign(transformer, state_dict)
+        incompatible = transformer.load_state_dict(state_dict, strict=strict, assign=assign)
+        _materialize_known_meta_tensors(transformer)
+        if device is not None:
+            transformer.to(device)
+        configure_backend(transformer, backend)
+        _install_mps_attention(transformer)
+    except BaseException:  # includes KeyboardInterrupt mid-load; only sets a flag and re-raises
+        transformer._nunchaku_lite_patch_failed = True
+        raise
 
     transformer._nunchaku_lite_patched = True
     transformer._nunchaku_lite_target = adapter.target
@@ -683,32 +722,6 @@ def _coerce_state_dict_for_assign(module: torch.nn.Module, state_dict: dict[str,
         state_dict[key] = value.to(dtype=expected.dtype)
 
 
-def _sibling_quantization_config(checkpoint: str | os.PathLike) -> dict[str, Any]:
-    """``quantization_config`` from the ``config.json`` next to a checkpoint file (Diffusers-format repos that keep it
-    there instead of in the safetensors metadata); ``{}`` when there is none."""
-
-    from huggingface_hub.errors import EntryNotFoundError
-
-    sibling = Path(checkpoint).parent / "config.json"
-    try:
-        if Path(checkpoint).exists():  # local file: never fall through to a Hub download
-            if not sibling.is_file():
-                return {}
-            config_path = sibling
-        else:  # Hub reference ``org/repo/.../file.safetensors``
-            config_path = fetch_or_download(sibling)
-        value = json.loads(Path(config_path).read_text()).get("quantization_config")
-    except json.JSONDecodeError as exc:
-        warnings.warn(f"Ignoring malformed {sibling} ({exc}).", stacklevel=3)
-        return {}
-    except (EntryNotFoundError, FileNotFoundError, ValueError):  # no config.json (ValueError: not a Hub path)
-        return {}
-    except Exception as exc:  # noqa: BLE001 - e.g. network or auth errors: continue without, but say so
-        warnings.warn(f"Could not read {sibling} for checkpoint metadata ({exc}); continuing without it.", stacklevel=3)
-        return {}
-    return value if isinstance(value, dict) else {}
-
-
 def _infer_svdq_rank(state_dict: dict[str, torch.Tensor]) -> int | None:
     """The low-rank branch rank of a lite-format checkpoint (``*.proj_down`` is ``(in_features, rank)``).
 
@@ -716,7 +729,13 @@ def _infer_svdq_rank(state_dict: dict[str, torch.Tensor]) -> int | None:
     ``transformer/config.json``; without it, a rank-64 checkpoint would be patched with the default rank 32.
     """
 
-    ranks = {int(v.shape[1]) for k, v in state_dict.items() if k.endswith(".proj_down") and v.ndim == 2}
+    from .linear import SVDQ_RANK_TENSOR, SVDQW4A4Linear
+
+    ranks = {
+        SVDQW4A4Linear.checkpoint_rank(tuple(v.shape))
+        for k, v in state_dict.items()
+        if k.endswith(f".{SVDQ_RANK_TENSOR}") and v.ndim == 2
+    }
     if not ranks:
         return None
     if len(ranks) > 1:
@@ -724,33 +743,6 @@ def _infer_svdq_rank(state_dict: dict[str, torch.Tensor]) -> int | None:
             f"Checkpoint low-rank branches have mixed ranks {sorted(ranks)}; using {max(ranks)}.", stacklevel=3
         )
     return max(ranks)
-
-
-def _parse_json_metadata(metadata: dict[str, str] | None, key: str) -> dict[str, Any]:
-    """Decode a JSON object from safetensors metadata.
-
-    Args:
-        metadata: Metadata dictionary returned by safetensors, or ``None``.
-        key: Metadata key to decode.
-
-    Returns:
-        Parsed JSON object. Missing metadata returns an empty dict.
-
-    Raises:
-        ValueError: If the metadata value is not valid JSON or does not decode
-            to an object.
-    """
-
-    if not metadata:
-        return {}
-    raw = metadata.get(key, "{}")
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid JSON in checkpoint metadata field {key!r}: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise TypeError(f"Checkpoint metadata field {key!r} must decode to a JSON object.")
-    return parsed
 
 
 def _normalize_precision(
@@ -796,28 +788,7 @@ def _validate_quantization_compatibility(
             f"Use a {requested} checkpoint or set precision={actual!r}."
         )
 
-    if not torch.cuda.is_available():
-        return
-    target_device = torch.device(device or "cuda")
-    if target_device.type != "cuda":
-        return
-    device_index = 0 if target_device.index is None else target_device.index
-    capability = torch.cuda.get_device_capability(device_index)
-    sm = capability[0] * 10 + capability[1]
-    if sm >= 100 and checkpoint_precision != "nvfp4":
-        warnings.warn(
-            "INT4 quantization on Blackwell GPUs may be slower than FP4. "
-            "Use an FP4 checkpoint for best performance when one is available.",
-            UserWarning,
-            stacklevel=3,
-        )
-        return
-    if sm in {75, 80, 86, 89} and checkpoint_precision != "int4":
-        raise ValueError('Please use "int4" quantization for Turing, Ampere, and Ada GPUs.')
-    if sm not in {75, 80, 86, 89} and sm < 100:
-        raise ValueError(
-            f"Unsupported GPU architecture sm{sm}; Nunchaku Lite requires Turing, Ampere, Ada, or Blackwell."
-        )
+    check_device_precision(checkpoint_precision, device, stacklevel=3)
 
 
 def _precision_from_quantization_config(quantization_config: dict[str, Any]) -> str | None:
@@ -840,6 +811,73 @@ def _precision_from_quantization_config(quantization_config: dict[str, Any]) -> 
     if weight_dtype == "fp4_e2m1_all":
         return "nvfp4"
     return None
+
+
+def _check_rotation_support(
+    adapter: TransformerAdapter,
+    transformer: torch.nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    quantization_config: dict[str, Any],
+    stored_manifest: RuntimeManifest | None,
+    *,
+    precision: str,
+    device: str | torch.device | None,
+    allow_fp4: bool,
+) -> tuple[str, ...] | None:
+    """Refuse checkpoints whose activation rotation cannot be honoured, before patching.
+
+    Rotation is declared either per target in a ``nunchaku_format_version`` 2 runtime manifest
+    stored in the checkpoint (``stored_manifest``; not one synthesized from target lists), or in
+    the model-level ``input_rotation`` declaration together with the ``ROTATION_MARKER_KEY``
+    tensor. Both make loaders that predate rotation refuse the checkpoint. When both a manifest
+    and a declaration are present they must agree.
+
+    Loading rotated weights without binding the rotation would silently give wrong outputs, so
+    every check that does not need the patched model runs here. Unless the manifest adapter binds
+    manifest rotations itself, marks the rotated targets in ``state_dict`` and returns them; the
+    caller binds them with :func:`~nunchaku_lite.rotation_loader.bind_input_rotations` after patching.
+    """
+
+    refuse_legacy_transform_tensors(state_dict)
+    targets = resolve_rotated_targets(
+        quantization_config, has_marker=ROTATION_MARKER_KEY in state_dict, stored_manifest=stored_manifest
+    )
+    if targets is None:
+        return None
+    manifest_rotated = targets if stored_manifest is not None and stored_manifest.rotated_targets else ()
+    check_rotation_runtime(_rotation_device(device, transformer))
+
+    if adapter.target == "manifest" and manifest_rotated:
+        # The manifest adapter binds these per target itself; refuse NVFP4 here, before patching.
+        for rotated in stored_manifest.rotated_targets:
+            resolve_input_rotation(rotated, allow_fp4=allow_fp4)
+        state_dict.pop(ROTATION_MARKER_KEY, None)
+        return None
+    if not getattr(adapter, "supports_input_rotation", False):
+        raise ValueError(f"Checkpoint uses activation rotation, which adapter {adapter.target!r} does not support.")
+    validate_declared_targets(state_dict, targets, is_fp4=precision == "nvfp4", allow_fp4=allow_fp4)
+    state_dict.pop(ROTATION_MARKER_KEY, None)
+    mark_rotated_targets(state_dict, targets)
+    return targets
+
+
+def _rotation_device(device: str | torch.device | None, transformer: torch.nn.Module) -> torch.device:
+    """Device a rotated checkpoint will run on, for the load-time support check.
+
+    With no explicit ``device``, a transformer still on CPU or meta is assumed to run on the
+    available accelerator, which is where the quantized kernels run.
+    """
+
+    if device is not None:
+        return torch.device(device)
+    current = next(iter(transformer.parameters()), torch.empty(0)).device
+    if current.type not in ("cpu", "meta"):
+        return current
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return current
 
 
 def _select_adapter_for_checkpoint(

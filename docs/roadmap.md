@@ -22,6 +22,7 @@ full `nunchaku` package.
 | Qwen-Image and Qwen-Image-Edit | `QwenImageTransformer2DModel` | `qwen_image` | Yes |
 | SDXL and SDXL-Turbo | `UNet2DConditionModel` | `sdxl` | Not yet |
 | Z-Image Turbo | `ZImageTransformer2DModel` | `z_image` | Yes |
+| LTX-2 / LTX-2.5 (preview) | `LTX2VideoTransformer3DModel` | `ltx2` | Not yet |
 
 Additional model families should be added through the common adapter registry
 rather than through pipeline-specific subclasses.

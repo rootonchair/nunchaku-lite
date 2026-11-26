@@ -99,6 +99,18 @@ void dispatch_quantize_w4a4_act_fuse_lora(OptionalTensor input,
         input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4);
 }
 
+void dispatch_quantize_w4a4_act_hadamard_fuse_lora(OptionalTensor input,
+                                                   OptionalTensor output,
+                                                   OptionalTensor oscales,
+                                                   OptionalTensor lora_down,
+                                                   OptionalTensor lora_act_out,
+                                                   OptionalTensor smooth,
+                                                   bool fuse_glu,
+                                                   bool fp4) {
+    nunchaku_lite::ops::quantize_w4a4_act_hadamard_fuse_lora(
+        input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4);
+}
+
 torch::Tensor dispatch_fused_rms_norm_modulate(torch::Tensor x,
                                                OptionalTensor norm_weight,
                                                torch::Tensor scale,
@@ -154,6 +166,35 @@ std::vector<torch::Tensor> dispatch_fused_cross_head_qk_norm_rope(torch::Tensor 
                                                              interleaved);
 }
 
+void dispatch_per_head_qk_norm_rope3d_(torch::Tensor q,
+                                       torch::Tensor k,
+                                       OptionalTensor q_weight,
+                                       OptionalTensor k_weight,
+                                       torch::Tensor cos_t,
+                                       torch::Tensor sin_t,
+                                       torch::Tensor cos_h,
+                                       torch::Tensor sin_h,
+                                       torch::Tensor cos_w,
+                                       torch::Tensor sin_w,
+                                       double q_scale,
+                                       double eps) {
+    nunchaku_lite::ops::per_head_qk_norm_rope3d_(
+        q, k, q_weight, k_weight, cos_t, sin_t, cos_h, sin_h, cos_w, sin_w, q_scale, eps);
+}
+
+torch::Tensor dispatch_add_rmsnorm_modulate_(torch::Tensor x,
+                                             torch::Tensor residual,
+                                             OptionalTensor weight,
+                                             torch::Tensor one_plus_scale,
+                                             torch::Tensor shift,
+                                             double eps) {
+    return nunchaku_lite::ops::add_rmsnorm_modulate_(x, residual, weight, one_plus_scale, shift, eps);
+}
+
+torch::Tensor dispatch_silu_mul(torch::Tensor gate_up) {
+    return nunchaku_lite::ops::silu_mul(gate_up);
+}
+
 } // namespace
 #endif // NUNCHAKU_LITE_METAL_BUILD
 
@@ -173,6 +214,9 @@ TORCH_LIBRARY(nunchaku_lite_kernels, ops) {
     ops.def("quantize_w4a4_act_fuse_lora(Tensor? input, Tensor(a!)? output, "
             "Tensor(b!)? oscales, Tensor? lora_down, Tensor(c!)? lora_act_out, "
             "Tensor? smooth, bool fuse_glu, bool fp4) -> ()");
+    ops.def("quantize_w4a4_act_hadamard_fuse_lora(Tensor? input, Tensor(a!)? output, "
+            "Tensor(b!)? oscales, Tensor? lora_down, Tensor(c!)? lora_act_out, "
+            "Tensor? smooth, bool fuse_glu, bool fp4) -> ()");
     ops.def("fused_rms_norm_modulate(Tensor x, Tensor? norm_weight, Tensor scale, "
             "Tensor shift, float eps) -> Tensor");
     ops.def("fused_affine_modulate(Tensor x, Tensor scale, Tensor shift) -> Tensor");
@@ -188,6 +232,12 @@ TORCH_LIBRARY(nunchaku_lite_kernels, ops) {
             "Tensor? k_weight, Tensor? q_cos, Tensor? q_sin, Tensor? k_cos, "
             "Tensor? k_sin, int q_heads, int k_heads, int head_dim, float eps, "
             "bool interleaved) -> Tensor[]");
+    ops.def("per_head_qk_norm_rope3d_(Tensor(a!) q, Tensor(b!) k, Tensor? q_weight, Tensor? k_weight, "
+            "Tensor cos_t, Tensor sin_t, Tensor cos_h, Tensor sin_h, Tensor cos_w, Tensor sin_w, "
+            "float q_scale, float eps) -> ()");
+    ops.def("add_rmsnorm_modulate_(Tensor(a!) x, Tensor residual, Tensor? weight, Tensor one_plus_scale, "
+            "Tensor shift, float eps) -> Tensor");
+    ops.def("silu_mul(Tensor gate_up) -> Tensor");
     // SVDQ W8A8 / W4A8 ops (MPS backend; Neural Accelerator int8 matmul on M5-class GPUs).
     ops.def("svdq_quantize_act_int8(Tensor x, Tensor inv_smooth, float shift) -> (Tensor, Tensor)");
     ops.def("svdq_gemm_w8a8(Tensor a, Tensor w8, Tensor ascale, Tensor wsc, Tensor lact, "
@@ -205,6 +255,7 @@ TORCH_LIBRARY(nunchaku_lite_kernels, ops) {
 #if defined(NUNCHAKU_LITE_REGISTER_CUDA_DISPATCH) || defined(CUDA_KERNEL) || defined(ROCM_KERNEL)
     ops.impl("gemm_w4a4", torch::kCUDA, &dispatch_gemm_w4a4);
     ops.impl("quantize_w4a4_act_fuse_lora", torch::kCUDA, &dispatch_quantize_w4a4_act_fuse_lora);
+    ops.impl("quantize_w4a4_act_hadamard_fuse_lora", torch::kCUDA, &dispatch_quantize_w4a4_act_hadamard_fuse_lora);
     ops.impl("fused_rms_norm_modulate", torch::kCUDA, &dispatch_fused_rms_norm_modulate);
     ops.impl("fused_affine_modulate", torch::kCUDA, &dispatch_fused_affine_modulate);
     ops.impl("awq_gemm_w4a16_g128_int16", torch::kCUDA, &nunchaku_lite::ops::awq_gemm_w4a16_g128_int16);
@@ -212,6 +263,9 @@ TORCH_LIBRARY(nunchaku_lite_kernels, ops) {
     ops.impl("gemv_awq", torch::kCUDA, &dispatch_gemv_awq);
     ops.impl("attention_fp16", torch::kCUDA, &dispatch_attention_fp16);
     ops.impl("fused_cross_head_qk_norm_rope", torch::kCUDA, &dispatch_fused_cross_head_qk_norm_rope);
+    ops.impl("per_head_qk_norm_rope3d_", torch::kCUDA, &dispatch_per_head_qk_norm_rope3d_);
+    ops.impl("add_rmsnorm_modulate_", torch::kCUDA, &dispatch_add_rmsnorm_modulate_);
+    ops.impl("silu_mul", torch::kCUDA, &dispatch_silu_mul);
 #endif
 
 #ifdef NUNCHAKU_LITE_METAL_BUILD

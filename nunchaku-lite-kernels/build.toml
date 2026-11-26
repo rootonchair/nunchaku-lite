@@ -1,6 +1,6 @@
 [general]
 name = "nunchaku-lite-kernels"
-version = 2
+version = 3
 edition = 6
 license = "Apache-2.0"
 backends = ["cuda", "metal"]
@@ -95,6 +95,8 @@ src = [
     "nunchaku_lite_kernels_cuda/kernels/zgemm/zgemm.h",
     "nunchaku_lite_kernels_cuda/kernels/modulation.cu",
     "nunchaku_lite_kernels_cuda/kernels/cross_head_qk_norm_rope.cu",
+    "nunchaku_lite_kernels_cuda/kernels/per_head_qk_norm_rope3d.cu",
+    "nunchaku_lite_kernels_cuda/kernels/ltx2_decoder_block.cu",
     "nunchaku_lite_kernels_cuda/kernels/awq/gemm_awq.cu",
     "nunchaku_lite_kernels_cuda/kernels/awq/gemm_awq.h",
     "nunchaku_lite_kernels_cuda/kernels/awq/gemv_awq.cu",

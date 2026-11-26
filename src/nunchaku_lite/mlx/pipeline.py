@@ -26,7 +26,7 @@ from . import fused_attention as fa
 from .fused_attention import install_fused_attention
 from .keymap import PrefixMap
 from .linear import AWQW4A16Linear, SVDQW4A4Linear, resolve_backend
-from .manifest import RuntimeManifest, apply_runtime_manifest, parse_runtime_manifest
+from .manifest import RuntimeManifest, apply_runtime_manifest, parse_runtime_manifest, refuse_rotated_checkpoint
 from .patch import configure_backend, load_checkpoint, load_dense_weights, svdq_layer_from_state
 
 __all__ = [
@@ -122,6 +122,7 @@ def load_nunchaku_pipeline(
     resolve_backend(backend)  # validate before loading anything
     state, quantization_config = load_checkpoint(checkpoint, return_quantization_config=True)
     manifest = parse_runtime_manifest(quantization_config, checkpoint_keys=state)
+    refuse_rotated_checkpoint(manifest, quantization_config, state)
     if manifest is not None and manifest.precision == "fp4":
         raise NotImplementedError("NVFP4 (fp4) checkpoints are not supported on MLX yet; use an INT4 checkpoint.")
     if load_base_transformer:

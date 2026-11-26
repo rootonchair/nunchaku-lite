@@ -1,7 +1,10 @@
+import inspect
 import json
+import types
 from types import SimpleNamespace
 from typing import ClassVar
 
+import pytest
 import torch
 from diffusers import LTX2VideoTransformer3DModel
 from safetensors.torch import save_file
@@ -248,3 +251,211 @@ def test_ltx2_residual_gate_torch_path_broadcasts_batch_channel_gate():
     output = ltx2_adapter._residual_gate(residual, gate, branch)
 
     torch.testing.assert_close(output, residual + gate.unsqueeze(1) * branch)
+
+
+# --- LTX-2.5 compatibility and INT4 fused-MLP routing --------------------------------------
+
+_LTX25_SUPPORTED = {"ff_bias", "use_prompt_adaln_single", "use_keyframes_abs_pos_embedding"} <= set(
+    inspect.signature(LTX2VideoTransformer3DModel.__init__).parameters
+)
+requires_ltx25_diffusers = pytest.mark.skipif(not _LTX25_SUPPORTED, reason="needs a diffusers version with LTX-2.5")
+
+
+def _ltx25_style_config(use_prompt_adaln_single):
+    # Small version of the LTX-2.5 transformer: prompt cross-attention modulation, no FF biases,
+    # keyframe embedding, with or without the cacheable (static-table) prompt modulation.
+    return {
+        "in_channels": 4,
+        "out_channels": 4,
+        "patch_size": 1,
+        "patch_size_t": 1,
+        "num_attention_heads": 2,
+        "attention_head_dim": 8,
+        "cross_attention_dim": 16,
+        "audio_in_channels": 4,
+        "audio_out_channels": 4,
+        "audio_num_attention_heads": 2,
+        "audio_attention_head_dim": 4,
+        "audio_cross_attention_dim": 8,
+        "num_layers": 2,
+        "qk_norm": "rms_norm_across_heads",
+        "caption_channels": 16,
+        "rope_double_precision": False,
+        "cross_attn_mod": True,
+        "audio_cross_attn_mod": True,
+        "ff_bias": False,
+        "audio_ff_bias": False,
+        "use_prompt_adaln_single": use_prompt_adaln_single,
+        "use_keyframes_abs_pos_embedding": True,
+    }
+
+
+def _ltx2_dummy_inputs(generator):
+    batch, frames, height, width, audio_frames, seq = 2, 2, 16, 16, 9, 16
+    return {
+        "hidden_states": torch.randn((batch, frames * height * width, 4), generator=generator),
+        "audio_hidden_states": torch.randn((batch, audio_frames, 4), generator=generator),
+        "encoder_hidden_states": torch.randn((batch, seq, 16), generator=generator),
+        "audio_encoder_hidden_states": torch.randn((batch, seq, 16), generator=generator),
+        "timestep": torch.rand((batch,), generator=generator) * 1000,
+        "sigma": torch.rand((batch,), generator=generator),
+        "audio_sigma": torch.rand((batch,), generator=generator),
+        "encoder_attention_mask": torch.ones((batch, seq)).bool(),
+        "num_frames": frames,
+        "height": height,
+        "width": width,
+        "audio_num_frames": audio_frames,
+        "fps": 25.0,
+    }
+
+
+@requires_ltx25_diffusers
+@pytest.mark.parametrize("use_prompt_adaln_single", [True, False])
+def test_lite_block_forward_matches_diffusers_for_ltx25_config(use_prompt_adaln_single):
+    # The adapter replaces the block forward with its own copy; it must match diffusers' block,
+    # including the static prompt modulation used when `use_prompt_adaln_single=False`.
+    torch.manual_seed(0)
+    model = LTX2VideoTransformer3DModel(**_ltx25_style_config(use_prompt_adaln_single)).eval()
+    with torch.no_grad():
+        for table in ("prompt_scale_shift_table", "audio_prompt_scale_shift_table"):
+            for block in model.transformer_blocks:
+                getattr(block, table).normal_()  # zero-init by default; make the static table matter
+    inputs = _ltx2_dummy_inputs(torch.Generator().manual_seed(1))
+    with torch.no_grad():
+        expected = model(**inputs, return_dict=False)
+        for block in model.transformer_blocks:
+            block.forward = types.MethodType(_ltx2_block_forward, block)
+        actual = model(**inputs, return_dict=False)
+    for exp, act in zip(expected, actual):
+        torch.testing.assert_close(act, exp, rtol=1e-5, atol=1e-5)
+
+
+@requires_ltx25_diffusers
+def test_ltx25_bias_free_feed_forward_patches_and_loads(tmp_path):
+    rank = 4
+    source = make_tiny_ltx2_transformer(ff_bias=False, audio_ff_bias=False)
+    LTX2Adapter().patch(source, {}, {"rank": rank}, _patch_options(rank))
+    assert source.transformer_blocks[0].ff.net[0].proj.bias is None
+    assert source.transformer_blocks[0].ff.net[2].bias is None
+    checkpoint = tmp_path / "ltx25-lite.safetensors"
+    save_file(source.state_dict(), checkpoint, metadata={"quantization_config": json.dumps({"rank": rank})})
+
+    transformer = make_tiny_ltx2_transformer(ff_bias=False, audio_ff_bias=False)
+    patch_transformer(transformer, checkpoint, target="ltx2", precision="int4", torch_dtype=torch.bfloat16)
+    incompatible = transformer._nunchaku_lite_incompatible_keys
+    assert not incompatible.missing_keys and not incompatible.unexpected_keys
+
+
+@pytest.mark.parametrize("precision,fused", [("nvfp4", True), ("int4", False)])
+def test_ltx2_feed_forward_uses_fused_mlp_only_for_nvfp4(precision, fused):
+    # INT4 LTX exports are unshifted; the fused GELU epilogue assumes a +0.171875 shift folded into
+    # fc2's bias, so INT4 must run unfused. NVFP4 has no shift and keeps the fused kernel.
+    from diffusers.models.attention import FeedForward
+
+    from nunchaku_lite.adapters.common import SVDQPatchContext
+    from nunchaku_lite.adapters.ltx2 import _patch_ltx2_feed_forward, _use_fused_gelu_mlp
+
+    context = SVDQPatchContext(precision=precision, rank=16, torch_dtype=torch.bfloat16)
+    ff = _patch_ltx2_feed_forward(FeedForward(64, activation_fn="gelu-approximate"), context)
+    cuda_like = SimpleNamespace(is_cuda=True)
+    with torch.no_grad():
+        assert _use_fused_gelu_mlp(ff, cuda_like, (), {}) is fused
+    assert not _use_fused_gelu_mlp(ff, SimpleNamespace(is_cuda=False), (), {})
+
+
+# --- activation rotation (hadamard) -----------------------------------------------------------
+
+_LTX2_ROTATED = [
+    "transformer_blocks.0.attn1.to_q",
+    "transformer_blocks.0.attn2.to_k",
+    "transformer_blocks.0.audio_to_video_attn.to_out.0",
+    "transformer_blocks.0.ff.net.0.proj",
+    "transformer_blocks.0.ff.net.2",
+]
+
+
+def _ltx2_rotated_checkpoint(tmp_path, rotated, *, marker=True, declaration=True, precision="int4", rank=4):
+    source = make_tiny_ltx2_transformer()
+    options = _patch_options(rank)
+    options.precision = precision
+    LTX2Adapter().patch(source, {}, {"rank": rank}, options)
+    state = {k: v.contiguous() for k, v in source.state_dict().items()}
+    if marker:
+        state["nunchaku_lite.input_rotation"] = torch.empty(0)
+    config = {"rank": rank}
+    if declaration:
+        config["input_rotation"] = {"format_version": 2, "type": "hadamard", "targets": list(rotated)}
+    path = tmp_path / "ltx2-rotated.safetensors"
+    save_file(state, path, metadata={"quantization_config": json.dumps(config)})
+    return path
+
+
+def _ltx2_is_unpatched(transformer):
+    return not any(isinstance(m, SVDQW4A4Linear) for m in transformer.modules())
+
+
+@pytest.mark.parametrize("target", ["ltx2", "auto"])
+def test_ltx2_marker_checkpoint_binds_rotated_int4_targets(tmp_path, target):
+    path = _ltx2_rotated_checkpoint(tmp_path, _LTX2_ROTATED)
+    transformer = patch_transformer(
+        make_tiny_ltx2_transformer(), path, target=target, precision="int4", torch_dtype=torch.bfloat16, device="cpu"
+    )
+    bound = {n for n, m in transformer.named_modules() if isinstance(m, SVDQW4A4Linear) and m.input_rotation}
+    assert bound == set(_LTX2_ROTATED)
+    assert transformer.transformer_blocks[0].audio_ff.net[2].input_rotation is None
+    assert not transformer._nunchaku_lite_incompatible_keys.unexpected_keys
+    assert not transformer._nunchaku_lite_incompatible_keys.missing_keys
+
+
+def test_ltx2_declaration_without_marker_is_refused_and_leaves_model_unpatched(tmp_path):
+    path = _ltx2_rotated_checkpoint(tmp_path, _LTX2_ROTATED, marker=False)
+    transformer = make_tiny_ltx2_transformer()
+    with pytest.raises(ValueError, match="marker tensor"):
+        patch_transformer(transformer, path, target="ltx2", precision="int4", torch_dtype=torch.bfloat16, device="cpu")
+    assert _ltx2_is_unpatched(transformer)
+
+
+def test_ltx2_nvfp4_fc2_rotation_is_refused_even_with_fp4_opt_in(tmp_path):
+    # NVFP4 fc2 is quantized inside the fused GELU-MLP epilogue, which applies no rotation.
+    path = _ltx2_rotated_checkpoint(tmp_path, ["transformer_blocks.0.ff.net.2"], precision="nvfp4")
+    transformer = make_tiny_ltx2_transformer()
+    with pytest.raises(ValueError, match="fused-MLP"):
+        patch_transformer(
+            transformer,
+            path,
+            target="ltx2",
+            precision="fp4",
+            torch_dtype=torch.bfloat16,
+            device="cpu",
+            adapter_options={"allow_fp4_rotation": True},
+        )
+
+
+@pytest.mark.parametrize(
+    "precision,rotate,fc2_marked_fused,uses_fused",
+    [
+        ("int4", None, False, False),
+        ("int4", "fc1", False, False),
+        ("int4", "fc2", False, False),
+        ("nvfp4", None, True, True),
+        ("nvfp4", "fc1", True, False),
+        ("nvfp4", "fc2", True, False),
+    ],
+)
+def test_ltx2_fused_mlp_decision_table(precision, rotate, fc2_marked_fused, uses_fused):
+    from diffusers.models.attention import FeedForward
+
+    from nunchaku_lite.adapters.common import SVDQPatchContext
+    from nunchaku_lite.adapters.ltx2 import _patch_ltx2_feed_forward, _use_fused_gelu_mlp
+    from nunchaku_lite.ops.fused import FUSED_MLP_FC2_ATTR
+
+    context = SVDQPatchContext(precision=precision, rank=16, torch_dtype=torch.bfloat16)
+    ff = _patch_ltx2_feed_forward(FeedForward(64, activation_fn="gelu-approximate"), context)
+    if rotate == "fc1":
+        ff.net[0].proj.input_rotation = "hadamard"
+    elif rotate == "fc2":
+        ff.net[2].input_rotation = "hadamard"
+    assert getattr(ff.net[2], FUSED_MLP_FC2_ATTR, False) is fc2_marked_fused
+    assert ff.net[2].act_unsigned is False
+    with torch.no_grad():
+        assert _use_fused_gelu_mlp(ff, SimpleNamespace(is_cuda=True), (), {}) is uses_fused

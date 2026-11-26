@@ -166,6 +166,26 @@ text_encoder_2 = NunchakuT5EncoderModel.from_pretrained(
 checkpoints and can be passed manually as a Diffusers pipeline component, such
 as FLUX.1 `text_encoder_2`. The quantized forward path uses CUDA native kernels.
 
+## `load_text_encoder_bnb`
+
+```python
+from transformers import AutoModelForImageTextToText
+from nunchaku_lite.text_encoders import load_text_encoder_bnb
+
+text_encoder = load_text_encoder_bnb(
+    AutoModelForImageTextToText,
+    "path/to/model/text_encoder",
+    quantization="nf4",  # or "int8"
+    device="cuda",
+)
+```
+
+Loads a Hugging Face text encoder with bitsandbytes NF4 or 8-bit weights, placed on the CUDA device (do not call
+`.to()` on it afterwards). Vision/audio towers and the LM head stay in `torch_dtype` (default bf16);
+`skip_modules` changes that list, and other keyword arguments go to `from_pretrained`. Needs
+`pip install "nunchaku-lite[bnb]"`. `bnb_quantization_config(...)` returns the `BitsAndBytesConfig` it uses. See
+[LTX-2.5](models/ltx2.md#lower-vram-quantized-text-encoder) for measured sizes and accuracy.
+
 ## `patch_transformer`
 
 ```python

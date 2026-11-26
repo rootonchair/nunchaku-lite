@@ -153,6 +153,16 @@ def get_precision(
     return "int4"
 
 
+def module_device(module: torch.nn.Module) -> torch.device:
+    """Device of a module's own tensors, else of its children's; CPU when it has none."""
+
+    for tensor in (*module.parameters(recurse=False), *module.buffers(recurse=False)):
+        return tensor.device
+    for tensor in (*module.parameters(), *module.buffers()):
+        return tensor.device
+    return torch.device("cpu")
+
+
 def patch_scale_key(
     transformer_from_config: torch.nn.Module, state_dict_from_checkpoint: dict[str, torch.Tensor]
 ) -> None:
@@ -167,19 +177,20 @@ def patch_scale_key(
         ``None``. The checkpoint state is modified in place.
     """
 
-    state_dict = transformer_from_config.state_dict()
-    for key in state_dict:
-        if key not in state_dict_from_checkpoint:
-            if ".wcscales" not in key:
-                continue
-            scale = state_dict[key]
-            state_dict_from_checkpoint[key] = torch.ones(scale.shape, dtype=scale.dtype, device="cpu")
-
-    from .linear import SVDQW4A4Linear
+    from .linear import SVDQ_CHECKPOINT_SCALARS, SVDQ_DEFAULTED_CHECKPOINT_TENSORS, SVDQW4A4Linear
 
     for name, module in transformer_from_config.named_modules():
-        if isinstance(module, SVDQW4A4Linear) and module.wtscale is not None:
-            module.wtscale = state_dict_from_checkpoint.pop(f"{name}.wtscale", 1.0)
+        if not isinstance(module, SVDQW4A4Linear):
+            continue
+        for tensor in SVDQ_DEFAULTED_CHECKPOINT_TENSORS:
+            if getattr(module, tensor, None) is not None and f"{name}.{tensor}" not in state_dict_from_checkpoint:
+                module.default_missing_tensor(tensor)
+        for scalar in SVDQ_CHECKPOINT_SCALARS:
+            key = f"{name}.{scalar}"
+            if getattr(module, scalar, None) is not None and key in state_dict_from_checkpoint:
+                value = state_dict_from_checkpoint[key]
+                module.use_checkpoint_scalar(scalar, tuple(value.shape))
+                state_dict_from_checkpoint[key] = value.to(torch.float32)
 
 
 def convert_fp16(transformer_from_config: torch.nn.Module, state_dict_from_checkpoint: dict[str, torch.Tensor]) -> None:

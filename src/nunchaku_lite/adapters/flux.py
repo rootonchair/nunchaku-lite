@@ -21,7 +21,7 @@ from torch.nn import GELU as TorchGELU
 
 from ..core import PatchOptions, register_adapter
 from ..linear import DenseRuntimeLoraLinear, SVDQW4A4Linear
-from ..ops.fused import fused_gelu_mlp, fused_qkv_norm_rotary
+from ..ops.fused import FUSED_MLP_FC2_ATTR, fused_gelu_mlp, fused_qkv_norm_rotary
 from .attention_dispatch import dispatch_lite_attention_fn
 from .common import (
     SVDQPatchContext,
@@ -616,6 +616,7 @@ def _patch_flux_feed_forward(ff: nn.Module, context: SVDQPatchContext, **kwargs)
     )
     if len(ff.net) > 2 and isinstance(ff.net[2], SVDQW4A4Linear):
         ff.net[2].act_unsigned = ff.net[2].precision != "nvfp4"
+        setattr(ff.net[2], FUSED_MLP_FC2_ATTR, True)
     return NunchakuFluxFeedForward(ff)
 
 
@@ -743,6 +744,7 @@ class NunchakuFluxSingleTransformerBlock(nn.Module):
         self.act_mlp = block.act_mlp
         self.mlp_fc2 = svdq_from_linear(proj_out, context, in_features=self.mlp_hidden_dim, **kwargs)
         self.mlp_fc2.act_unsigned = self.mlp_fc2.precision != "nvfp4"
+        setattr(self.mlp_fc2, FUSED_MLP_FC2_ATTR, True)
         self.attn = NunchakuFluxAttention(block.attn, context=context, patch_output=False, **kwargs)
         self.attn.to_out = svdq_from_linear(proj_out, context, in_features=self.mlp_fc1.in_features, **kwargs)
         self._nunchaku_lite_flux_block_patched = True

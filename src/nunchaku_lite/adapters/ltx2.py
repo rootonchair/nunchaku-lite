@@ -17,7 +17,9 @@ from torch import nn
 
 from ..core import PatchOptions, register_adapter
 from ..linear import AWQW4A16Linear, SVDQW4A4Linear
+from ..ltx2_conventions import ltx2_gelu_mlp_plan
 from ..ops.fused import (
+    FUSED_MLP_FC2_ATTR,
     fused_affine_modulate,
     fused_cross_head_qk_norm_rope,
     fused_gelu_mlp,
@@ -41,22 +43,39 @@ def _patch_ltx2_feed_forward(ff: FeedForward, context: SVDQPatchContext) -> Feed
     )
     if len(ff.net) > 2 and isinstance(ff.net[2], SVDQW4A4Linear):
         ff.net[2].act_unsigned = False
+        # Only NVFP4 runs fc2 inside the fused GELU-MLP epilogue (see _use_fused_gelu_mlp); INT4 fc2
+        # quantizes its own input on the signed standalone path, so it may carry an input rotation.
+        if context.precision == "nvfp4":
+            setattr(ff.net[2], FUSED_MLP_FC2_ATTR, True)
     ff._nunchaku_lite_ltx2_original_forward = ff.forward
     ff.forward = types.MethodType(_ltx2_feed_forward, ff)
     return ff
 
 
-def _ltx2_feed_forward(self: FeedForward, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-    if (
+def _use_fused_gelu_mlp(ff: FeedForward, hidden_states: torch.Tensor, args: tuple, kwargs: dict) -> bool:
+    """Whether the LTX feed-forward can run through ``fused_gelu_mlp``.
+
+    NVFP4 only. For INT4, fc1's fused epilogue quantizes fc2's input unsigned with the
+    built-in +0.171875 GELU shift, which is only correct when the exporter folded that shift
+    into fc2's bias. LTX exports (data-free and diffuse-compressor) are unshifted, so INT4 runs
+    fc1 -> GELU -> fc2 unfused, where every layer quantizes its own input signed.
+    """
+
+    return (
         hidden_states.is_cuda
         and not torch.is_grad_enabled()
         and not args
         and not kwargs
-        and len(self.net) > 2
-        and isinstance(self.net[0], GELU)
-        and isinstance(getattr(self.net[0], "proj", None), SVDQW4A4Linear)
-        and isinstance(self.net[2], SVDQW4A4Linear)
-    ):
+        and len(ff.net) > 2
+        and isinstance(ff.net[0], GELU)
+        and isinstance(getattr(ff.net[0], "proj", None), SVDQW4A4Linear)
+        and isinstance(ff.net[2], SVDQW4A4Linear)
+        and ltx2_gelu_mlp_plan(ff.net[0].proj, ff.net[2]).fused
+    )
+
+
+def _ltx2_feed_forward(self: FeedForward, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    if _use_fused_gelu_mlp(self, hidden_states, args, kwargs):
         return fused_gelu_mlp(hidden_states, self.net[0].proj, self.net[2])
     return self._nunchaku_lite_ltx2_original_forward(hidden_states, *args, **kwargs)
 
@@ -403,12 +422,26 @@ def _ltx2_block_forward(
     audio_hidden_states = _residual_gate(audio_hidden_states, audio_gate_msa, self.audio_attn1(**audio_self_attn_args))
 
     if self.cross_attn_adaln:
-        video_prompt_ada_params = self.get_mod_params(self.prompt_scale_shift_table, temb_prompt, batch_size)
-        shift_text_kv, scale_text_kv = video_prompt_ada_params
-        audio_prompt_ada_params = self.get_mod_params(
-            self.audio_prompt_scale_shift_table, temb_prompt_audio, batch_size
-        )
-        audio_shift_text_kv, audio_scale_text_kv = audio_prompt_ada_params
+        # `temb_prompt`/`temb_prompt_audio` are None when the model uses `use_prompt_adaln_single=False`
+        # (LTX-2.5 cacheable cross-attention): the prompt-side scale/shift is then the static per-layer table.
+        if temb_prompt is not None:
+            shift_text_kv, scale_text_kv = self.get_mod_params(self.prompt_scale_shift_table, temb_prompt, batch_size)
+        else:
+            shift_text_kv, scale_text_kv = (
+                self.prompt_scale_shift_table[None, None]
+                .to(device=hidden_states.device, dtype=hidden_states.dtype)
+                .unbind(dim=2)
+            )
+        if temb_prompt_audio is not None:
+            audio_shift_text_kv, audio_scale_text_kv = self.get_mod_params(
+                self.audio_prompt_scale_shift_table, temb_prompt_audio, batch_size
+            )
+        else:
+            audio_shift_text_kv, audio_scale_text_kv = (
+                self.audio_prompt_scale_shift_table[None, None]
+                .to(device=audio_hidden_states.device, dtype=audio_hidden_states.dtype)
+                .unbind(dim=2)
+            )
 
     norm_hidden_states = self.norm2(hidden_states)
     if self.video_cross_attn_adaln:
@@ -521,6 +554,9 @@ class LTX2Adapter:
     """Adapter for Diffusers ``LTX2VideoTransformer3DModel`` checkpoints."""
 
     target = "ltx2"
+    # Every SVDQ layer quantizes its own input on the signed standalone path, except NVFP4 fc2, which
+    # is marked FUSED_MLP_FC2_ATTR and refused by the rotation binder.
+    supports_input_rotation = True
 
     def matches(self, transformer: torch.nn.Module) -> bool:
         return isinstance(transformer, LTX2VideoTransformer3DModel)

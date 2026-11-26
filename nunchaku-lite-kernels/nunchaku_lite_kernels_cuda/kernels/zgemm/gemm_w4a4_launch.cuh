@@ -55,7 +55,8 @@ public:
                                             Tensor lora_act_out,
                                             Tensor smooth,
                                             bool fuse_glu,
-                                            bool fp4);
+                                            bool fp4,
+                                            bool hadamard);
     static void quantize_w4a4_act(Tensor input, Tensor output, Tensor oscales);
     static void quantize_w4a4_wgt(Tensor input, Tensor output, Tensor oscales);
 

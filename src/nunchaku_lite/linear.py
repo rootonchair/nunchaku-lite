@@ -6,7 +6,42 @@ from torch import nn
 
 from .ops.gemm import awq_gemm_w4a16_g64_int32, awq_gemm_w4a16_g128_int16, svdq_gemm_w4a4_cuda
 from .ops.gemv import awq_gemv_w4a16_cuda
-from .ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
+from .ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda, svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda
+
+INPUT_ROTATIONS = (None, "hadamard")
+# The SVDQ checkpoint format, defined here once and used by every loading path:
+SVDQ_GROUP_SIZE = {"int4": 64, "nvfp4": 16}  # input channels per weight scale
+SVDQ_RANK_TENSOR = "proj_down"  # (in_features, rank): the tensor that fixes the low-rank branch's rank
+SVDQ_CHECKPOINT_SCALARS = ("wtscale",)  # optional one-element per-tensor scale (NVFP4); absent means 1.0
+SVDQ_DEFAULTED_CHECKPOINT_TENSORS = ("wcscales",)  # parameters a checkpoint may omit (NVFP4 channel scales: ones)
+SVDQ_LEGACY_CHECKPOINT_SUFFIXES = ("smooth_factor_orig",)  # leftover of older exports; every loader drops it
+_ALPHA_CACHE_ATTR = "_nunchaku_lite_alpha_cache"
+# Tensors of SVDQW4A4Linear whose dtype a module-wide cast must not change.
+_CAST_PROTECTED_DTYPES = {"wscales": (torch.float8_e4m3fn,), "wtscale": (torch.float32,)}
+
+
+def wtscale_alpha(module: nn.Module) -> float | torch.Tensor | None:
+    """The NVFP4 per-tensor weight scale to pass to the GEMM as ``alpha``.
+
+    ``wtscale`` is a float, a CPU tensor (set by the Diffusers loader), or, for layers built by
+    :mod:`nunchaku_lite.loader`, a persistent buffer that moves with the module. The native op
+    reads ``alpha`` with ``item()``, so a device-resident buffer would force a host sync on every
+    GEMM (and break CUDA-graph capture): it is read once per (re)load and handed over as a CPU
+    float32 scalar, exactly the value ``item()`` would have read.
+    """
+
+    wtscale = getattr(module, "wtscale", None)
+    if not isinstance(wtscale, torch.Tensor) or wtscale.device.type == "cpu":
+        return wtscale
+    # Inference tensors (models built under torch.inference_mode, as ltx-core does) have no version counter; a
+    # reload still replaces the tensor, so its data pointer alone keys the cache.
+    version = None if wtscale.is_inference() else wtscale._version
+    key = (wtscale.data_ptr(), version, wtscale.dtype)
+    cached = module.__dict__.get(_ALPHA_CACHE_ATTR)
+    if cached is None or cached[0] != key:
+        cached = (key, torch.tensor(float(wtscale.reshape(-1)[0]), dtype=torch.float32))
+        module.__dict__[_ALPHA_CACHE_ATTR] = cached
+    return cached[1]
 
 
 class DenseRuntimeLoraLinear(nn.Linear):
@@ -72,6 +107,7 @@ class SVDQW4A4Linear(nn.Module):
         act_unsigned: bool = False,
         torch_dtype: torch.dtype = torch.bfloat16,
         device: str | torch.device | None = None,
+        input_rotation: str | None = None,
     ):
         """Allocate SVDQ parameter buffers for a quantized linear projection.
 
@@ -86,9 +122,15 @@ class SVDQW4A4Linear(nn.Module):
                 unsigned activations.
             torch_dtype: Runtime dtype for floating-point buffers.
             device: Device for parameter allocation.
+            input_rotation: Online activation rotation the packed weight was
+                exported for: ``None`` or ``"hadamard"`` (blockwise H64/8,
+                applied after smoothing; the low-rank branch stays unrotated).
+                Rotation needs a signed activation path, so it cannot be
+                combined with ``act_unsigned``.
 
         Raises:
-            ValueError: If ``precision`` is unsupported.
+            ValueError: If ``precision`` or ``input_rotation`` is unsupported,
+                or rotation is combined with unsigned activations.
 
         Returns:
             None.
@@ -103,12 +145,9 @@ class SVDQW4A4Linear(nn.Module):
         self.precision = precision
         self.torch_dtype = torch_dtype
 
-        if precision == "nvfp4":
-            self.group_size = 16
-        elif precision == "int4":
-            self.group_size = 64
-        else:
+        if precision not in SVDQ_GROUP_SIZE:
             raise ValueError(f"Invalid precision: {precision}")
+        self.group_size = SVDQ_GROUP_SIZE[precision]
 
         self.qweight = nn.Parameter(
             torch.empty(out_features, in_features // 2, dtype=torch.int8, device=device), requires_grad=False
@@ -142,9 +181,55 @@ class SVDQW4A4Linear(nn.Module):
             self.wtscale = None
             self.wcscales = None
 
+        if input_rotation not in INPUT_ROTATIONS:
+            raise ValueError(f"Invalid input_rotation: {input_rotation!r}; expected one of {INPUT_ROTATIONS}")
+        if input_rotation is not None and act_unsigned:
+            raise ValueError("input_rotation requires signed activations; it cannot be combined with act_unsigned")
         self.act_unsigned = act_unsigned
+        self.input_rotation = input_rotation
         # Quantized-kernel backend on Apple silicon ("auto", "int8", "int4", "dense"); set by patch_transformer.
         self.backend = "auto"
+
+    @staticmethod
+    def checkpoint_dims(shapes: dict[str, tuple[int, ...]]) -> tuple[int, int, int]:
+        """``(in_features, out_features, rank)`` of a layer from its checkpoint tensor shapes (``suffix -> shape``).
+
+        Raises:
+            KeyError: If ``qweight`` or ``proj_down`` is missing.
+            ValueError: If either is not 2-D.
+        """
+
+        qweight, proj_down = shapes["qweight"], shapes[SVDQ_RANK_TENSOR]
+        if len(qweight) != 2 or len(proj_down) != 2:
+            raise ValueError(f"qweight {tuple(qweight)} and {SVDQ_RANK_TENSOR} {tuple(proj_down)} must be 2-D")
+        out_features, packed_in = qweight
+        return 2 * packed_in, out_features, SVDQW4A4Linear.checkpoint_rank(proj_down)
+
+    @staticmethod
+    def checkpoint_rank(proj_down_shape: tuple[int, ...]) -> int:
+        """The low-rank branch rank from the shape of the checkpoint's ``proj_down`` tensor ``(in_features, rank)``."""
+
+        return int(proj_down_shape[1])
+
+    def use_checkpoint_scalar(self, name: str, shape: tuple[int, ...]) -> None:
+        """Hold the checkpoint's per-tensor scale ``name`` (e.g. ``wtscale``) as a persistent float32 buffer, so any
+        state-dict loader fills it and moves keep it on the module's device; without one it stays a plain ``1.0``."""
+
+        if name not in SVDQ_CHECKPOINT_SCALARS or getattr(self, name, None) is None:
+            raise ValueError(f"{self.precision} SVDQ layers have no checkpoint scalar {name!r}.")
+        delattr(self, name)
+        self.register_buffer(name, torch.ones(shape, dtype=torch.float32, device=self.qweight.device), persistent=True)
+
+    def default_missing_tensor(self, name: str) -> None:
+        """Turn parameter ``name``, which the checkpoint omits, into a non-persistent buffer of its default (ones), so a
+        strict loader does not expect it. Built on meta, the buffer is created on the CPU for the caller to move."""
+
+        if name not in SVDQ_DEFAULTED_CHECKPOINT_TENSORS or getattr(self, name, None) is None:
+            raise ValueError(f"{self.precision} SVDQ layers cannot default {name!r}.")
+        old = getattr(self, name)
+        device = torch.device("cpu") if old.device.type == "meta" else old.device
+        delattr(self, name)
+        self.register_buffer(name, torch.ones(old.shape, dtype=old.dtype, device=device), persistent=False)
 
     @classmethod
     def from_linear(cls, linear: nn.Linear, **kwargs):
@@ -184,7 +269,15 @@ class SVDQW4A4Linear(nn.Module):
             activation output.
         """
 
-        return svdq_quantize_w4a4_act_fuse_lora_cuda(
+        if self.input_rotation is not None and self.act_unsigned:
+            # act_unsigned is often set by adapters after construction, so re-check here.
+            raise ValueError("input_rotation requires signed activations; it cannot be combined with act_unsigned")
+        quantize_fn = (
+            svdq_quantize_w4a4_act_hadamard_fuse_lora_cuda
+            if self.input_rotation == "hadamard"
+            else svdq_quantize_w4a4_act_fuse_lora_cuda
+        )
+        return quantize_fn(
             x,
             lora_down=self.proj_down,
             smooth=self.smooth_factor,
@@ -226,7 +319,7 @@ class SVDQW4A4Linear(nn.Module):
             lora_up=self.proj_up,
             bias=self.bias,
             fp4=self.precision == "nvfp4",
-            alpha=self.wtscale,
+            alpha=wtscale_alpha(self),
             wcscales=self.wcscales,
             act_unsigned=self.act_unsigned,
         )
@@ -235,7 +328,24 @@ class SVDQW4A4Linear(nn.Module):
     def _apply(self, fn, recurse=True):
         from .ops.mps import preserve_cache_across_move
 
-        return preserve_cache_across_move(self, lambda: super(SVDQW4A4Linear, self)._apply(fn, recurse))
+        # A dtype cast (module.to(torch.float16), as framework model managers do) must not touch the packed
+        # NVFP4 scales (float8) or a wtscale buffer (float32): they keep their dtype and only move.
+        # detach(): nn.Module._apply rebinds ``param.data`` in place, which would also change a plain reference.
+        kept = {
+            name: tensor.detach()
+            for name, tensor in (("wscales", self.wscales), ("wtscale", getattr(self, "wtscale", None)))
+            if isinstance(tensor, torch.Tensor) and tensor.dtype in _CAST_PROTECTED_DTYPES[name]
+        }
+        result = preserve_cache_across_move(self, lambda: super(SVDQW4A4Linear, self)._apply(fn, recurse))
+        for name, original in kept.items():
+            moved = getattr(self, name)
+            if moved.dtype != original.dtype:
+                restored = original.to(moved.device)
+                if name in self._parameters:
+                    self._parameters[name] = nn.Parameter(restored, requires_grad=False)
+                else:
+                    self._buffers[name] = restored
+        return result
 
     def forward(self, x: torch.Tensor, output: torch.Tensor | None = None) -> torch.Tensor:
         """Apply the quantized projection to a batched sequence tensor.
@@ -273,7 +383,8 @@ class SVDQW4A4Linear(nn.Module):
 
         return (
             f"SVDQW4A4Linear(in_features={self.in_features}, out_features={self.out_features}, "
-            f"rank={self.rank}, precision={self.precision}, act_unsigned={self.act_unsigned})"
+            f"rank={self.rank}, precision={self.precision}, act_unsigned={self.act_unsigned}, "
+            f"input_rotation={self.input_rotation})"
         )
 
 

@@ -39,6 +39,8 @@ Documentation = "https://nunchaku-lite.readthedocs.io/en/latest/"
 Issues = "https://github.com/rootonchair/nunchaku-lite/issues"
 
 [project.optional-dependencies]
+# Quantized text encoders via nunchaku_lite.text_encoders.load_text_encoder_bnb (CUDA).
+bnb = [ "bitsandbytes>=0.45" ]
 # Accepted for compatibility with instructions that use `nunchaku-lite[torch]`; the base install already has torch.
 torch = []
 # MLX runtime (Apple silicon): nunchaku_lite.mlx. Pipelines come from mflux (pip install mflux).

@@ -8,12 +8,20 @@ manifest is parsed by the same code as the PyTorch runtime (:mod:`nunchaku_lite.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from typing import Any
 
 import mlx.core as mx
 from mlx import nn
 
-from ..manifest import RuntimeManifest, RuntimeManifestTarget, parse_runtime_manifest
+from ..manifest import (
+    LEGACY_INPUT_TRANSFORM_SUFFIX,
+    ROTATION_DECLARATION_KEY,
+    ROTATION_MARKER_KEY,
+    RuntimeManifest,
+    RuntimeManifestTarget,
+    parse_runtime_manifest,
+)
 from .linear import AWQW4A16Linear, SVDQW4A4Linear
 
 __all__ = [
@@ -23,7 +31,33 @@ __all__ = [
     "SplitLinearOutput",
     "apply_runtime_manifest",
     "parse_runtime_manifest",
+    "refuse_rotated_checkpoint",
 ]
+
+
+def refuse_rotated_checkpoint(
+    manifest: RuntimeManifest | None, quantization_config: Mapping[str, Any], checkpoint_keys: Iterable[str]
+) -> None:
+    """Refuse checkpoints exported with online activation rotation, which MLX does not implement.
+
+    Their residual weights are packed for rotated activations, so loading them unrotated would
+    silently give wrong outputs.
+
+    Raises:
+        NotImplementedError: If the manifest, the model-level declaration or the checkpoint keys
+            show a rotated checkpoint.
+    """
+
+    rotated = (
+        (manifest is not None and manifest.rotated_targets)
+        or quantization_config.get(ROTATION_DECLARATION_KEY) is not None
+        or any(key == ROTATION_MARKER_KEY or key.endswith(LEGACY_INPUT_TRANSFORM_SUFFIX) for key in checkpoint_keys)
+    )
+    if rotated:
+        raise NotImplementedError(
+            "Rotated (hadamard) SVDQ checkpoints are not supported on MLX yet; use an unrotated checkpoint."
+        )
+
 
 SVDQ_PARAMS = ("qweight", "wscales", "smooth_factor", "proj_down", "proj_up", "bias")
 AWQ_PARAMS = ("qweight", "wscales", "wzeros", "bias")
@@ -223,6 +257,7 @@ def apply_runtime_manifest(
     """
 
     key_map = key_map or (lambda name: name)
+    refuse_rotated_checkpoint(manifest, {}, state)
     if any(target.precision != "int4" for target in manifest.targets):
         raise NotImplementedError("NVFP4 (fp4) manifest targets are not supported on MLX yet; use an INT4 checkpoint.")
     _apply_structural_patches(model, state, manifest, key_map)

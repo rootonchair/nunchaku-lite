@@ -98,3 +98,42 @@ output_path.parent.mkdir(parents=True, exist_ok=True)
 image.save(output_path)
 print(f"saved {output_path}")
 ```
+
+## Rotated (Hadamard) Checkpoints
+
+FLUX.2 Klein INT4 checkpoints can be exported with an online Hadamard rotation, which spreads
+activation outliers before 4-bit quantization. On FLUX.2-klein INT4 it lowers quantization error per
+layer (median +1.7 dB output SQNR; about 0.82x whole-model output error) for roughly 0.1% extra
+transformer time. At 4 sampling steps, end-to-end image metrics were within run-to-run noise.
+Rotated INT4 checkpoints load with the usual `patch_transformer` / pipeline calls. They need CUDA
+kernels that include `quantize_w4a4_act_hadamard_fuse_lora`; the prebuilt Hub kernels gain it with
+the first kernel release after this format, and until then such checkpoints are refused at load.
+MPS and MLX refuse them at load time too. Rotated NVFP4 checkpoints also need an explicit opt-in
+(see below).
+
+A checkpoint declares rotation by name, `{"type": "hadamard"}`, in one of two ways. Both make
+Nunchaku Lite versions older than this format refuse the checkpoint instead of silently loading it
+without its rotation.
+
+- **Checkpoints with a runtime manifest** (loaded by the generic manifest adapter): each rotated
+  target carries `"op_options": {"rotation": {"type": "hadamard"}}`, and the manifest has
+  `nunchaku_format_version: 2`. Older versions refuse version 2 manifests.
+- **Checkpoints without a manifest** (loaded by a model adapter, as FLUX.2 Klein is): the
+  `quantization_config` lists the rotated layers in
+  `"input_rotation": {"format_version": 2, "type": "hadamard", "targets": [...]}`, and the checkpoint
+  contains one empty marker tensor named `nunchaku_lite.input_rotation`. Older versions ignore the
+  declaration but reject the unknown marker tensor under the default `strict=True`.
+
+A declaration without a v2 manifest or the marker is refused, and so is a marker without a
+declaration. If a manifest and a declaration are both present, they must list the same targets.
+Layers that aren't listed run unrotated.
+
+`"hadamard"` has exactly one meaning. For each block of 64 contiguous input channels, in logical
+channel order, the smoothed activations `x / smooth` are multiplied by the orthonormal Sylvester
+Hadamard matrix `H64 / 8`. The low-rank branch sees the unrotated input, and the residual weight
+is packed as `Q(R @ blockdiag(H64 / 8))`. `nunchaku_lite.ops.hadamard_rotate` is the reference
+transform. A different transform needs a new name.
+
+Rotation is refused on NVFP4 by default, because it measured slightly worse than no rotation there.
+Pass `adapter_options={"allow_fp4_rotation": True}` to load such a checkpoint anyway. Rotation is
+also refused on fc2 layers whose input is quantized unsigned or inside the fused GELU MLP.

@@ -446,7 +446,8 @@ void GEMM_W4A4_Launch<Config, USE_FP4>::quantize_w4a4_act_fuse_lora(Tensor input
                                                                     Tensor lora_act_out,
                                                                     Tensor smooth,
                                                                     bool fuse_glu,
-                                                                    bool fp4) {
+                                                                    bool fp4,
+                                                                    bool hadamard) {
     const int actualM = input.numel() / input.shape[-1];
     const int actualN = input.shape[-1];
 
@@ -481,8 +482,9 @@ void GEMM_W4A4_Launch<Config, USE_FP4>::quantize_w4a4_act_fuse_lora(Tensor input
 
     // dispatchVal(rank, LoraRanks(), [&]<int RANK>() {
     dispatchBool(fuse_glu, [&]<bool FUSE_GLU>() {
+    dispatchBool(hadamard, [&]<bool USE_HADAMARD>() {
         // using Lora = typename GEMM::Lora<RANK>;
-        using kernel = typename GEMM::quantize_w4a4_fuse_lora_kernel<FUSE_GLU, USE_FP4>;
+        using kernel = typename GEMM::quantize_w4a4_fuse_lora_kernel<FUSE_GLU, USE_FP4, USE_HADAMARD>;
 
         auto func = invoke_kernel<kernel, typename kernel::Arguments>;
 
@@ -507,6 +509,7 @@ void GEMM_W4A4_Launch<Config, USE_FP4>::quantize_w4a4_act_fuse_lora(Tensor input
                 .alwaysfalse   = false,
             });
         checkCUDA(cudaGetLastError());
+    });
     });
     // });
 }
