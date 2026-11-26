@@ -300,7 +300,7 @@ def test_explicit_backends(bitsandbytes_installed):
 
 @pytest.mark.parametrize(("weights", "bnb_mode"), [("int4", "nf4"), ("int8", "int8")])
 def test_cuda_load_routes_to_bitsandbytes(tmp_path, monkeypatch, bitsandbytes_installed, weights, bnb_mode):
-    import nunchaku_lite.text_encoders.bnb as bnb
+    from nunchaku_lite.text_encoders import bnb
     from nunchaku_lite import load_quantized_text_encoder
 
     calls = []
