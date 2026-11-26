@@ -47,9 +47,15 @@ current porting backlog for `nunchaku_lite`:
 - [x] Quantized T5 text encoder support based on `NunchakuT5EncoderModel`.
 - [ ] Benchmark quantized text encoder memory and latency impact in end-to-end
   pipelines.
-- [ ] Quantized Qwen3 text encoder support, covering FLUX.2 Klein and Z-Image.
-- [ ] Quantized Qwen2.5-VL text encoder support, covering Qwen-Image and
-  Qwen-Image-Edit.
+- [x] Load-time weight-only text encoder quantization (`text_encoder_quantization="int4"`/`"int8"`, round-to-nearest,
+  no checkpoint needed) for any Transformers encoder, on CUDA and MPS. Verified with FLUX.2 Klein's Qwen3-4B.
+- [ ] Calibrated (AWQ) text encoder checkpoints, if round-to-nearest INT4 quality falls short.
+- [ ] Text encoder quantization on MLX for bf16 base repos (mflux `-q4` repos already ship a 4-bit encoder).
+- [x] Quantized Qwen3 text encoder support, covering FLUX.2 Klein and Z-Image (through `text_encoder_quantization`;
+  Z-Image not yet verified end to end).
+- [x] Quantized Qwen2.5-VL text encoder support, covering Qwen-Image and
+  Qwen-Image-Edit (through `text_encoder_quantization`; `"int8"` verified on hidden states, `"int4"` loses more and
+  is not yet checked on images).
 - [x] FLUX runtime LoRA support, including Diffusers-format conversion,
   Nunchaku-format loading, strength control, reset, and multi-LoRA composition.
 - [x] Qwen-Image runtime LoRA support, covering Qwen-Image and Qwen-Image-Edit

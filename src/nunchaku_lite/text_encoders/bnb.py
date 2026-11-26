@@ -12,7 +12,7 @@ Usage::
         AutoModelForImageTextToText, "path/to/ltx-2.5-distilled-diffusers/text_encoder", quantization="nf4"
     )
 
-Requires ``pip install bitsandbytes`` (or ``pip install "nunchaku-lite[bnb]"``). The model is placed at load time; do
+Uses bitsandbytes, a nunchaku-lite dependency everywhere except macOS. The model is placed at load time; do
 not call ``.to()`` on it afterwards.
 """
 
@@ -75,7 +75,7 @@ def load_text_encoder_bnb(
     config = bnb_quantization_config(quantization, skip_modules, torch_dtype)
     if importlib.util.find_spec("bitsandbytes") is None:
         raise ImportError(
-            'bitsandbytes is not installed: pip install bitsandbytes (or pip install "nunchaku-lite[bnb]")'
+            'bitsandbytes is not installed: pip install bitsandbytes'
         )
     device = torch.device(device)
     if device.type != "cuda":

@@ -675,3 +675,125 @@ def _tinychat_ceil_num_groups(in_features: int, group_size: int, weight_bits: in
     pack_size = 32 // weight_bits
     num_packs = (num_groups + pack_size - 1) // pack_size
     return num_packs * pack_size
+
+
+class _WeightOnlyLinear(nn.Module):
+    """Shared shape check and bias handling for the load-time text encoder modules."""
+
+    in_features: int
+    out_features: int
+    bias: nn.Parameter | None
+
+    def _init_bias(self, bias: bool, torch_dtype: torch.dtype, device) -> None:
+        self.bias = (
+            nn.Parameter(torch.empty(self.out_features, dtype=torch_dtype, device=device), requires_grad=False)
+            if bias
+            else None
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 0 or x.shape[-1] != self.in_features:
+            raise ValueError(
+                f"{type(self).__name__} expected input last dimension {self.in_features}, got shape {tuple(x.shape)}."
+            )
+        output = self._matmul(x.reshape(-1, self.in_features))
+        if self.bias is not None:
+            output = output + self.bias.to(output.dtype)
+        return output.reshape(*x.shape[:-1], self.out_features)
+
+    def _matmul(self, x: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def extra_repr(self) -> str:
+        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}"
+
+
+class Int8WeightOnlyLinear(_WeightOnlyLinear):
+    """Weight-only INT8 linear projection (symmetric per-output-channel scales, bf16/fp16 activations).
+
+    Used for load-time text encoder quantization. ``weight`` holds the int8 codes, so code that inspects
+    ``module.weight.dtype`` (Hugging Face T5 skips its fp32 cast for int8 weights) keeps working. Prompt-sized inputs
+    dequantize the weight one layer at a time and run a dense matmul (faster on MPS than PyTorch's
+    ``aten._weight_int8pack_mm``, which is used for inputs of a few rows on CPU and MPS).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        torch_dtype: torch.dtype = torch.bfloat16,
+        device: str | torch.device | None = None,
+    ):
+        super().__init__()
+        device = device if device is not None else torch.device("cpu")
+        self.in_features = in_features
+        self.out_features = out_features
+        self.register_buffer("weight", torch.empty(out_features, in_features, dtype=torch.int8, device=device))
+        self.register_buffer("wscales", torch.empty(out_features, dtype=torch_dtype, device=device))
+        self._init_bias(bias, torch_dtype, device)
+
+    def _matmul(self, x: torch.Tensor) -> torch.Tensor:
+        scales = self.wscales.to(x.dtype)
+        if (
+            x.shape[0] < 16
+            and x.device.type in ("cpu", "mps")
+            and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and self.in_features % 32 == 0
+            and self.out_features % 32 == 0
+        ):
+            return torch.ops.aten._weight_int8pack_mm(x.contiguous(), self.weight, scales)
+        return F.linear(x, self.weight.to(x.dtype)) * scales
+
+
+class Int4WeightOnlyLinear(_WeightOnlyLinear):
+    """Weight-only INT4 linear projection in plain PyTorch (asymmetric, groups of ``group_size`` input channels).
+
+    ``weight_packed`` holds two unsigned 4-bit codes per byte (even input channel in the high nibble) and the weight
+    is ``code * wscales + wzeros`` per group. Each call dequantizes the weight one layer at a time and runs a dense
+    matmul, which on MPS beats PyTorch's ``aten._weight_int4pack_mm`` by several times at prompt-sized inputs. Used
+    for load-time text encoder quantization off CUDA (on CUDA, :class:`AWQW4A16Linear` runs the AWQ kernels).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        group_size: int = 64,
+        torch_dtype: torch.dtype = torch.bfloat16,
+        device: str | torch.device | None = None,
+    ):
+        super().__init__()
+        if in_features % group_size or group_size % 2:
+            raise ValueError("in_features must be divisible by an even group_size.")
+        device = device if device is not None else torch.device("cpu")
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+        groups = in_features // group_size
+        self.register_buffer(
+            "weight_packed", torch.empty(out_features, in_features // 2, dtype=torch.uint8, device=device)
+        )
+        self.register_buffer("wscales", torch.empty(out_features, groups, dtype=torch_dtype, device=device))
+        self.register_buffer("wzeros", torch.empty(out_features, groups, dtype=torch_dtype, device=device))
+        self._init_bias(bias, torch_dtype, device)
+        # Hugging Face T5 checks ``wo.weight.dtype`` before its feed-forward output projection.
+        self.weight = torch.empty(0, dtype=torch_dtype, device=device)
+
+    def dequantize(self, dtype: torch.dtype | None = None) -> torch.Tensor:
+        """Dense ``(out_features, in_features)`` weight."""
+
+        dtype = dtype or self.wscales.dtype
+        packed = self.weight_packed
+        codes = torch.stack([packed >> 4, packed & 0xF], dim=-1).view(self.out_features, -1, self.group_size)
+        weight = torch.addcmul(
+            self.wzeros.to(dtype).unsqueeze(-1), codes.to(dtype), self.wscales.to(dtype).unsqueeze(-1)
+        )
+        return weight.view(self.out_features, self.in_features)
+
+    def _matmul(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.dequantize(x.dtype))
+
+    def extra_repr(self) -> str:
+        return f"{super().extra_repr()}, group_size={self.group_size}"
