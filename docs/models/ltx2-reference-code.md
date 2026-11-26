@@ -86,10 +86,22 @@ between rows is what matters.
 The fused Q/K norm + RoPE kernel matches ltx-core's own path to bf16 rounding (relative difference 1.7e-3) and saves
 about 3% of transformer time; `--nunchaku-stock-attention` gives the same quality.
 
-Our NVFP4 flickers more than Lightricks' in this pipeline. Restricting it to Lightricks' layer set (video-side linears
-only) does not change that, so the difference lies in how the shared layers are quantized. Our quantized path is
-also not bit-reproducible from run to run, and the ancestral sampler amplifies that: repeated runs of the same file
-differ by about 0.3 dB PSNR.
+Our NVFP4 flickers more than Lightricks' in this pipeline, and most of the difference comes from the last blocks.
+Lightricks' NVFP4 file quantizes all 28 linear layers in blocks 0-41 and keeps blocks 42-47 in bf16; ours quantizes
+all 48 blocks. Splicing ours into blocks 0-41 only (`--targets-regex 'transformer_blocks\.([0-9]|[1-3][0-9]|4[01])\..*'`)
+closes about 70% of the gap (RTX PRO 4500 Blackwell, 10 of the 16 clips, flicker measured on the MP4s):
+
+| transformer | flicker gap to Lightricks NVFP4 | clips steadier than all-48 | transformer size |
+| --- | --- | --- | --- |
+| Nunchaku Lite NVFP4 r32, all 48 blocks | +1.36 | - | 14.9 GB |
+| Nunchaku Lite NVFP4 r32, blocks 42-47 kept bf16 | +0.42 | 9 of 10 (one tie) | 18.0 GB |
+
+Side by side, the difference is hard to see, so the published checkpoints keep all 48 blocks quantized (smaller and
+faster); `--targets-regex` gives the steadier variant for anyone who prefers it. Restricting the quantized layer
+types instead (Lightricks' video-side linears only, in all 48 blocks) does not change flicker, and the activation
+scaling is not the cause either: emulating our dynamic NVFP4 scales against Lightricks' static `input_scale` gives the
+same quantization error and frame-to-frame noise. Our quantized path is also not bit-reproducible from run to run,
+and the ancestral sampler amplifies that: repeated runs of the same file differ by about 0.3 dB PSNR.
 
 ## Results (L40S, INT4)
 
