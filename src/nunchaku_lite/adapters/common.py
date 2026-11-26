@@ -9,7 +9,7 @@ from diffusers.models.attention import AttentionModuleMixin
 from diffusers.models.attention_processor import Attention
 from torch import nn
 
-from ..linear import AWQW4A16Linear, DenseRuntimeLoraLinear, SVDQW4A4Linear
+from ..linear import SVDQ_LEGACY_CHECKPOINT_SUFFIXES, AWQW4A16Linear, DenseRuntimeLoraLinear, SVDQW4A4Linear
 from ..utils import convert_fp16, patch_scale_key
 
 PATCHED_MODULE_ATTR = "_nunchaku_lite_patched_module"
@@ -148,8 +148,9 @@ def finalize_svdq_checkpoint(
 def drop_obsolete_svdq_tensors(checkpoint_state: dict[str, torch.Tensor]) -> None:
     """Drop SVDQ tensors retained only for legacy checkpoint compatibility."""
 
+    suffixes = tuple(f".{suffix}" for suffix in SVDQ_LEGACY_CHECKPOINT_SUFFIXES)
     for key in list(checkpoint_state):
-        if key.endswith(".smooth_factor_orig"):
+        if key.endswith(suffixes):
             checkpoint_state.pop(key)
 
 

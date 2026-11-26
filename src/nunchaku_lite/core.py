@@ -2,7 +2,6 @@
 
 import importlib
 import inspect
-import json
 import os
 import warnings
 from dataclasses import dataclass, field
@@ -11,17 +10,20 @@ from typing import Any, Protocol
 
 import torch
 
+from .checkpoint_config import check_device_precision
+from .checkpoint_config import parse_json_metadata as _parse_json_metadata
+from .checkpoint_config import sibling_quantization_config as _sibling_quantization_config
 from .manifest import ROTATION_MARKER_KEY, RuntimeManifest, parse_runtime_manifest, with_target_list_manifest
 from .rotation_loader import (
     bind_input_rotations,
     check_rotation_runtime,
     mark_rotated_targets,
-    parse_rotation_declaration,
     refuse_legacy_transform_tensors,
     resolve_input_rotation,
+    resolve_rotated_targets,
     validate_declared_targets,
 )
-from .utils import fetch_or_download, get_precision, load_state_dict_in_safetensors
+from .utils import get_precision, load_state_dict_in_safetensors
 
 
 @dataclass
@@ -633,32 +635,6 @@ def _coerce_state_dict_for_assign(module: torch.nn.Module, state_dict: dict[str,
         state_dict[key] = value.to(dtype=expected.dtype)
 
 
-def _sibling_quantization_config(checkpoint: str | os.PathLike) -> dict[str, Any]:
-    """``quantization_config`` from the ``config.json`` next to a checkpoint file (Diffusers-format repos that keep it
-    there instead of in the safetensors metadata); ``{}`` when there is none."""
-
-    from huggingface_hub.errors import EntryNotFoundError
-
-    sibling = Path(checkpoint).parent / "config.json"
-    try:
-        if Path(checkpoint).exists():  # local file: never fall through to a Hub download
-            if not sibling.is_file():
-                return {}
-            config_path = sibling
-        else:  # Hub reference ``org/repo/.../file.safetensors``
-            config_path = fetch_or_download(sibling)
-        value = json.loads(Path(config_path).read_text()).get("quantization_config")
-    except json.JSONDecodeError as exc:
-        warnings.warn(f"Ignoring malformed {sibling} ({exc}).", stacklevel=3)
-        return {}
-    except (EntryNotFoundError, FileNotFoundError, ValueError):  # no config.json (ValueError: not a Hub path)
-        return {}
-    except Exception as exc:  # noqa: BLE001 - e.g. network or auth errors: continue without, but say so
-        warnings.warn(f"Could not read {sibling} for checkpoint metadata ({exc}); continuing without it.", stacklevel=3)
-        return {}
-    return value if isinstance(value, dict) else {}
-
-
 def _infer_svdq_rank(state_dict: dict[str, torch.Tensor]) -> int | None:
     """The low-rank branch rank of a lite-format checkpoint (``*.proj_down`` is ``(in_features, rank)``).
 
@@ -666,7 +642,13 @@ def _infer_svdq_rank(state_dict: dict[str, torch.Tensor]) -> int | None:
     ``transformer/config.json``; without it, a rank-64 checkpoint would be patched with the default rank 32.
     """
 
-    ranks = {int(v.shape[1]) for k, v in state_dict.items() if k.endswith(".proj_down") and v.ndim == 2}
+    from .linear import SVDQ_RANK_TENSOR, SVDQW4A4Linear
+
+    ranks = {
+        SVDQW4A4Linear.checkpoint_rank(tuple(v.shape))
+        for k, v in state_dict.items()
+        if k.endswith(f".{SVDQ_RANK_TENSOR}") and v.ndim == 2
+    }
     if not ranks:
         return None
     if len(ranks) > 1:
@@ -674,33 +656,6 @@ def _infer_svdq_rank(state_dict: dict[str, torch.Tensor]) -> int | None:
             f"Checkpoint low-rank branches have mixed ranks {sorted(ranks)}; using {max(ranks)}.", stacklevel=3
         )
     return max(ranks)
-
-
-def _parse_json_metadata(metadata: dict[str, str] | None, key: str) -> dict[str, Any]:
-    """Decode a JSON object from safetensors metadata.
-
-    Args:
-        metadata: Metadata dictionary returned by safetensors, or ``None``.
-        key: Metadata key to decode.
-
-    Returns:
-        Parsed JSON object. Missing metadata returns an empty dict.
-
-    Raises:
-        ValueError: If the metadata value is not valid JSON or does not decode
-            to an object.
-    """
-
-    if not metadata:
-        return {}
-    raw = metadata.get(key, "{}")
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid JSON in checkpoint metadata field {key!r}: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise TypeError(f"Checkpoint metadata field {key!r} must decode to a JSON object.")
-    return parsed
 
 
 def _normalize_precision(
@@ -746,28 +701,7 @@ def _validate_quantization_compatibility(
             f"Use a {requested} checkpoint or set precision={actual!r}."
         )
 
-    if not torch.cuda.is_available():
-        return
-    target_device = torch.device(device or "cuda")
-    if target_device.type != "cuda":
-        return
-    device_index = 0 if target_device.index is None else target_device.index
-    capability = torch.cuda.get_device_capability(device_index)
-    sm = capability[0] * 10 + capability[1]
-    if sm >= 100 and checkpoint_precision != "nvfp4":
-        warnings.warn(
-            "INT4 quantization on Blackwell GPUs may be slower than FP4. "
-            "Use an FP4 checkpoint for best performance when one is available.",
-            UserWarning,
-            stacklevel=3,
-        )
-        return
-    if sm in {75, 80, 86, 89} and checkpoint_precision != "int4":
-        raise ValueError('Please use "int4" quantization for Turing, Ampere, and Ada GPUs.')
-    if sm not in {75, 80, 86, 89} and sm < 100:
-        raise ValueError(
-            f"Unsupported GPU architecture sm{sm}; Nunchaku Lite requires Turing, Ampere, Ada, or Blackwell."
-        )
+    check_device_precision(checkpoint_precision, device, stacklevel=3)
 
 
 def _precision_from_quantization_config(quantization_config: dict[str, Any]) -> str | None:
@@ -818,36 +752,12 @@ def _check_rotation_support(
     """
 
     refuse_legacy_transform_tensors(state_dict)
-    declared = parse_rotation_declaration(quantization_config)
-    has_marker = ROTATION_MARKER_KEY in state_dict
-    manifest_rotated = (
-        tuple(target.checkpoint_prefix for target in stored_manifest.rotated_targets) if stored_manifest else ()
+    targets = resolve_rotated_targets(
+        quantization_config, has_marker=ROTATION_MARKER_KEY in state_dict, stored_manifest=stored_manifest
     )
-    if has_marker and declared is None:
-        raise ValueError(
-            f"Checkpoint has the {ROTATION_MARKER_KEY!r} rotation marker but no quantization_config.input_rotation "
-            "declaration listing the rotated targets."
-        )
-    if declared is None and not manifest_rotated:
+    if targets is None:
         return None
-    if stored_manifest is not None and declared is not None and set(declared) != set(manifest_rotated):
-        if not manifest_rotated:
-            raise ValueError(
-                "Checkpoint declares quantization_config.input_rotation but its runtime_manifest declares no "
-                "rotation; checkpoints with a manifest must declare rotation per target in op_options.rotation."
-            )
-        raise ValueError(
-            "quantization_config.input_rotation.targets do not match the runtime_manifest targets that declare "
-            "op_options.rotation; the checkpoint metadata is inconsistent."
-        )
-    if not manifest_rotated and not has_marker:
-        raise ValueError(
-            "Checkpoint declares quantization_config.input_rotation without a runtime_manifest "
-            f"(nunchaku_format_version 2) declaring the rotation or the {ROTATION_MARKER_KEY!r} marker tensor. "
-            "One of them is required, so that older Nunchaku Lite versions refuse the checkpoint instead of "
-            "loading it without rotation."
-        )
-    targets = manifest_rotated or declared
+    manifest_rotated = targets if stored_manifest is not None and stored_manifest.rotated_targets else ()
     check_rotation_runtime(_rotation_device(device, transformer))
 
     if adapter.target == "manifest" and manifest_rotated:

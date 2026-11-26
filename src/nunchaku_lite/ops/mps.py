@@ -245,10 +245,17 @@ def _unpack_lowrank(tensor: torch.Tensor, features: int, down: bool) -> torch.Te
 # ---------------------------------------------------------------------------
 
 
+def _tensor_version(t: torch.Tensor) -> int | None:
+    """``t._version``, or ``None`` for inference tensors (ltx-core builds models under ``inference_mode``), which
+    have no version counter; those can only change inside ``inference_mode`` and are keyed by identity/pointer."""
+
+    return None if t.is_inference() else t._version
+
+
 def _param_state(t: torch.Tensor | None) -> tuple | None:
     if t is None:
         return None
-    return (id(t), t._version, tuple(t.shape), t.dtype, t.device, t.data_ptr())
+    return (id(t), _tensor_version(t), tuple(t.shape), t.dtype, t.device, t.data_ptr())
 
 
 def _states_match(saved: tuple | None, current: tuple | None) -> bool:
@@ -855,18 +862,18 @@ def _device_constant(values: tuple, dtype: torch.dtype, device: str) -> torch.Te
     return torch.tensor(values, dtype=dtype, device=device)
 
 
-_DERIVED: dict[tuple[int, str], tuple[weakref.ref, int, object]] = {}
+_DERIVED: dict[tuple[int, str], tuple[weakref.ref, int | None, object]] = {}
 
 
 def _derived(t: torch.Tensor, key: str, build):
     """``build(t)``, cached while ``t`` is alive and unmodified (weights, per-step rotary tables)."""
 
     entry = _DERIVED.get((id(t), key))
-    if entry is not None and entry[0]() is t and entry[1] == t._version:
+    if entry is not None and entry[0]() is t and entry[1] == _tensor_version(t):
         return entry[2]
     value = build(t)
     cache_key = (id(t), key)
-    _DERIVED[cache_key] = (weakref.ref(t, lambda _ref: _DERIVED.pop(cache_key, None)), t._version, value)
+    _DERIVED[cache_key] = (weakref.ref(t, lambda _ref: _DERIVED.pop(cache_key, None)), _tensor_version(t), value)
     return value
 
 
