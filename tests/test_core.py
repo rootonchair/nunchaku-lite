@@ -236,6 +236,110 @@ def test_load_nunchaku_pipeline_rejects_quantized_encoder_collision(tmp_path, mo
         )
 
 
+def _install_fake_bnb_loader(monkeypatch):
+    from nunchaku_lite import text_encoders
+
+    calls = []
+
+    def fake_load(model_cls, path, **kwargs):
+        encoder = torch.nn.Linear(2, 2)
+        calls.append((model_cls, path, kwargs, encoder))
+        return encoder
+
+    monkeypatch.setattr(text_encoders, "load_text_encoder_bnb", fake_load)
+    return calls
+
+
+def test_load_nunchaku_pipeline_loads_bnb_text_encoder(tmp_path, monkeypatch):
+    from nunchaku_lite import load_nunchaku_pipeline
+
+    _install_fake_adapter(monkeypatch)
+    calls = _install_fake_bnb_loader(monkeypatch)
+    pipe = load_nunchaku_pipeline(
+        tmp_path,
+        pipeline_cls=FakePipelineWithEncoder,
+        checkpoint=_fake_checkpoint(tmp_path),
+        target=FakeAdapter.target,
+        torch_dtype={"default": torch.bfloat16, "text_encoder_2": torch.float16},
+        device="cpu",
+        revision="abc",
+        text_encoder_quantization={"text_encoder_2": "int8"},
+    )
+
+    ((model_cls, path, kwargs, encoder),) = calls
+    assert model_cls is FakePipelineComponent and path == tmp_path
+    assert kwargs == {
+        "quantization": "int8",
+        "device": "cpu",
+        "torch_dtype": torch.float16,
+        "subfolder": "text_encoder_2",
+        "revision": "abc",
+    }
+    assert FakePipelineWithEncoder.from_pretrained_kwargs["text_encoder_2"] is encoder
+    assert FakePipelineWithEncoder.from_pretrained_kwargs["transformer"] is pipe.transformer
+
+
+def test_load_nunchaku_pipeline_bnb_defaults_to_cuda_and_bf16(tmp_path, monkeypatch):
+    from nunchaku_lite import load_nunchaku_pipeline
+
+    _install_fake_adapter(monkeypatch)
+    calls = _install_fake_bnb_loader(monkeypatch)
+    load_nunchaku_pipeline(
+        tmp_path,
+        pipeline_cls=FakePipelineWithEncoder,
+        checkpoint=_fake_checkpoint(tmp_path),
+        target=FakeAdapter.target,
+        text_encoder_quantization={"text_encoder_2": "nf4"},
+    )
+
+    ((_, _, kwargs, _),) = calls
+    assert kwargs["device"] == "cuda" and kwargs["torch_dtype"] is torch.bfloat16 and kwargs["quantization"] == "nf4"
+
+
+@pytest.mark.parametrize(
+    ("quantization", "extra", "match"),
+    [
+        ({"text_encoder_2": "int4"}, {}, "must be one of"),
+        ({"text_encoder_2": "nf4"}, {"text_encoder_2": torch.nn.Linear(2, 2)}, "already contains 'text_encoder_2'"),
+        ({"transformer": "nf4"}, {}, "cannot replace the main Nunchaku component"),
+        ({"text_encoder_3": "nf4"}, {}, "does not define an encoder component named 'text_encoder_3'"),
+    ],
+)
+def test_load_nunchaku_pipeline_rejects_bad_text_encoder_quantization(tmp_path, monkeypatch, quantization, extra, match):
+    from nunchaku_lite import load_nunchaku_pipeline
+
+    _install_fake_adapter(monkeypatch)
+    calls = _install_fake_bnb_loader(monkeypatch)
+    with pytest.raises(ValueError, match=match):
+        load_nunchaku_pipeline(
+            tmp_path,
+            pipeline_cls=FakePipelineWithEncoder,
+            checkpoint=_fake_checkpoint(tmp_path),
+            target=FakeAdapter.target,
+            text_encoder_quantization=quantization,
+            **extra,
+        )
+    assert calls == []
+
+
+def test_load_nunchaku_pipeline_rejects_encoder_in_both_options(tmp_path, monkeypatch):
+    from nunchaku_lite import core, load_nunchaku_pipeline
+
+    _install_fake_adapter(monkeypatch)
+    calls = _install_fake_bnb_loader(monkeypatch)
+    monkeypatch.setattr(core, "_load_quantized_encoder_component", lambda *a, **k: torch.nn.Linear(2, 2))
+    with pytest.raises(ValueError, match="in both quantized_encoder_checkpoints and text_encoder_quantization"):
+        load_nunchaku_pipeline(
+            tmp_path,
+            pipeline_cls=FakePipelineWithEncoder,
+            checkpoint=_fake_checkpoint(tmp_path),
+            target=FakeAdapter.target,
+            quantized_encoder_checkpoints={"text_encoder_2": "encoder.safetensors"},
+            text_encoder_quantization={"text_encoder_2": "nf4"},
+        )
+    assert calls == []
+
+
 def test_load_nunchaku_pipeline_allows_adapter_without_pipeline_patch(tmp_path, monkeypatch):
     from nunchaku_lite import load_nunchaku_pipeline
 

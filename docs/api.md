@@ -49,6 +49,9 @@ Arguments:
   patching controls as `patch_transformer`.
 - `quantized_encoder_checkpoints`: optional mapping from Diffusers component
   name to a quantized encoder checkpoint. Currently supports T5 checkpoints.
+- `text_encoder_quantization`: optional mapping from Diffusers component name to
+  `"nf4"` or `"int8"`. Those Hugging Face encoders are loaded with bitsandbytes
+  weights on `device` (CUDA) instead of bf16; see `load_text_encoder_bnb`.
 - Additional keyword arguments are forwarded to `pipeline_cls.from_pretrained(...)`.
 
 Quantized text encoders can be injected up front so Diffusers skips loading the
@@ -67,6 +70,24 @@ pipe = load_nunchaku_pipeline(
     device="cuda",
 )
 ```
+
+Any Hugging Face text encoder can instead be loaded with bitsandbytes NF4 or
+8-bit weights (`pip install "nunchaku-lite[bnb]"`):
+
+```python
+pipe = load_nunchaku_pipeline(
+    "black-forest-labs/FLUX.1-dev",
+    pipeline_cls=FluxPipeline,
+    checkpoint="nunchaku-tech/nunchaku-flux.1-dev/svdq-int4_r32-flux.1-dev.safetensors",
+    target="flux",
+    text_encoder_quantization={"text_encoder_2": "nf4"},  # or "int8"
+    torch_dtype=torch.bfloat16,
+    device="cuda",
+)
+```
+
+bitsandbytes encoders are placed on the GPU at load time; don't move the pipeline
+with `pipe.to(...)` or CPU offload afterwards.
 
 ## `NunchakuT5EncoderModel`
 

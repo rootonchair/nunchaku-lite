@@ -203,6 +203,7 @@ def load_nunchaku_pipeline(
     strict: bool = True,
     adapter_options: dict[str, Any] | None = None,
     quantized_encoder_checkpoints: dict[str, str | Path] | None = None,
+    text_encoder_quantization: dict[str, str] | None = None,
     backend: str = "auto",
     **pipeline_kwargs,
 ):
@@ -231,6 +232,10 @@ def load_nunchaku_pipeline(
         quantized_encoder_checkpoints: Optional mapping from Diffusers pipeline
             component name to quantized encoder checkpoint. This currently
             supports T5-compatible Nunchaku checkpoints.
+        text_encoder_quantization: Optional mapping from pipeline component name to ``"nf4"`` or ``"int8"``,
+            e.g. ``{"text_encoder": "nf4"}``. Those Hugging Face encoders are loaded with bitsandbytes weights on
+            ``device`` (CUDA) via :func:`~nunchaku_lite.text_encoders.load_text_encoder_bnb`, instead of bf16. They
+            are placed at load time: don't move them with ``pipe.to()`` or CPU offload afterwards.
         backend: Quantized-kernel backend for SVDQ layers (``"auto"``,
             ``"int8"``, ``"int4"``, ``"dense"``); see :func:`patch_transformer`.
         **pipeline_kwargs: Additional keyword arguments forwarded to
@@ -260,6 +265,19 @@ def load_nunchaku_pipeline(
         component_name=component_name,
         torch_dtype=torch_dtype,
         device=device,
+    )
+    quantized_encoders.update(
+        _load_bnb_encoder_components(
+            text_encoder_quantization,
+            pretrained_model_name_or_path,
+            pipeline_cls=pipeline_cls,
+            pipeline_config=pipeline_config,
+            pipeline_kwargs=pipeline_kwargs,
+            component_name=component_name,
+            already_loaded=set(quantized_encoders),
+            torch_dtype=torch_dtype,
+            device=device,
+        )
     )
 
     component_cls = _resolve_pipeline_component_class(pipeline_config, component_name)
@@ -324,6 +342,56 @@ def _load_quantized_encoder_components(
             encoder_checkpoint,
             torch_dtype=_resolve_component_torch_dtype(torch_dtype, encoder_component),
             device=device,
+        )
+    return components
+
+
+def _load_bnb_encoder_components(
+    text_encoder_quantization: dict[str, str] | None,
+    pretrained_model_name_or_path: str | os.PathLike,
+    *,
+    pipeline_cls: type,
+    pipeline_config: dict[str, Any],
+    pipeline_kwargs: dict[str, Any],
+    component_name: str,
+    already_loaded: set[str],
+    torch_dtype: torch.dtype | dict[str, torch.dtype] | None,
+    device: str | torch.device | None,
+) -> dict[str, torch.nn.Module]:
+    if not text_encoder_quantization:
+        return {}
+    from .text_encoders import load_text_encoder_bnb
+    from .text_encoders.bnb import QUANTIZATIONS
+
+    expected_modules = _pipeline_expected_modules(pipeline_cls)
+    loading_kwargs = _extract_config_loading_kwargs(pipeline_kwargs)
+    components: dict[str, torch.nn.Module] = {}
+    for encoder_component, quantization in text_encoder_quantization.items():
+        if quantization not in QUANTIZATIONS:
+            raise ValueError(
+                f"text_encoder_quantization[{encoder_component!r}] must be one of {QUANTIZATIONS}, got {quantization!r}."
+            )
+        if encoder_component in pipeline_kwargs:
+            raise ValueError(
+                f"pipeline_kwargs already contains {encoder_component!r}; "
+                "remove it or omit text_encoder_quantization for that component."
+            )
+        if encoder_component == component_name:
+            raise ValueError(f"text_encoder_quantization cannot replace the main Nunchaku component {component_name!r}.")
+        if encoder_component in already_loaded:
+            raise ValueError(
+                f"{encoder_component!r} is in both quantized_encoder_checkpoints and text_encoder_quantization."
+            )
+        if encoder_component not in expected_modules and encoder_component not in pipeline_config:
+            raise ValueError(f"Pipeline does not define an encoder component named {encoder_component!r}.")
+        components[encoder_component] = load_text_encoder_bnb(
+            _resolve_pipeline_component_class(pipeline_config, encoder_component),
+            pretrained_model_name_or_path,
+            quantization=quantization,
+            device=device or "cuda",
+            torch_dtype=_resolve_component_torch_dtype(torch_dtype, encoder_component) or torch.bfloat16,
+            subfolder=encoder_component,
+            **loading_kwargs,
         )
     return components
 
