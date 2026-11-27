@@ -229,7 +229,14 @@ def load_nunchaku_pipeline(
         torch_dtype: Optional dtype passed to Diffusers. Dict values follow the
             Diffusers convention; the patched component uses its own entry or
             ``"default"`` when present.
-        device: Optional device to move the patched component to after loading.
+        device: Optional device for the whole pipeline. The patched component
+            and quantized text encoders are created there, and every other
+            ``torch.nn.Module`` component (VAE, dense text encoders, ...) is
+            moved there after loading, like ``pipe.to(device)``. Components
+            that are already placed are left alone: bitsandbytes models and
+            modules dispatched with a ``device_map``. Leave ``device`` unset
+            when you will call ``enable_model_cpu_offload()``, so the full
+            pipeline is never resident on the GPU.
         strict: Whether checkpoint loading should require exact key matching.
         adapter_options: Optional adapter-specific patch settings.
         quantized_encoder_checkpoints: Optional mapping from Diffusers pipeline
@@ -317,7 +324,29 @@ def load_nunchaku_pipeline(
     patch_pipeline = getattr(adapter, "patch_pipeline", None)
     if patch_pipeline is not None:
         patch_pipeline(pipe, component_name=component_name, component=loaded_component)
+    if device is not None and "device_map" not in pipeline_kwargs:
+        _move_pipeline_components(pipe, device, placed={component_name, *quantized_encoders})
     return pipe
+
+
+def _move_pipeline_components(pipe: Any, device: str | torch.device, *, placed: set[str]) -> None:
+    """Move the pipeline's remaining module components to ``device`` (``pipe.to`` without its dtype handling)."""
+
+    components = getattr(pipe, "components", None)
+    if not isinstance(components, dict):
+        return
+    for name, module in components.items():
+        if name in placed or not isinstance(module, torch.nn.Module) or _keeps_own_placement(module):
+            continue
+        module.to(device)
+
+
+def _keeps_own_placement(module: torch.nn.Module) -> bool:
+    """bitsandbytes models are placed at load time and must not be moved; dispatched modules have hooks that place them."""
+
+    if getattr(module, "is_loaded_in_4bit", False) or getattr(module, "is_loaded_in_8bit", False):
+        return True
+    return getattr(module, "hf_device_map", None) is not None or hasattr(module, "_hf_hook")
 
 
 def _load_quantized_encoder_components(
