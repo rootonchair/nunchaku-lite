@@ -1,5 +1,6 @@
 import sys
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 import torch
@@ -434,3 +435,120 @@ def test_patch_transformer_rejects_mps_backend_on_cuda(tmp_path, monkeypatch):
             device="cuda",
             backend="int4",
         )
+
+
+# --- device= places the whole pipeline -------------------------------------------------------------------------------
+
+
+class RecordingModule(torch.nn.Module):
+    def __init__(self, **attrs):
+        super().__init__()
+        self.moves = []
+        for key, value in attrs.items():
+            setattr(self, key, value)
+
+    def to(self, *args, **kwargs):
+        self.moves.append((args, kwargs))
+        return self
+
+
+class FakePipelineWithParts(FakePipeline):
+    """A pipeline exposing ``components`` like Diffusers, with one component of each placement kind."""
+
+    extra: ClassVar[dict] = {}
+
+    def __init__(self, transformer, **parts):
+        self.transformer = transformer
+        self.parts = parts
+
+    @property
+    def components(self):
+        return {"transformer": self.transformer, **self.parts}
+
+    @classmethod
+    def from_pretrained(cls, model_id, **kwargs):
+        cls.from_pretrained_kwargs = kwargs
+        parts = {k: v for k, v in kwargs.items() if k.startswith(("text_encoder", "vae", "scheduler", "dispatched"))}
+        return cls(kwargs["transformer"], **{**cls.extra, **parts})
+
+
+def _parts():
+    return {
+        "vae": RecordingModule(),
+        "text_encoder": RecordingModule(),
+        "text_encoder_bnb": RecordingModule(is_loaded_in_4bit=True),
+        "text_encoder_bnb8": RecordingModule(is_loaded_in_8bit=True),
+        "dispatched_map": RecordingModule(hf_device_map={"": 0}),
+        "dispatched_hook": RecordingModule(_hf_hook=object()),
+        "scheduler": SimpleNamespace(),
+    }
+
+
+def _load_with_parts(tmp_path, monkeypatch, **kwargs):
+    from nunchaku_lite import load_nunchaku_pipeline
+
+    _install_fake_adapter(monkeypatch)
+    parts = _parts()
+    monkeypatch.setattr(FakePipelineWithParts, "extra", parts)
+    pipe = load_nunchaku_pipeline(
+        tmp_path,
+        pipeline_cls=FakePipelineWithParts,
+        checkpoint=_fake_checkpoint(tmp_path),
+        target=FakeAdapter.target,
+        **kwargs,
+    )
+    return pipe, parts
+
+
+def test_device_moves_remaining_components(tmp_path, monkeypatch):
+    _, parts = _load_with_parts(tmp_path, monkeypatch, device="cpu")
+
+    assert parts["vae"].moves == [(("cpu",), {})]
+    assert parts["text_encoder"].moves == [(("cpu",), {})]
+    for kept in ("text_encoder_bnb", "text_encoder_bnb8", "dispatched_map", "dispatched_hook"):
+        assert parts[kept].moves == [], kept
+
+
+def test_no_device_moves_nothing(tmp_path, monkeypatch):
+    _, parts = _load_with_parts(tmp_path, monkeypatch)
+    assert all(not p.moves for p in parts.values() if isinstance(p, RecordingModule))
+
+
+def test_device_map_pipeline_is_not_moved(tmp_path, monkeypatch):
+    _, parts = _load_with_parts(tmp_path, monkeypatch, device="cpu", device_map="balanced")
+    assert all(not p.moves for p in parts.values() if isinstance(p, RecordingModule))
+
+
+def test_components_created_by_nunchaku_lite_are_not_moved_again(tmp_path, monkeypatch):
+    from nunchaku_lite import core
+
+    encoder = RecordingModule()
+    monkeypatch.setattr(core, "_load_quantized_encoder_component", lambda checkpoint, **kwargs: encoder)
+    monkeypatch.setattr(core, "_pipeline_expected_modules", lambda cls: {"transformer", "text_encoder_2"})
+    real_to = torch.nn.Module.to
+    transformer_moves = []
+
+    def spy_to(self, *args, **kwargs):
+        if isinstance(self, FakePipelineComponent):
+            transformer_moves.append(args)
+        return real_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.Module, "to", spy_to)
+    _, parts = _load_with_parts(
+        tmp_path, monkeypatch, device="cpu", quantized_encoder_checkpoints={"text_encoder_2": "enc.safetensors"}
+    )
+    moves_at_load = list(transformer_moves)
+
+    assert encoder.moves == []  # created on the device by its loader
+    assert parts["vae"].moves == [(("cpu",), {})]
+    assert transformer_moves == moves_at_load  # the patched component is placed once, while loading
+
+
+def test_bitsandbytes_text_encoder_from_pipeline_option_is_not_moved(tmp_path, monkeypatch):
+    from nunchaku_lite import core
+
+    bnb_encoder = RecordingModule(_nunchaku_lite_text_encoder_backend="bitsandbytes")
+    monkeypatch.setattr(core, "_load_runtime_quantized_text_encoders", lambda *a, **k: {"text_encoder_q": bnb_encoder})
+    _, parts = _load_with_parts(tmp_path, monkeypatch, device="cpu", text_encoder_quantization="int4")
+    assert bnb_encoder.moves == []
+    assert parts["vae"].moves == [(("cpu",), {})]
