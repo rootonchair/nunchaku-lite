@@ -211,8 +211,9 @@ def load_nunchaku_pipeline(
 ):
     """Load a Diffusers pipeline with its Nunchaku component installed up front.
 
-    The selected ``transformer`` or ``unet`` is constructed on the meta device,
-    patched with the Nunchaku adapter, materialized from ``checkpoint``, and
+    The selected ``transformer`` or ``unet`` is constructed with its parameters
+    on the meta device (buffers are built normally), patched with the Nunchaku
+    adapter, materialized from ``checkpoint``, and
     then passed into ``pipeline_cls.from_pretrained``. Passing the patched
     component into Diffusers prevents the original dense BF16 component weights
     from being loaded only to be discarded.
@@ -544,6 +545,7 @@ def _patch_component(
         incompatible = transformer.load_state_dict(state_dict, strict=strict, assign=assign)
         _materialize_known_meta_tensors(transformer)
         if device is not None:
+            _raise_on_meta_tensors(transformer)
             transformer.to(device)
         configure_backend(transformer, backend)
         _install_mps_attention(transformer)
@@ -667,7 +669,12 @@ def _load_nunchaku_component_from_config(
     if isinstance(component_config, tuple):
         component_config = component_config[0]
 
-    with torch.device("meta"):
+    # Only parameters go to the meta device. Buffers and plain tensor attributes (rotary and positional tables,
+    # masks) are computed by __init__ and are usually non-persistent, so the checkpoint cannot supply them; building
+    # them for real here is what Diffusers' own low-memory loading does, and avoids per-model rebuild code.
+    from accelerate import init_empty_weights
+
+    with init_empty_weights(include_buffers=False):
         component = component_cls.from_config(component_config)
 
     return _patch_component(
@@ -712,6 +719,23 @@ def _materialize_known_meta_tensors(module: torch.nn.Module) -> None:
         child.neg_freqs = torch.cat(
             [child.rope_params(neg_index, axis_dim, child.theta) for axis_dim in child.axes_dim],
             dim=1,
+        )
+
+
+def _raise_on_meta_tensors(module: torch.nn.Module) -> None:
+    """Name the tensors still on the meta device instead of failing inside ``Module.to``."""
+
+    names = [name for name, tensor in module.named_parameters() if tensor.is_meta]
+    names += [name for name, tensor in module.named_buffers() if tensor.is_meta]
+    for module_name, child in module.named_modules():
+        for attr, value in vars(child).items():
+            if isinstance(value, torch.Tensor) and value.is_meta:
+                names.append(f"{module_name}.{attr}" if module_name else attr)
+    if names:
+        shown = ", ".join(names[:8]) + (f", ... ({len(names)} total)" if len(names) > 8 else "")
+        raise RuntimeError(
+            f"These tensors were not loaded from the checkpoint and are still on the meta device: {shown}. "
+            "Check that the checkpoint matches this model, or load the model normally and use patch_transformer."
         )
 
 

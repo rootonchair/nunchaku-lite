@@ -12,7 +12,13 @@ from ..linear import SVDQ_GROUP_SIZE, AWQW4A16Linear, SVDQW4A4Linear
 from ..manifest import RuntimeManifest, RuntimeManifestTarget, parse_runtime_manifest
 from ..rotation_loader import resolve_input_rotation
 from ..utils import module_device as _module_device
-from .common import SVDQPatchContext, _mark_patched_module, finalize_svdq_checkpoint, prepare_transformer_dtype
+from .common import (
+    SVDQPatchContext,
+    _mark_patched_module,
+    finalize_svdq_checkpoint,
+    infer_transformer_dtype,
+    prepare_transformer_dtype,
+)
 
 
 class ManifestAdapter:
@@ -188,8 +194,7 @@ class ManifestAdaNormAWQW4A16(nn.Module):
 
 
 def _manifest_context(transformer: nn.Module, manifest: RuntimeManifest, options: PatchOptions) -> SVDQPatchContext:
-    parameter = next(transformer.parameters(), None)
-    torch_dtype = options.torch_dtype or (parameter.dtype if parameter is not None else torch.bfloat16)
+    torch_dtype = options.torch_dtype or infer_transformer_dtype(transformer)
     return SVDQPatchContext(
         precision=manifest.runtime_precision or options.precision,
         rank=manifest.rank,

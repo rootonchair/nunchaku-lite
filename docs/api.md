@@ -31,8 +31,9 @@ pipe = load_nunchaku_pipeline(
 ```
 
 `load_nunchaku_pipeline` is the preferred public API. It reads the pipeline
-config, constructs the selected `transformer` or `unet` on the meta device,
-patches it with the Nunchaku adapter, loads the quantized checkpoint with
+config, constructs the selected `transformer` or `unet` with its parameters on
+the meta device (buffers such as rotary tables are built normally, since
+checkpoints do not store non-persistent buffers), patches it with the Nunchaku adapter, loads the quantized checkpoint with
 `assign=True`, and passes the patched component into
 `pipeline_cls.from_pretrained(...)`. Diffusers then loads the rest of the
 pipeline normally while skipping the original dense component. Adapters that
@@ -228,7 +229,8 @@ Arguments:
 - `precision`: `"auto"`, `"fp4"`, or `"int4"`. Internally, `"fp4"` maps to
   NVFP4 kernels.
 - `torch_dtype`: optional model dtype, typically `torch.bfloat16` or
-  `torch.float16`.
+  `torch.float16`. When omitted, quantized layers use the dtype of the model's
+  `nn.Linear` weights, so modules Diffusers keeps in float32 do not change it.
 - `device`: optional destination device after patching.
 - `strict`: forwarded to `load_state_dict`.
 - `adapter_options`: model-specific adapter options.
