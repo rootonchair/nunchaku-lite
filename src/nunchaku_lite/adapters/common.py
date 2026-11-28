@@ -1,6 +1,7 @@
 """Shared adapter utilities for replacing Diffusers modules with lite SVDQ modules."""
 
 import math
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -85,6 +86,30 @@ class ModulePatchReport:
         self.skipped_modules += other.skipped_modules
 
 
+def infer_transformer_dtype(transformer: nn.Module) -> torch.dtype:
+    """The compute dtype of a transformer: the most common dtype of its ``nn.Linear`` weights.
+
+    The first parameter is not reliable. Diffusers keeps some modules in float32 (``_keep_in_fp32_modules``) and
+    one of them can come first, e.g. Wan's ``scale_shift_table``; quantized layers built in float32 then reject
+    the bfloat16 activations they receive.
+
+    Args:
+        transformer: Module tree to inspect.
+
+    Returns:
+        The dtype for quantized layers, falling back to the first floating parameter, then bfloat16.
+    """
+
+    counts = Counter(
+        module.weight.dtype
+        for module in transformer.modules()
+        if isinstance(module, nn.Linear) and module.weight.is_floating_point()
+    )
+    if counts:
+        return counts.most_common(1)[0][0]
+    return next((p.dtype for p in transformer.parameters() if p.is_floating_point()), torch.bfloat16)
+
+
 def build_svdq_context(transformer: nn.Module, quantization_config: dict, options) -> SVDQPatchContext:
     """Build SVDQ patch settings from checkpoint metadata and patch options.
 
@@ -99,7 +124,7 @@ def build_svdq_context(transformer: nn.Module, quantization_config: dict, option
     """
 
     rank = int(options.adapter_options.get("rank", quantization_config.get("rank", 32)))
-    torch_dtype = options.torch_dtype or next(transformer.parameters()).dtype
+    torch_dtype = options.torch_dtype or infer_transformer_dtype(transformer)
     return SVDQPatchContext(
         precision=options.precision,
         rank=rank,
